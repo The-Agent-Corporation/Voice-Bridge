@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
-import { chmodSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFile, spawn } from "node:child_process";
+import { once } from "node:events";
+import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { after, describe, test } from "node:test";
-import { resolveExecutable, type ProbeReport } from "../probe.js";
+import { setTimeout as delay } from "node:timers/promises";
+import { runProbe as probeInProcess, resolveExecutable, type ProbeReport } from "../probe.js";
 import { CAPABILITIES, type CapabilityResult } from "../probeReport.js";
 import { CLI_ENTRY, removeTempDirs, tempDir } from "./helpers.js";
 
@@ -45,10 +47,31 @@ function assertGone(pid: number): void {
   assert.throws(() => process.kill(pid, 0), { code: "ESRCH" }, `pid ${pid} is still alive`);
 }
 
+/** A killed process can take a moment to be reaped by init once its parent is gone. */
+async function assertGoneSoon(pid: number): Promise<void> {
+  for (let attempt = 0; attempt < 40; attempt++) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      break;
+    }
+    await delay(50);
+  }
+  assertGone(pid);
+}
+
 const versionStub = (version: string) => `#!/bin/sh\necho "${version}"\nexit 0\n`;
 
 /** A Codex stand-in that serves line-delimited JSON-RPC on `app-server` and logs each method it receives. */
-function fakeCodex(log: string, { codexHome, steer }: { codexHome?: string; steer: "result" | "method_not_found" }): string {
+function fakeCodex(
+  log: string,
+  { codexHome, steer, read = "same_id" }: { codexHome?: string; steer: "result" | "method_not_found" | "invalid_params"; read?: "same_id" | "wrong_id" },
+): string {
+  const steerReply = {
+    result: `reply({ turnId: "u1" })`,
+    method_not_found: `send({ jsonrpc: "2.0", id: message.id, error: { code: -32601, message: "method not found" } })`,
+    invalid_params: `send({ jsonrpc: "2.0", id: message.id, error: { code: -32602, message: "invalid params" } })`,
+  }[steer];
   return `#!${process.execPath}
 const { appendFileSync, realpathSync } = require("node:fs");
 const argv = process.argv.slice(2);
@@ -67,12 +90,11 @@ require("node:readline").createInterface({ input: process.stdin }).on("line", (l
     case "thread/start":
       reply({ thread: { id: "t1" } });
       return send({ jsonrpc: "2.0", method: "thread/started", params: { thread: { id: "t1" } } });
-    case "thread/read": return reply({ thread: { id: "t1" } });
+    case "thread/read": return reply({ thread: { id: ${JSON.stringify(read === "same_id" ? "t1" : "other")} } });
     case "turn/start":
       reply({ turn: { id: "u1", status: "inProgress" } });
       return send({ jsonrpc: "2.0", method: "turn/started", params: { threadId: "t1", turn: { id: "u1" } } });
-    case "turn/steer":
-      ${steer === "result" ? `return reply({ turnId: "u1" });` : `return send({ jsonrpc: "2.0", id: message.id, error: { code: -32601, message: "method not found" } });`}
+    case "turn/steer": return ${steerReply};
     case "turn/interrupt": return reply({});
   }
 }).on("close", () => process.exit(0));
@@ -183,6 +205,58 @@ describe("voice-bridge probe", () => {
     const dir = stubDir({ codex: fakeCodex(path.join(tempDir(), "methods"), { steer: "result" }) });
     const { report } = await runProbe({ PATH: dir });
     assert.equal(report.providers[0].surfaces.app_server.steer.status, "supported");
+  });
+
+  test("an error other than method-not-found, or a result without its proof, is check_failed and never supported", async () => {
+    const dir = stubDir({ codex: fakeCodex(path.join(tempDir(), "methods"), { steer: "invalid_params", read: "wrong_id" }) });
+    const { status, report, stderr } = await runProbe({ PATH: dir });
+    assert.equal(status, 0, stderr);
+    const appServer = report.providers[0].surfaces.app_server;
+    assert.deepEqual([appServer.steer.status, appServer.steer.reason], ["unverified", "check_failed"]);
+    assert.equal(appServer.steer.evidence[0]?.rpc, "turn/steer → error -32602: invalid params");
+    assert.deepEqual([appServer.inspect.status, appServer.inspect.reason], ["unverified", "check_failed"]);
+    assert.equal(appServer.inspect.detail, "thread/read returned a result without the expected proof");
+  });
+
+  test("an interrupted probe kills every process group it started and removes its temp home", async () => {
+    const started = path.join(tempDir(), "started");
+    const dir = stubDir({
+      codex: `#!/bin/sh\ncase "$1" in --version) echo "codex 9.9.9-stub"; exit 0;; esac\n/bin/sleep 300 &\necho "$$ $! $CODEX_HOME" > ${JSON.stringify(started)}\nexec /bin/sleep 300\n`,
+    });
+    const probe = spawn(process.execPath, [CLI_ENTRY, "probe"], { env: { PATH: dir }, stdio: "ignore" });
+    const exited = once(probe, "exit");
+    let line = "";
+    for (let attempt = 0; attempt < 100 && line.split(" ").length < 3; attempt++) {
+      await delay(50);
+      line = existsSync(started) ? readFileSync(started, "utf8").trim() : "";
+    }
+    const [leader, grandchild, codexHome] = line.split(" ");
+    assert.ok(codexHome, "the app-server stub never started");
+    probe.kill("SIGINT");
+    const [code] = await exited;
+    assert.equal(code, 130);
+    await assertGoneSoon(Number(leader));
+    await assertGoneSoon(Number(grandchild));
+    assert.equal(existsSync(path.dirname(codexHome)), false, "the probe's temp home is left behind");
+  });
+
+  test("a provider that hangs or fails on --version gets no version, and its processes are reaped", async () => {
+    const pidFile = path.join(tempDir(), "pid");
+    const dir = stubDir({
+      codex: `#!/bin/sh\necho "codex 9.9.9-stub"\nexit 2\n`,
+      claude: `#!/bin/sh\n/bin/sleep 300 &\necho $! > ${JSON.stringify(pidFile)}\nexec /bin/sleep 300\n`,
+    });
+    const report = await probeInProcess(dir, { versionTimeoutMs: 500 });
+    const [codex, claude] = report.providers;
+    assert.equal(codex.version, null);
+    assert.equal(codex.version_check?.exit_code, 2);
+    assert.equal(claude.version, null);
+    assert.equal(claude.version_check?.timed_out, true);
+    for (const child of report.children) {
+      assert.equal(child.reaped, true);
+      assertGone(child.pid);
+    }
+    assertGone(Number(readFileSync(pidFile, "utf8").trim()));
   });
 
   test("an app-server using any home but the probe's own is sent nothing after initialize", async () => {

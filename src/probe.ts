@@ -1,5 +1,5 @@
 import { accessSync, constants, mkdirSync, mkdtempSync, realpathSync, rmSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { constants as osConstants, tmpdir } from "node:os";
 import path from "node:path";
 import { probeCodexAppServer } from "./codexAppServer.js";
 import {
@@ -13,7 +13,7 @@ import {
   type StaticReason,
   type SurfaceReport,
 } from "./probeReport.js";
-import { runToExit, type ChildRecord } from "./providerProcess.js";
+import { killLiveGroups, runToExit, type ChildRecord } from "./providerProcess.js";
 
 export const SURFACES = {
   codex: ["cli", "app_server", "desktop", "ide"],
@@ -41,6 +41,7 @@ export interface ProbeReport {
 
 const BINARY_NAMES: Record<ProviderName, string> = { codex: "codex", "claude-code": "claude" };
 const VERSION_TIMEOUT_MS = 10_000;
+const INTERRUPTS = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
 
 type StaticRow = Record<Capability, StaticReason>;
 const every = (reason: StaticReason): StaticRow =>
@@ -134,6 +135,7 @@ async function probeProvider<P extends ProviderName>(
   provider: P,
   pathValue: string,
   probeHome: ProbeHome,
+  versionTimeoutMs: number,
   children: ChildRecord[],
 ): Promise<ProviderReport<P>> {
   const surfaces = (report: (surface: SurfaceName<P>) => SurfaceReport) =>
@@ -152,7 +154,7 @@ async function probeProvider<P extends ProviderName>(
   }
 
   const env = buildChildEnv(pathValue, probeHome);
-  const ended = await runToExit([resolved.binary, "--version"], { env, cwd: probeHome.home, timeoutMs: VERSION_TIMEOUT_MS }, children);
+  const ended = await runToExit([resolved.binary, "--version"], { env, cwd: probeHome.home, timeoutMs: versionTimeoutMs }, children);
   const version = ended.exit_code === 0 && !ended.timed_out ? firstLine(ended.stdout) : null;
 
   const sources: Partial<Record<string, SurfaceReport>> = {};
@@ -163,14 +165,29 @@ async function probeProvider<P extends ProviderName>(
   return { provider, ...resolved, version, version_check: evidenceOf(ended), surfaces: surfaces((surface) => sources[surface]!) };
 }
 
-/** Probes both providers. Every provider process it starts has been reaped by the time this resolves. */
-export async function runProbe(pathValue = process.env.PATH ?? ""): Promise<ProbeReport> {
+export interface ProbeOptions {
+  versionTimeoutMs?: number;
+}
+
+/**
+ * Probes both providers. Every provider process it starts has been reaped by the time
+ * this resolves. Children lead their own process groups, so a terminal's Ctrl-C never
+ * reaches them: on SIGINT, SIGTERM or SIGHUP the probe kills every group it started,
+ * removes its temp home and exits with 128 + the signal number.
+ */
+export async function runProbe(pathValue = process.env.PATH ?? "", { versionTimeoutMs = VERSION_TIMEOUT_MS }: ProbeOptions = {}): Promise<ProbeReport> {
   const probed_at = new Date().toISOString();
   const children: ChildRecord[] = [];
   const probeHome = makeProbeHome();
+  const interrupted = (signal: (typeof INTERRUPTS)[number]) => {
+    killLiveGroups();
+    rmSync(probeHome.root, { recursive: true, force: true });
+    process.exit(128 + osConstants.signals[signal]);
+  };
+  for (const signal of INTERRUPTS) process.on(signal, interrupted);
   try {
-    const codex = await probeProvider("codex", pathValue, probeHome, children);
-    const claude = await probeProvider("claude-code", pathValue, probeHome, children);
+    const codex = await probeProvider("codex", pathValue, probeHome, versionTimeoutMs, children);
+    const claude = await probeProvider("claude-code", pathValue, probeHome, versionTimeoutMs, children);
     return {
       schema_version: 1,
       probed_at,
@@ -179,6 +196,7 @@ export async function runProbe(pathValue = process.env.PATH ?? ""): Promise<Prob
       children,
     };
   } finally {
+    for (const signal of INTERRUPTS) process.off(signal, interrupted);
     rmSync(probeHome.root, { recursive: true, force: true });
   }
 }

@@ -60,6 +60,25 @@ export async function reapGroup(pgid: number): Promise<boolean> {
   return true;
 }
 
+/** Process groups started and not yet reaped, so an interrupted probe can still kill them. */
+const liveGroups = new Set<number>();
+
+/**
+ * SIGKILLs every group not yet reaped, synchronously, for a probe that must stop now.
+ * It does not wait: a killed leader stays a zombie until this process exits, so a poll
+ * here would never see the group empty.
+ */
+export function killLiveGroups(): void {
+  for (const pgid of liveGroups) {
+    try {
+      process.kill(-pgid, "SIGKILL");
+    } catch {
+      // ESRCH: already gone.
+    }
+  }
+  liveGroups.clear();
+}
+
 /** `promise`'s value, or undefined once `ms` has passed. */
 function within<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
   return new Promise((resolve) => {
@@ -86,6 +105,7 @@ class Launched {
     const [file, ...args] = command;
     if (file === undefined || !file.startsWith("/")) throw new Error(`refusing to run a provider by bare name: ${file}`);
     this.child = spawn(file, args, { env, cwd, detached: true, stdio: [withStdin ? "pipe" : "ignore", "pipe", "pipe"] });
+    if (this.child.pid !== undefined) liveGroups.add(this.child.pid);
     this.child.stdin?.on("error", () => {
       // EPIPE once the provider has exited; the exit is what gets reported.
     });
@@ -114,6 +134,7 @@ class Launched {
     const pid = this.child.pid ?? null;
     if (pid !== null) {
       const reaped = await reapGroup(pid);
+      liveGroups.delete(pid);
       await within(this.exited, STDIO_CLOSE_WAIT_MS);
       await within(this.stdioClosed, STDIO_CLOSE_WAIT_MS);
       children.push({ pid, command: this.command, reaped });

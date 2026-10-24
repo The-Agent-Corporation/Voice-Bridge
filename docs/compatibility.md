@@ -35,7 +35,7 @@ The probe runs every provider by its resolved realpath and never by a bare name.
   6. `turn/steer {expectedTurnId}` is sent at once. On this machine it returned `-32600: no active turn to steer`, in each of the six runs on 2026-10-24: the credential-less turn had already ended. The cell stays `check_failed`, not `unsupported`.
   7. `turn/interrupt`, which is cleanup and not evidence. Then stdin closes.
 - Requests the server sends to the client, such as approvals or `item/tool/requestUserInput`, are recorded and never answered.
-- Every child leads its own process group. The group is SIGKILLed and polled until it is empty, even after a clean exit, because the Codex app-server leaves a grandchild behind. `probe` exits 1 if any group survives.
+- Every child leads its own process group. The group is SIGKILLed and polled until it is empty, even after a clean exit, because the Codex app-server leaves a grandchild behind. `probe` exits 1 if any group survives. On SIGINT (Ctrl-C), SIGTERM or SIGHUP it SIGKILLs every group it started, deletes the temp directory and exits with 128 + the signal number.
 
 The app-server is labelled `[experimental]` in `codex app-server --help` for this version. It opens outbound connections without credentials: the model websocket (refused with 401) and a plugin sync.
 
