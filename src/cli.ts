@@ -3,13 +3,15 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { daemonInfoPath, LISTEN_ADDRESS, type DaemonInfo } from "./app.js";
 import { resolveDataDir } from "./dataDir.js";
+import { runProbe } from "./probe.js";
 import type { OpenedProject, ProjectSummary, RegisterResult } from "./registry.js";
 import { readClientToken } from "./token.js";
 
 const USAGE = `usage:
   voice-bridge register <path>
   voice-bridge projects
-  voice-bridge open <project_id>`;
+  voice-bridge open <project_id>
+  voice-bridge probe`;
 
 class CliError extends Error {
   constructor(readonly code: string, message: string) {
@@ -103,6 +105,12 @@ async function run(args: string[]): Promise<number> {
     console.log(`freshness: ${project.freshness}`);
     console.log(project.briefing);
     return 0;
+  }
+  if (command === "probe" && arg === undefined) {
+    const report = await runProbe();
+    console.log(JSON.stringify(report, null, 2));
+    // A provider process that outlived the probe is a broken guarantee, so it fails the command.
+    return report.children.every((child) => child.reaped) ? 0 : 1;
   }
   console.error(USAGE);
   return 2;
