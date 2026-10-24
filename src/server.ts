@@ -1,9 +1,11 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { ProviderHomes } from "./adapters/homes.js";
-import { BridgeError } from "./errors.js";
+import { BridgeError, requireString } from "./errors.js";
+import { ingestEvent } from "./events.js";
 import { getPrimarySession, pinPrimary, unpinPrimary } from "./primary.js";
 import { listProjects, openProject, registerProject } from "./registry.js";
 import { listSessions } from "./sessions.js";
+import { getProjectStatus } from "./status.js";
 import type { Store } from "./store.js";
 import { tokenMatches } from "./token.js";
 
@@ -18,14 +20,6 @@ export interface BridgeServerOptions {
 
 type Tool = (options: BridgeServerOptions, body: Record<string, unknown>) => unknown;
 
-function requireString(body: Record<string, unknown>, field: string): string {
-  const value = body[field];
-  if (typeof value !== "string" || !value) {
-    throw new BridgeError("invalid_request", `${field} must be a non-empty string`);
-  }
-  return value;
-}
-
 const TOOLS: Record<string, Tool> = {
   register_project: ({ store, providerHomes }, body) => registerProject(store, requireString(body, "path"), providerHomes),
   list_projects: ({ store }) => ({ projects: listProjects(store) }),
@@ -36,6 +30,8 @@ const TOOLS: Record<string, Tool> = {
   pin_primary: ({ store, providerHomes }, body) =>
     pinPrimary(store, requireString(body, "project_id"), requireString(body, "session_id"), providerHomes),
   unpin_primary: ({ store, providerHomes }, body) => unpinPrimary(store, requireString(body, "project_id"), providerHomes),
+  ingest_event: ({ store }, body) => ingestEvent(store, body),
+  get_project_status: ({ store }, body) => getProjectStatus(store, requireString(body, "project_id")),
 };
 
 function sendJson(res: ServerResponse, status: number, payload: unknown): void {

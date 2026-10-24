@@ -91,3 +91,42 @@ test("a pinned primary session survives a restart", async () => {
     await second.stop();
   }
 });
+
+test("events and watermarks survive a restart", async () => {
+  const env = daemonEnv();
+  const dataDir = env.VOICE_BRIDGE_DATA_DIR!;
+  const event = (n: number) => ({
+    project_id: "desktop-agent",
+    source: "hook",
+    source_event_id: `e${n}`,
+    source_sequence: n,
+    type: "progress",
+    payload: { n },
+    observed_at: `2026-10-24T12:00:0${n}.000Z`,
+  });
+
+  const first = await spawnDaemon(env);
+  const token = readFileSync(tokenPath(dataDir), "utf8");
+  let lastEventId: number;
+  try {
+    assert.equal((await call(first.port, token, "register_project", { path: makeRepo() })).status, 200);
+    assert.equal((await call(first.port, token, "ingest_event", event(1))).status, 200);
+    lastEventId = (await call(first.port, token, "ingest_event", event(2))).body.event_id;
+  } finally {
+    await first.stop();
+  }
+
+  const second = await spawnDaemon(env);
+  try {
+    const { body } = await call(second.port, token, "get_project_status", { project_id: "desktop-agent" });
+    assert.equal(body.freshness, "current");
+    assert.deepEqual(body.watermarks, { hook: 2 });
+    assert.equal(body.last_event_id, lastEventId);
+    assert.deepEqual((await call(second.port, token, "ingest_event", event(2))).body, {
+      event_id: lastEventId,
+      duplicate: true,
+    });
+  } finally {
+    await second.stop();
+  }
+});

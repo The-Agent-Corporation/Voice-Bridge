@@ -5,8 +5,8 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { after, before, describe, test } from "node:test";
 import { daemonInfoPath, startBridge, type RunningBridge } from "../app.js";
-import { ensureClientToken } from "../token.js";
-import { CLI_ENTRY, fixtureHomes, makeRepo, removeTempDirs, tempDir } from "./helpers.js";
+import { ensureClientToken, readClientToken } from "../token.js";
+import { call, CLI_ENTRY, fixtureHomes, makeRepo, removeTempDirs, tempDir } from "./helpers.js";
 
 after(removeTempDirs);
 
@@ -84,8 +84,41 @@ describe("voice-bridge CLI", () => {
     assert.match(foreign.stderr, /session_not_in_project/);
   });
 
+  test("status --why prints freshness, reasons, watermarks and last_event_id", async () => {
+    const quiet = await cli("status", "desktop-agent");
+    assert.equal(quiet.status, 0, quiet.stderr);
+    assert.equal(quiet.stdout, "freshness: unverified\nlast_confirmed_activity: -\n");
+
+    const token = readClientToken(dataDir);
+    const ingested = await call(bridge.port, token, "ingest_event", {
+      project_id: "desktop-agent",
+      source: "hook",
+      source_event_id: "h1",
+      source_sequence: 1,
+      type: "turn_completed",
+      payload: {},
+      observed_at: "2026-10-24T12:00:00.000Z",
+    });
+    assert.equal(ingested.status, 200);
+
+    const why = await cli("status", "desktop-agent", "--why");
+    assert.equal(why.status, 0, why.stderr);
+    assert.equal(
+      why.stdout,
+      "freshness: current\nlast_confirmed_activity: turn_completed at 2026-10-24T12:00:00.000Z\n" +
+        `reasons: -\nwatermark\thook\t1\nlast_event_id: ${ingested.body.event_id}\n`,
+    );
+
+    const unknown = await cli("status", "nope");
+    assert.equal(unknown.status, 1);
+    assert.match(unknown.stderr, /project_not_found/);
+  });
+
   test("bad usage exits 2", async () => {
     assert.equal((await cli("unregister")).status, 2);
+    for (const args of [["status"], ["status", "desktop-agent", "--bogus"], ["status", "desktop-agent", "--why", "x"]]) {
+      assert.equal((await cli(...args)).status, 2, args.join(" "));
+    }
     for (const args of [["primary"], ["primary", "desktop-agent", "--pin"], ["primary", "desktop-agent", "--unpin", "x"], ["primary", "desktop-agent", "--bogus"]]) {
       assert.equal((await cli(...args)).status, 2, args.join(" "));
     }

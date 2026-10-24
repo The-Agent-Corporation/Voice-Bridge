@@ -7,6 +7,7 @@ import type { PrimaryResult } from "./primary.js";
 import { runProbe } from "./probe.js";
 import type { OpenedProject, ProjectSummary, RegisterResult } from "./registry.js";
 import type { SessionList } from "./sessions.js";
+import type { ProjectStatus } from "./status.js";
 import { readClientToken } from "./token.js";
 
 const USAGE = `usage:
@@ -17,6 +18,7 @@ const USAGE = `usage:
   voice-bridge primary <project_id>
   voice-bridge primary <project_id> --pin <session_id>
   voice-bridge primary <project_id> --unpin
+  voice-bridge status <project_id> [--why]
   voice-bridge probe`;
 
 class CliError extends Error {
@@ -141,6 +143,19 @@ async function run(args: string[]): Promise<number> {
     console.log(`available: ${result.available}\tmutating_allowed: ${result.mutating_allowed}`);
     console.log(`reason: ${result.reason}`);
     if (result.skipped_records > 0) console.log(`skipped_records: ${result.skipped_records}`);
+    return 0;
+  }
+  const why = rest.length === 1 && rest[0] === "--why";
+  if (command === "status" && arg && (rest.length === 0 || why)) {
+    const status = await callTool<ProjectStatus>("get_project_status", { project_id: arg });
+    const activity = status.last_confirmed_activity;
+    console.log(`freshness: ${status.freshness}`);
+    console.log(`last_confirmed_activity: ${activity ? `${activity.type} at ${activity.observed_at}` : "-"}`);
+    if (why) {
+      console.log(`reasons: ${status.freshness_reasons.join(", ") || "-"}`);
+      for (const [source, watermark] of Object.entries(status.watermarks)) console.log(`watermark\t${source}\t${watermark}`);
+      console.log(`last_event_id: ${status.last_event_id ?? "-"}`);
+    }
     return 0;
   }
   if (command === "probe" && arg === undefined) {
