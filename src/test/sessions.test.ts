@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { after, before, describe, test } from "node:test";
 import { startBridge, type RunningBridge } from "../app.js";
 import { runGit } from "../git.js";
+import { openStore } from "../store.js";
 import { readClientToken } from "../token.js";
 import {
   call,
@@ -39,6 +40,7 @@ function snapshot(dir: string): Record<string, { mtimeMs: number; sha256: string
 
 describe("saved session discovery", () => {
   let bridge: RunningBridge;
+  let dataDir: string;
   let token: string;
   let codexHome: string;
   let claudeHome: string;
@@ -54,13 +56,21 @@ describe("saved session discovery", () => {
     assert.equal(response.status, 200, JSON.stringify(response.body));
     return response.body as { project_id: string; sessions: any[]; skipped_records: number };
   };
+  const storedIds = (projectId: string) => {
+    const store = openStore(dataDir);
+    try {
+      return store.listSessions(projectId).map((s) => s.native_session_id).sort();
+    } finally {
+      store.close();
+    }
+  };
   const ids = (body: { sessions: { native_session_id: string }[] }) => body.sessions.map((s) => s.native_session_id).sort();
 
   before(async () => {
     const homes = fixtureHomes();
     codexHome = homes.VOICE_BRIDGE_CODEX_HOME;
     claudeHome = homes.VOICE_BRIDGE_CLAUDE_HOME;
-    const dataDir = tempDir();
+    dataDir = tempDir();
     bridge = await startBridge({ dataDir, port: 0, env: homes });
     token = readClientToken(dataDir);
 
@@ -120,6 +130,82 @@ describe("saved session discovery", () => {
     assert.deepEqual(ids(w), ["codex-w-1", "codex-w-wt"]);
     assert.equal(w.sessions.find((s) => s.native_session_id === "codex-w-1").worktree_id, repoW);
     assert.equal(w.sessions.find((s) => s.native_session_id === "codex-w-wt").worktree_id, worktreeW);
+  });
+
+  test("a project registered at a linked worktree claims only that worktree, so no session is listed twice", async () => {
+    const main = makeRepo(project("split-main"));
+    const commit = runGit(["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-q", "-m", "init"], main);
+    assert.ok(commit.ok, !commit.ok ? commit.detail : "");
+    const linked = ["one", "two"].map((name) => {
+      const dir = `${main}-${name}`;
+      const added = runGit(["worktree", "add", "-q", dir, "-b", name], main);
+      assert.ok(added.ok, !added.ok ? added.detail : "");
+      writeVoiceConfig(dir, project(`split-${name}`));
+      return realpathSync(dir);
+    });
+    writeCodexSession(codexHome, main, "codex-split-main");
+    writeCodexSession(codexHome, linked[0], "codex-split-one");
+    writeCodexSession(codexHome, linked[1], "codex-split-two");
+    const register = async (dir: string) =>
+      assert.equal((await call(bridge.port, token, "register_project", { path: dir })).status, 200);
+
+    await register(linked[0]);
+    assert.deepEqual(ids(await sessions("split-one")), ["codex-split-one"]);
+
+    await register(main);
+    assert.deepEqual(ids(await sessions("split-main")), ["codex-split-main", "codex-split-two"]);
+    assert.deepEqual(ids(await sessions("split-one")), ["codex-split-one"]);
+
+    await register(linked[1]);
+    assert.deepEqual(ids(await sessions("split-main")), ["codex-split-main"]);
+    assert.deepEqual(ids(await sessions("split-two")), ["codex-split-two"]);
+  });
+
+  test("a session saved twice is stored once, as its most recent copy", async () => {
+    const repo = makeRepo(project("twice"));
+    const older = writeCodexSession(codexHome, repo, "codex-twice");
+    const newer = writeCodexSession(codexHome, repo, "codex-twice", { zstd: true });
+    utimesSync(older, new Date("2026-01-01T00:00:00Z"), new Date("2026-01-01T00:00:00Z"));
+    utimesSync(newer, new Date("2026-02-01T00:00:00Z"), new Date("2026-02-01T00:00:00Z"));
+    try {
+      assert.equal((await call(bridge.port, token, "register_project", { path: repo })).status, 200);
+      const twice = await sessions("twice");
+      assert.equal(twice.sessions.length, 1);
+      assert.equal(twice.sessions[0].last_activity_at, "2026-02-01T00:00:00.000Z");
+    } finally {
+      rmSync(older);
+      rmSync(newer);
+    }
+  });
+
+  test("a missing provider home set in the environment fails loudly and keeps the stored sessions", async () => {
+    const stored = storedIds("repo-b");
+    assert.notDeepEqual(stored, []);
+    const moved = `${codexHome}-moved`;
+    renameSync(codexHome, moved);
+    try {
+      const response = await call(bridge.port, token, "list_sessions", { project_id: "repo-b" });
+      assert.equal(response.status, 500);
+      assert.equal(response.body.error.code, "session_discovery_failed");
+      assert.deepEqual(storedIds("repo-b"), stored);
+    } finally {
+      renameSync(moved, codexHome);
+    }
+  });
+
+  test("a provider folder that cannot be read fails loudly and keeps the stored sessions", { skip: process.getuid?.() === 0 && "root reads any folder" }, async () => {
+    const stored = storedIds("repo-b");
+    assert.notDeepEqual(stored, []);
+    const dir = path.join(codexHome, "sessions");
+    chmodSync(dir, 0o000);
+    try {
+      const response = await call(bridge.port, token, "list_sessions", { project_id: "repo-b" });
+      assert.equal(response.status, 500);
+      assert.equal(response.body.error.code, "session_discovery_failed");
+      assert.deepEqual(storedIds("repo-b"), stored);
+    } finally {
+      chmodSync(dir, 0o755);
+    }
   });
 
   test("every discovered session is saved, with every capability false", async () => {

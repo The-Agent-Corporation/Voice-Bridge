@@ -1,3 +1,5 @@
+import type { Capability } from "../probeReport.js";
+
 export const PROVIDERS = ["codex", "claude-code"] as const;
 
 export type Provider = (typeof PROVIDERS)[number];
@@ -17,6 +19,15 @@ export interface SessionCapabilities {
   answer_pending_question: boolean;
   subscribe_events: boolean;
 }
+
+/** The probe's name (probeReport.ts) for each session capability, so the two vocabularies cannot drift apart. */
+export const PROBED_AS = {
+  live_attach: "live_attach",
+  next_turn: "next_turn",
+  steer_active_turn: "steer",
+  answer_pending_question: "answer_question",
+  subscribe_events: "events",
+} as const satisfies Record<keyof SessionCapabilities, Capability>;
 
 /** A work tree of a registered project; `id` is its canonical root path. */
 export interface Worktree {
