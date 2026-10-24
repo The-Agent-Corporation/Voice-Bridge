@@ -5,12 +5,14 @@ import { daemonInfoPath, LISTEN_ADDRESS, type DaemonInfo } from "./app.js";
 import { resolveDataDir } from "./dataDir.js";
 import { runProbe } from "./probe.js";
 import type { OpenedProject, ProjectSummary, RegisterResult } from "./registry.js";
+import type { SessionList } from "./sessions.js";
 import { readClientToken } from "./token.js";
 
 const USAGE = `usage:
   voice-bridge register <path>
   voice-bridge projects
   voice-bridge open <project_id>
+  voice-bridge sessions <project_id>
   voice-bridge probe`;
 
 class CliError extends Error {
@@ -91,6 +93,8 @@ async function run(args: string[]): Promise<number> {
     const result = await callTool<RegisterResult>("register_project", { path: path.resolve(arg) });
     const verb = result.created ? "registered" : "already registered";
     console.log(`${verb} ${result.project_id} (${result.display_name}) at ${result.canonical_path}`);
+    const skipped = result.skipped_records > 0 ? `, skipped ${result.skipped_records} unreadable record(s)` : "";
+    console.log(`found ${result.sessions} saved session(s)${skipped}`);
     return 0;
   }
   if (command === "projects" && arg === undefined) {
@@ -104,6 +108,15 @@ async function run(args: string[]): Promise<number> {
     console.log(project.display_name);
     console.log(`freshness: ${project.freshness}`);
     console.log(project.briefing);
+    return 0;
+  }
+  if (command === "sessions" && arg && rest.length === 0) {
+    const { sessions, skipped_records } = await callTool<SessionList>("list_sessions", { project_id: arg });
+    if (sessions.length === 0) console.log("no saved sessions found");
+    for (const s of sessions) {
+      console.log([s.provider, s.native_session_id, s.observed_state, s.last_activity_at ?? "-", s.worktree_id].join("\t"));
+    }
+    if (skipped_records > 0) console.log(`skipped_records: ${skipped_records}`);
     return 0;
   }
   if (command === "probe" && arg === undefined) {

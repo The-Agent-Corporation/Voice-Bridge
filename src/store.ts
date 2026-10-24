@@ -1,9 +1,10 @@
 import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
+import type { DiscoveredSession, Provider } from "./adapters/types.js";
 import { BridgeError } from "./errors.js";
 
 export const STORE_FILE = "bridge.sqlite";
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const SQLITE_CONSTRAINT_UNIQUE = 2067;
 
 export interface Project {
@@ -14,6 +15,11 @@ export interface Project {
   updated_at: string;
 }
 
+export interface StoredSession extends DiscoveredSession {
+  /** `<provider>:<native_session_id>`, stable across rediscovery. */
+  session_id: string;
+}
+
 export interface Store {
   getById(projectId: string): Project | undefined;
   list(): Project[];
@@ -22,29 +28,71 @@ export interface Store {
    * One id maps to one canonical path; either conflict throws and writes nothing.
    */
   upsert(project: Omit<Project, "created_at" | "updated_at">): { project: Project; created: boolean };
+  /** Replaces every stored session of the project with `sessions`, in one transaction. */
+  replaceSessions(projectId: string, sessions: readonly DiscoveredSession[]): void;
+  /** Most recent activity first, then by session_id. */
+  listSessions(projectId: string): StoredSession[];
   close(): void;
 }
 
-/** Migrating stored data is a human decision, so an unknown schema version refuses to open. */
+const PROJECTS_TABLE = `
+  CREATE TABLE IF NOT EXISTS projects (
+    project_id     TEXT PRIMARY KEY,
+    canonical_path TEXT NOT NULL UNIQUE,
+    display_name   TEXT NOT NULL,
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL
+  );
+`;
+
+const SESSIONS_TABLE = `
+  CREATE TABLE IF NOT EXISTS sessions (
+    project_id        TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+    session_id        TEXT NOT NULL,
+    provider          TEXT NOT NULL,
+    native_session_id TEXT NOT NULL,
+    worktree_id       TEXT NOT NULL,
+    observed_state    TEXT NOT NULL,
+    last_activity_at  TEXT,
+    capabilities      TEXT NOT NULL,
+    PRIMARY KEY (project_id, session_id)
+  );
+`;
+
+/** Tables each known version still lacks; every step only adds tables and leaves stored rows alone. */
+const MIGRATIONS: Record<number, string> = {
+  0: PROJECTS_TABLE + SESSIONS_TABLE,
+  1: SESSIONS_TABLE,
+};
+
+function inTransaction<T>(db: DatabaseSync, work: () => T): T {
+  db.exec("BEGIN");
+  try {
+    const result = work();
+    db.exec("COMMIT");
+    return result;
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+/** Rewriting stored data is a human decision, so a version with no additive step here refuses to open. */
 function initSchema(db: DatabaseSync, file: string): void {
   const { user_version: version } = db.prepare("PRAGMA user_version").get() as { user_version: number };
   if (version === SCHEMA_VERSION) return;
-  if (version !== 0) {
+  const migration = Object.hasOwn(MIGRATIONS, version) ? MIGRATIONS[version] : undefined;
+  if (migration === undefined) {
     throw new BridgeError(
       "store_version_unsupported",
-      `${file} has schema version ${version}; this build only understands version ${SCHEMA_VERSION}`,
+      `${file} has schema version ${version}; this build only understands versions up to ${SCHEMA_VERSION}`,
     );
   }
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS projects (
-      project_id     TEXT PRIMARY KEY,
-      canonical_path TEXT NOT NULL UNIQUE,
-      display_name   TEXT NOT NULL,
-      created_at     TEXT NOT NULL,
-      updated_at     TEXT NOT NULL
-    );
-    PRAGMA user_version = ${SCHEMA_VERSION};
-  `);
+  inTransaction(db, () => db.exec(`${migration} PRAGMA user_version = ${SCHEMA_VERSION};`));
+}
+
+export function sessionId(provider: Provider, nativeSessionId: string): string {
+  return `${provider}:${nativeSessionId}`;
 }
 
 export function openStore(dataDir: string): Store {
@@ -68,6 +116,19 @@ export function openStore(dataDir: string): Store {
       display_name = excluded.display_name,
       updated_at = excluded.updated_at
     WHERE projects.canonical_path = excluded.canonical_path
+  `);
+
+  const deleteSessions = db.prepare("DELETE FROM sessions WHERE project_id = ?");
+  const insertSession = db.prepare(`
+    INSERT INTO sessions (project_id, session_id, provider, native_session_id, worktree_id,
+                          observed_state, last_activity_at, capabilities)
+    VALUES (:project_id, :session_id, :provider, :native_session_id, :worktree_id,
+            :observed_state, :last_activity_at, :capabilities)
+  `);
+  const sessionsOf = db.prepare(`
+    SELECT session_id, provider, native_session_id, worktree_id, observed_state, last_activity_at, capabilities
+    FROM sessions WHERE project_id = ?
+    ORDER BY last_activity_at IS NULL, last_activity_at DESC, session_id
   `);
 
   const getById = (projectId: string) => byId.get(projectId) as Project | undefined;
@@ -108,6 +169,27 @@ export function openStore(dataDir: string): Store {
         );
       }
       return { project: stored, created: existing === undefined };
+    },
+    replaceSessions(projectId, sessions) {
+      inTransaction(db, () => {
+        deleteSessions.run(projectId);
+        for (const session of sessions) {
+          insertSession.run({
+            project_id: projectId,
+            session_id: sessionId(session.provider, session.native_session_id),
+            provider: session.provider,
+            native_session_id: session.native_session_id,
+            worktree_id: session.worktree_id,
+            observed_state: session.observed_state,
+            last_activity_at: session.last_activity_at,
+            capabilities: JSON.stringify(session.capabilities),
+          });
+        }
+      });
+    },
+    listSessions(projectId) {
+      const rows = sessionsOf.all(projectId) as unknown as (Omit<StoredSession, "capabilities"> & { capabilities: string })[];
+      return rows.map((row) => ({ ...row, capabilities: JSON.parse(row.capabilities) }));
     },
     close() {
       db.close();

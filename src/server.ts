@@ -1,6 +1,8 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import type { ProviderHomes } from "./adapters/homes.js";
 import { BridgeError } from "./errors.js";
 import { listProjects, openProject, registerProject } from "./registry.js";
+import { listSessions } from "./sessions.js";
 import type { Store } from "./store.js";
 import { tokenMatches } from "./token.js";
 
@@ -10,9 +12,10 @@ export interface BridgeServerOptions {
   store: Store;
   token: string;
   buildId: string | null;
+  providerHomes: ProviderHomes;
 }
 
-type Tool = (store: Store, body: Record<string, unknown>) => unknown;
+type Tool = (options: BridgeServerOptions, body: Record<string, unknown>) => unknown;
 
 function requireString(body: Record<string, unknown>, field: string): string {
   const value = body[field];
@@ -23,9 +26,10 @@ function requireString(body: Record<string, unknown>, field: string): string {
 }
 
 const TOOLS: Record<string, Tool> = {
-  register_project: (store, body) => registerProject(store, requireString(body, "path")),
-  list_projects: (store) => ({ projects: listProjects(store) }),
-  open_project: (store, body) => openProject(store, requireString(body, "project_id")),
+  register_project: ({ store, providerHomes }, body) => registerProject(store, requireString(body, "path"), providerHomes),
+  list_projects: ({ store }) => ({ projects: listProjects(store) }),
+  open_project: ({ store }, body) => openProject(store, requireString(body, "project_id")),
+  list_sessions: ({ store, providerHomes }, body) => listSessions(store, requireString(body, "project_id"), providerHomes),
 };
 
 function sendJson(res: ServerResponse, status: number, payload: unknown): void {
@@ -98,7 +102,7 @@ async function route(req: IncomingMessage, res: ServerResponse, options: BridgeS
     const tool = Object.hasOwn(TOOLS, name) ? TOOLS[name] : undefined;
     if (!tool) throw new BridgeError("unknown_tool", `no tool named ${name}`);
     const body = await readJsonObject(req);
-    return sendJson(res, 200, tool(options.store, body));
+    return sendJson(res, 200, await tool(options, body));
   }
 
   throw new BridgeError("not_found", `nothing is served at ${pathname}`);

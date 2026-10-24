@@ -4,13 +4,13 @@ import { after, test } from "node:test";
 import { PACKAGE_ROOT } from "../buildId.js";
 import { runGit } from "../git.js";
 import { tokenPath } from "../token.js";
-import { call, makeRepo, removeTempDirs, spawnDaemon, tempDir } from "./helpers.js";
+import { call, fixtureHomes, makeRepo, removeTempDirs, spawnDaemon, tempDir } from "./helpers.js";
 
 after(removeTempDirs);
 
 function daemonEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   const { FACTORY_RUNTIME_CANDIDATE: _ignored, ...env } = process.env;
-  return { ...env, VOICE_BRIDGE_DATA_DIR: tempDir(), ...extra };
+  return { ...env, VOICE_BRIDGE_DATA_DIR: tempDir(), ...fixtureHomes(), ...extra };
 }
 
 async function getText(port: number, route: string): Promise<{ status: number; text: string }> {

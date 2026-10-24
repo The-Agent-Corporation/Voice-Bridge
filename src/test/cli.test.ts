@@ -6,7 +6,7 @@ import type { AddressInfo } from "node:net";
 import { after, before, describe, test } from "node:test";
 import { daemonInfoPath, startBridge, type RunningBridge } from "../app.js";
 import { ensureClientToken } from "../token.js";
-import { CLI_ENTRY, makeRepo, removeTempDirs, tempDir } from "./helpers.js";
+import { CLI_ENTRY, fixtureHomes, makeRepo, removeTempDirs, tempDir } from "./helpers.js";
 
 after(removeTempDirs);
 
@@ -27,7 +27,7 @@ describe("voice-bridge CLI", () => {
 
   before(async () => {
     dataDir = tempDir();
-    bridge = await startBridge({ dataDir, port: 0, env: {} });
+    bridge = await startBridge({ dataDir, port: 0, env: fixtureHomes() });
   });
 
   after(() => bridge.close());
@@ -39,7 +39,7 @@ describe("voice-bridge CLI", () => {
 
     const registered = await cli("register", repo);
     assert.equal(registered.status, 0, registered.stderr);
-    assert.equal(registered.stdout, `registered desktop-agent (Desktop Agent) at ${repo}\n`);
+    assert.equal(registered.stdout, `registered desktop-agent (Desktop Agent) at ${repo}\nfound 0 saved session(s)\n`);
 
     const projects = await cli("projects");
     assert.equal(projects.status, 0, projects.stderr);
@@ -54,6 +54,16 @@ describe("voice-bridge CLI", () => {
     const result = await cli("open", "nope");
     assert.equal(result.status, 1);
     assert.match(result.stderr, /project_not_found/);
+  });
+
+  test("sessions lists a registered project's saved sessions and rejects an unknown id", async () => {
+    const listed = await cli("sessions", "desktop-agent");
+    assert.equal(listed.status, 0, listed.stderr);
+    assert.equal(listed.stdout, "no saved sessions found\n");
+
+    const unknown = await cli("sessions", "nope");
+    assert.equal(unknown.status, 1);
+    assert.match(unknown.stderr, /project_not_found/);
   });
 
   test("bad usage exits 2", async () => {

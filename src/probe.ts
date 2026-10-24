@@ -1,6 +1,7 @@
 import { accessSync, constants, mkdirSync, mkdtempSync, realpathSync, rmSync, statSync } from "node:fs";
 import { constants as osConstants, tmpdir } from "node:os";
 import path from "node:path";
+import type { Provider } from "./adapters/types.js";
 import { probeCodexAppServer } from "./codexAppServer.js";
 import {
   CAPABILITIES,
@@ -18,8 +19,8 @@ import { killLiveGroups, runToExit, type ChildRecord } from "./providerProcess.j
 export const SURFACES = {
   codex: ["cli", "app_server", "desktop", "ide"],
   "claude-code": ["cli", "sdk", "desktop", "ide"],
-} as const;
-export type ProviderName = keyof typeof SURFACES;
+} as const satisfies Record<Provider, readonly string[]>;
+export type ProviderName = Provider;
 export type SurfaceName<P extends ProviderName = ProviderName> = (typeof SURFACES)[P][number];
 
 export interface ProviderReport<P extends ProviderName = ProviderName> {
