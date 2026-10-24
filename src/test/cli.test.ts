@@ -66,8 +66,29 @@ describe("voice-bridge CLI", () => {
     assert.match(unknown.stderr, /project_not_found/);
   });
 
+  test("primary reports the route of a registered project and rejects an unknown id", async () => {
+    const primary = await cli("primary", "desktop-agent");
+    assert.equal(primary.status, 0, primary.stderr);
+    assert.match(primary.stdout, /^route: none\nprimary: -\nconnected: -\navailable: false\tmutating_allowed: false\nreason: .+\n$/);
+
+    const unpinned = await cli("primary", "desktop-agent", "--unpin");
+    assert.equal(unpinned.status, 0, unpinned.stderr);
+    assert.match(unpinned.stdout, /^route: none\n/);
+
+    const unknown = await cli("primary", "nope");
+    assert.equal(unknown.status, 1);
+    assert.match(unknown.stderr, /project_not_found/);
+
+    const foreign = await cli("primary", "desktop-agent", "--pin", "codex:nope");
+    assert.equal(foreign.status, 1);
+    assert.match(foreign.stderr, /session_not_in_project/);
+  });
+
   test("bad usage exits 2", async () => {
     assert.equal((await cli("unregister")).status, 2);
+    for (const args of [["primary"], ["primary", "desktop-agent", "--pin"], ["primary", "desktop-agent", "--unpin", "x"], ["primary", "desktop-agent", "--bogus"]]) {
+      assert.equal((await cli(...args)).status, 2, args.join(" "));
+    }
   });
 });
 

@@ -4,7 +4,7 @@ import { after, test } from "node:test";
 import { PACKAGE_ROOT } from "../buildId.js";
 import { runGit } from "../git.js";
 import { tokenPath } from "../token.js";
-import { call, fixtureHomes, makeRepo, removeTempDirs, spawnDaemon, tempDir } from "./helpers.js";
+import { call, fixtureHomes, makeRepo, removeTempDirs, spawnDaemon, tempDir, writeClaudeSession } from "./helpers.js";
 
 after(removeTempDirs);
 
@@ -61,6 +61,32 @@ test("registered projects and the client token survive a restart", async () => {
     if (process.platform !== "win32") assert.equal(statSync(tokenPath(dataDir)).mode & 0o777, 0o600);
     const { body } = await call(second.port, token, "list_projects");
     assert.deepEqual(body.projects, [{ project_id: "desktop-agent", display_name: "Desktop Agent", canonical_path: repo }]);
+  } finally {
+    await second.stop();
+  }
+});
+
+test("a pinned primary session survives a restart", async () => {
+  const env = daemonEnv();
+  const dataDir = env.VOICE_BRIDGE_DATA_DIR!;
+  const repo = makeRepo();
+  writeClaudeSession(env.VOICE_BRIDGE_CLAUDE_HOME!, repo, "claude-1");
+  const pin = { project_id: "desktop-agent", session_id: "claude-code:claude-1" };
+
+  const first = await spawnDaemon(env);
+  const token = readFileSync(tokenPath(dataDir), "utf8");
+  try {
+    assert.equal((await call(first.port, token, "register_project", { path: repo })).status, 200);
+    assert.equal((await call(first.port, token, "pin_primary", pin)).body.route, "pinned");
+  } finally {
+    await first.stop();
+  }
+
+  const second = await spawnDaemon(env);
+  try {
+    const { body } = await call(second.port, token, "get_primary_session", { project_id: "desktop-agent" });
+    assert.equal(body.route, "pinned");
+    assert.equal(body.primary_session_id, pin.session_id);
   } finally {
     await second.stop();
   }

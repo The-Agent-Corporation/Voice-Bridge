@@ -13,6 +13,7 @@ const STATUS_BY_CODE = {
   project_id_conflict: 400,
   path_already_registered: 400,
   invalid_request: 400,
+  session_not_in_project: 400,
   unauthorized: 401,
   unknown_tool: 404,
   project_not_found: 404,

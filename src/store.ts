@@ -4,7 +4,7 @@ import type { DiscoveredSession, Provider } from "./adapters/types.js";
 import { BridgeError } from "./errors.js";
 
 export const STORE_FILE = "bridge.sqlite";
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const SQLITE_CONSTRAINT_UNIQUE = 2067;
 
 export interface Project {
@@ -20,6 +20,12 @@ export interface StoredSession extends DiscoveredSession {
   session_id: string;
 }
 
+export interface PrimaryPin {
+  project_id: string;
+  session_id: string;
+  pinned_at: string;
+}
+
 export interface Store {
   getById(projectId: string): Project | undefined;
   list(): Project[];
@@ -32,6 +38,14 @@ export interface Store {
   replaceSessions(projectId: string, sessions: readonly DiscoveredSession[]): void;
   /** Most recent activity first, then by session_id. */
   listSessions(projectId: string): StoredSession[];
+  getPin(projectId: string): PrimaryPin | undefined;
+  /** Pins the session, replacing any earlier pin, and records a `pin` audit row in the same transaction. */
+  setPin(projectId: string, sessionId: string): PrimaryPin;
+  /**
+   * Removes the pin and records an `unpin` audit row in the same transaction; returns the removed pin.
+   * With no pin it writes nothing.
+   */
+  clearPin(projectId: string): PrimaryPin | undefined;
   close(): void;
 }
 
@@ -59,10 +73,31 @@ const SESSIONS_TABLE = `
   );
 `;
 
+// No foreign key to sessions: replaceSessions deletes and reinserts every row, which would drop or block the pin.
+const PRIMARY_PINS_TABLE = `
+  CREATE TABLE IF NOT EXISTS primary_pins (
+    project_id TEXT PRIMARY KEY REFERENCES projects(project_id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL,
+    pinned_at  TEXT NOT NULL
+  );
+`;
+
+/** Append-only, with no foreign keys, so the history outlives the pins and projects it names. */
+const PIN_AUDIT_TABLE = `
+  CREATE TABLE IF NOT EXISTS pin_audit (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    action     TEXT NOT NULL CHECK (action IN ('pin', 'unpin')),
+    at         TEXT NOT NULL
+  );
+`;
+
 /** Tables each known version still lacks; every step only adds tables and leaves stored rows alone. */
 const MIGRATIONS: Record<number, string> = {
-  0: PROJECTS_TABLE + SESSIONS_TABLE,
-  1: SESSIONS_TABLE,
+  0: PROJECTS_TABLE + SESSIONS_TABLE + PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE,
+  1: SESSIONS_TABLE + PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE,
+  2: PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE,
 };
 
 function inTransaction<T>(db: DatabaseSync, work: () => T): T {
@@ -131,6 +166,16 @@ export function openStore(dataDir: string): Store {
     ORDER BY last_activity_at IS NULL, last_activity_at DESC, session_id
   `);
 
+  const pinOf = db.prepare("SELECT project_id, session_id, pinned_at FROM primary_pins WHERE project_id = ?");
+  const upsertPin = db.prepare(`
+    INSERT INTO primary_pins (project_id, session_id, pinned_at) VALUES (:project_id, :session_id, :pinned_at)
+    ON CONFLICT (project_id) DO UPDATE SET session_id = excluded.session_id, pinned_at = excluded.pinned_at
+  `);
+  const deletePin = db.prepare("DELETE FROM primary_pins WHERE project_id = ?");
+  const insertAudit = db.prepare(`
+    INSERT INTO pin_audit (project_id, session_id, action, at) VALUES (:project_id, :session_id, :action, :at)
+  `);
+
   const getById = (projectId: string) => byId.get(projectId) as Project | undefined;
   const getByPath = (canonicalPath: string) => byPath.get(canonicalPath) as Project | undefined;
 
@@ -190,6 +235,26 @@ export function openStore(dataDir: string): Store {
     listSessions(projectId) {
       const rows = sessionsOf.all(projectId) as unknown as (Omit<StoredSession, "capabilities"> & { capabilities: string })[];
       return rows.map((row) => ({ ...row, capabilities: JSON.parse(row.capabilities) }));
+    },
+    getPin(projectId) {
+      return pinOf.get(projectId) as PrimaryPin | undefined;
+    },
+    setPin(projectId, sessionId) {
+      const pin: PrimaryPin = { project_id: projectId, session_id: sessionId, pinned_at: new Date().toISOString() };
+      inTransaction(db, () => {
+        upsertPin.run({ ...pin });
+        insertAudit.run({ project_id: projectId, session_id: sessionId, action: "pin", at: pin.pinned_at });
+      });
+      return pin;
+    },
+    clearPin(projectId) {
+      return inTransaction(db, () => {
+        const pin = pinOf.get(projectId) as PrimaryPin | undefined;
+        if (!pin) return undefined;
+        deletePin.run(projectId);
+        insertAudit.run({ project_id: projectId, session_id: pin.session_id, action: "unpin", at: new Date().toISOString() });
+        return pin;
+      });
     },
     close() {
       db.close();
