@@ -1,0 +1,10 @@
+# Claude Code. Model ids are the aliases this pinned Archon revision documents
+# (sonnet, opus, haiku), not a longer API model name.
+assistant: claude
+assistants:
+  claude:
+    model: sonnet
+tiers:
+  small: { provider: claude, model: sonnet }
+  medium: { provider: claude, model: sonnet }
+  large: { provider: claude, model: opus }
