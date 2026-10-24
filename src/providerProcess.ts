@@ -134,7 +134,7 @@ class Launched {
     const pid = this.child.pid ?? null;
     if (pid !== null) {
       const reaped = await reapGroup(pid);
-      liveGroups.delete(pid);
+      if (reaped) liveGroups.delete(pid);
       await within(this.exited, STDIO_CLOSE_WAIT_MS);
       await within(this.stdioClosed, STDIO_CLOSE_WAIT_MS);
       children.push({ pid, command: this.command, reaped });
