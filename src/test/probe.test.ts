@@ -6,7 +6,8 @@ import path from "node:path";
 import { after, describe, test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { PACKAGE_ROOT } from "../buildId.js";
-import { runProbe as probeInProcess, resolveExecutable, STATIC_REASONS, SURFACES, type ProbeReport } from "../probe.js";
+import { resolveExecutable } from "../executable.js";
+import { runProbe as probeInProcess, STATIC_REASONS, SURFACES, type ProbeReport } from "../probe.js";
 import { CAPABILITIES, UNVERIFIED_REASONS, type CapabilityResult } from "../probeReport.js";
 import { CLI_ENTRY, removeTempDirs, tempDir } from "./helpers.js";
 

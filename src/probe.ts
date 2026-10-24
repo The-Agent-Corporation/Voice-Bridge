@@ -1,8 +1,9 @@
-import { accessSync, constants, mkdirSync, mkdtempSync, realpathSync, rmSync, statSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { constants as osConstants, tmpdir } from "node:os";
 import path from "node:path";
 import type { Provider } from "./adapters/types.js";
 import { probeCodexAppServer } from "./codexAppServer.js";
+import { resolveExecutable } from "./executable.js";
 import {
   CAPABILITIES,
   evidenceOf,
@@ -80,26 +81,6 @@ export const STATIC_REASONS: { codex: Record<Exclude<SurfaceName<"codex">, "app_
 };
 
 const staticSurface = (row: StaticRow) => surfaceOf((capability) => ({ ...unprovable(row[capability]), evidence: [] }));
-
-/**
- * Finds `name` on `pathValue` the way a shell would, but only in absolute entries: a
- * relative entry resolves against whatever the cwd is, which the caller controls.
- * Returns the PATH hit and its realpath, which is what the probe executes.
- */
-export function resolveExecutable(name: string, pathValue: string): { found_on_path: string; binary: string } | null {
-  for (const entry of pathValue.split(path.delimiter)) {
-    if (!path.isAbsolute(entry)) continue;
-    const candidate = path.join(entry, name);
-    try {
-      if (!statSync(candidate).isFile()) continue;
-      accessSync(candidate, constants.X_OK);
-      return { found_on_path: candidate, binary: realpathSync(candidate) };
-    } catch {
-      continue;
-    }
-  }
-  return null;
-}
 
 interface ProbeHome {
   root: string;
