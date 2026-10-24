@@ -6,9 +6,6 @@ import { setTimeout as delay } from "node:timers/promises";
 export interface ChildRecord {
   pid: number;
   command: string[];
-  exit_code: number | null;
-  signal: string | null;
-  timed_out: boolean;
   reaped: boolean;
 }
 
@@ -119,7 +116,7 @@ class Launched {
       const reaped = await reapGroup(pid);
       await within(this.exited, STDIO_CLOSE_WAIT_MS);
       await within(this.stdioClosed, STDIO_CLOSE_WAIT_MS);
-      children.push({ pid, command: this.command, exit_code: this.exitCode, signal: this.signal, timed_out: timedOut, reaped });
+      children.push({ pid, command: this.command, reaped });
     }
     return {
       command: this.command,

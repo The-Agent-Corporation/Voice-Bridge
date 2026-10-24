@@ -3,7 +3,8 @@ import { execFile } from "node:child_process";
 import { chmodSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { after, describe, test } from "node:test";
-import { CAPABILITIES, resolveExecutable, type CapabilityResult, type ProbeReport } from "../probe.js";
+import { resolveExecutable, type ProbeReport } from "../probe.js";
+import { CAPABILITIES, type CapabilityResult } from "../probeReport.js";
 import { CLI_ENTRY, removeTempDirs, tempDir } from "./helpers.js";
 
 after(removeTempDirs);

@@ -8,7 +8,7 @@ import {
   type Evidence,
   type SurfaceReport,
   type Verdict,
-} from "./probe.js";
+} from "./probeReport.js";
 import { startSession, type ChildRecord, type LaunchOptions, type Session } from "./providerProcess.js";
 
 const RPC_TIMEOUT_MS = 5_000;
