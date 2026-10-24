@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { utimesSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -31,6 +32,8 @@ describe("primary session tools", () => {
     const repoA = makeRepo(project("repo-a"));
     const repoB = makeRepo(project("repo-b"));
     writeClaudeSession(homes.VOICE_BRIDGE_CLAUDE_HOME, repoA, "claude-a-1");
+    const older = new Date("2026-01-01T00:00:00.000Z");
+    utimesSync(writeClaudeSession(homes.VOICE_BRIDGE_CLAUDE_HOME, repoA, "claude-a-2"), older, older);
     writeClaudeSession(homes.VOICE_BRIDGE_CLAUDE_HOME, repoB, "claude-b-1");
     for (const repo of [repoA, repoB]) assert.equal((await tool("register_project", { path: repo })).status, 200);
   });
@@ -58,6 +61,20 @@ describe("primary session tools", () => {
     assert.equal(body.primary_session_id, "claude-code:claude-a-1");
     assert.equal(body.mutating_allowed, false);
     assert.equal(body.workspace_owner_session_id, null);
+    assert.equal(body.skipped_records, 0);
+  });
+
+  test("re-pinning moves the primary to the new session and audits both pins", async () => {
+    assert.equal((await tool("pin_primary", { project_id: "repo-a", session_id: "claude-code:claude-a-1" })).status, 200);
+    const repinned = await tool("pin_primary", { project_id: "repo-a", session_id: "claude-code:claude-a-2" });
+    assert.equal(repinned.status, 200, JSON.stringify(repinned.body));
+    assert.equal(repinned.body.route, "pinned");
+    assert.equal(repinned.body.primary_session_id, "claude-code:claude-a-2");
+    assert.equal((await tool("get_primary_session", { project_id: "repo-a" })).body.primary_session_id, "claude-code:claude-a-2");
+    assert.deepEqual(auditRows(), [
+      { project_id: "repo-a", session_id: "claude-code:claude-a-1", action: "pin" },
+      { project_id: "repo-a", session_id: "claude-code:claude-a-2", action: "pin" },
+    ]);
   });
 
   test("pin then unpin route through the pin and leave exactly two audit rows", async () => {

@@ -140,6 +140,7 @@ async function run(args: string[]): Promise<number> {
     console.log(`connected: ${result.connected_session_id ?? "-"}`);
     console.log(`available: ${result.available}\tmutating_allowed: ${result.mutating_allowed}`);
     console.log(`reason: ${result.reason}`);
+    if (result.skipped_records > 0) console.log(`skipped_records: ${result.skipped_records}`);
     return 0;
   }
   if (command === "probe" && arg === undefined) {

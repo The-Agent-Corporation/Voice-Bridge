@@ -22,10 +22,12 @@ export interface PrimaryRoute {
 
 export interface PrimaryResult extends PrimaryRoute {
   project_id: string;
+  /** Records discovery could not read; a nonzero count means the route was resolved without them. */
+  skipped_records: number;
 }
 
 /** The states docs/PRD.md §7.1 calls a live controllable agent. */
-export const CONNECTED_STATES: ReadonlySet<ObservedState> = new Set(["connected_idle", "connected_running", "waiting_user"]);
+const CONNECTED_STATES: ReadonlySet<ObservedState> = new Set(["connected_idle", "connected_running", "waiting_user"]);
 
 const isConnected = (session: StoredSession) => CONNECTED_STATES.has(session.observed_state);
 
@@ -119,16 +121,22 @@ export function resolveStoredPrimary(store: Store, project: Project): PrimaryRou
   return resolvePrimary(store.listSessions(project.project_id), pin, project.canonical_path);
 }
 
-async function discoveredProject(store: Store, projectId: string, homes: ProviderHomes): Promise<Project> {
-  const project = store.getById(projectId);
-  if (!project) throw new BridgeError("project_not_found", `no project registered with id ${projectId}`);
-  await discoverProjectSessions(store, project, homes);
-  return project;
+interface Discovered {
+  project: Project;
+  skipped_records: number;
 }
 
-const result = (store: Store, project: Project): PrimaryResult => ({
+async function discoveredProject(store: Store, projectId: string, homes: ProviderHomes): Promise<Discovered> {
+  const project = store.getById(projectId);
+  if (!project) throw new BridgeError("project_not_found", `no project registered with id ${projectId}`);
+  const { skipped_records } = await discoverProjectSessions(store, project, homes);
+  return { project, skipped_records };
+}
+
+const result = (store: Store, { project, skipped_records }: Discovered): PrimaryResult => ({
   project_id: project.project_id,
   ...resolveStoredPrimary(store, project),
+  skipped_records,
 });
 
 export async function getPrimarySession(store: Store, projectId: string, homes: ProviderHomes): Promise<PrimaryResult> {
@@ -137,16 +145,17 @@ export async function getPrimarySession(store: Store, projectId: string, homes: 
 
 /** Pins only a session discovered for this project just now; anything else writes nothing. */
 export async function pinPrimary(store: Store, projectId: string, sessionId: string, homes: ProviderHomes): Promise<PrimaryResult> {
-  const project = await discoveredProject(store, projectId, homes);
+  const discovered = await discoveredProject(store, projectId, homes);
+  const { project } = discovered;
   if (!store.listSessions(project.project_id).some((s) => s.session_id === sessionId)) {
     throw new BridgeError("session_not_in_project", `${sessionId} is not a session of project ${project.project_id}`);
   }
   store.setPin(project.project_id, sessionId);
-  return result(store, project);
+  return result(store, discovered);
 }
 
 export async function unpinPrimary(store: Store, projectId: string, homes: ProviderHomes): Promise<PrimaryResult> {
-  const project = await discoveredProject(store, projectId, homes);
-  store.clearPin(project.project_id);
-  return result(store, project);
+  const discovered = await discoveredProject(store, projectId, homes);
+  store.clearPin(discovered.project.project_id);
+  return result(store, discovered);
 }

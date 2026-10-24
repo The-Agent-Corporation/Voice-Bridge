@@ -201,3 +201,29 @@ test("pin then unpin write exactly two audit rows, and unpinning nothing writes 
     db.close();
   }
 });
+
+test("re-pinning replaces the pin and audits each pin", () => {
+  const { store, dataDir } = seededStore();
+  try {
+    store.setPin("p", "codex:s1");
+    const repinned = store.setPin("p", "codex:s2");
+    assert.deepEqual({ ...store.getPin("p") }, repinned);
+    assert.equal(repinned.session_id, "codex:s2");
+  } finally {
+    store.close();
+  }
+
+  const db = new DatabaseSync(path.join(dataDir, STORE_FILE));
+  try {
+    const rows = db.prepare("SELECT project_id, session_id, action FROM pin_audit ORDER BY id").all();
+    assert.deepEqual(
+      rows.map((row) => ({ ...row })),
+      [
+        { project_id: "p", session_id: "codex:s1", action: "pin" },
+        { project_id: "p", session_id: "codex:s2", action: "pin" },
+      ],
+    );
+  } finally {
+    db.close();
+  }
+});
