@@ -4,7 +4,7 @@ import type { DiscoveredSession, Provider } from "./adapters/types.js";
 import { BridgeError } from "./errors.js";
 
 export const STORE_FILE = "bridge.sqlite";
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 const SQLITE_CONSTRAINT_UNIQUE = 2067;
 
 export interface Project {
@@ -50,6 +50,22 @@ export type EventType = (typeof EVENT_TYPES)[number];
 /** The types that say where a session's turn stands; conflict detection compares only these. */
 export const TURN_EVENT_TYPES = ["turn_started", "turn_completed", "turn_failed"] as const satisfies readonly EventType[];
 
+/** The types the briefing renderer reads: their named payload fields, or their session for the agent line. */
+export const BRIEFING_EVENT_TYPES = [
+  "plan_updated",
+  "progress",
+  "blocker",
+  "user_question",
+  "user_decision",
+  "git_commit",
+  "session_started",
+  "session_ended",
+  ...TURN_EVENT_TYPES,
+] as const satisfies readonly EventType[];
+
+/** The most events of one type the briefing renderer is given. */
+export const BRIEFING_EVENTS_PER_TYPE = 200;
+
 export interface NewEvent {
   project_id: string;
   session_id: string | null;
@@ -57,7 +73,7 @@ export interface NewEvent {
   source_event_id: string;
   source_sequence: number;
   type: EventType;
-  /** JSON text, kept as untrusted data: nothing reads it back. */
+  /** JSON text, kept as untrusted data; only the briefing renderer reads its named fields. */
   payload: string;
   /** ISO 8601, as `Date.prototype.toISOString` writes it. */
   observed_at: string;
@@ -74,6 +90,23 @@ export interface ProcessedEvent {
   event_id: number;
   type: EventType;
   observed_at: string;
+}
+
+export interface BriefingEventRow {
+  event_id: number;
+  session_id: string | null;
+  type: (typeof BRIEFING_EVENT_TYPES)[number];
+  /** Untrusted JSON text, as stored. */
+  payload: string;
+  observed_at: string;
+}
+
+export interface StoredBriefing {
+  project_id: string;
+  /** sha256 hex of the text rendered with a fixed generation time. */
+  content_hash: string;
+  text: string;
+  generated_at: string;
 }
 
 export interface TurnState {
@@ -113,6 +146,16 @@ export interface Store {
   latestProcessedEvent(projectId: string): ProcessedEvent | undefined;
   /** Per session and source, the type of the processed turn event with the highest sequence. */
   latestTurnStates(projectId: string): TurnState[];
+  /**
+   * Processed events of the briefing types, at most `BRIEFING_EVENTS_PER_TYPE` newest of each type,
+   * newest first, ties broken by event_id.
+   */
+  recentBriefingEvents(projectId: string): BriefingEventRow[];
+  /** The highest event_id among processed events, or null when none is processed. */
+  highestProcessedEventId(projectId: string): number | null;
+  getBriefing(projectId: string): StoredBriefing | undefined;
+  /** Inserts or replaces the project's briefing record. */
+  saveBriefing(briefing: StoredBriefing): void;
   close(): void;
 }
 
@@ -190,12 +233,22 @@ const SOURCE_WATERMARKS_TABLE = `
 
 const EVENT_TABLES = EVENTS_TABLE + SOURCE_WATERMARKS_TABLE;
 
+const BRIEFINGS_TABLE = `
+  CREATE TABLE IF NOT EXISTS briefings (
+    project_id   TEXT PRIMARY KEY REFERENCES projects(project_id) ON DELETE CASCADE,
+    content_hash TEXT NOT NULL,
+    text         TEXT NOT NULL,
+    generated_at TEXT NOT NULL
+  );
+`;
+
 /** Tables each known version still lacks; every step only adds tables and leaves stored rows alone. */
 const MIGRATIONS: Record<number, string> = {
-  0: PROJECTS_TABLE + SESSIONS_TABLE + PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES,
-  1: SESSIONS_TABLE + PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES,
-  2: PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES,
-  3: EVENT_TABLES,
+  0: PROJECTS_TABLE + SESSIONS_TABLE + PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES + BRIEFINGS_TABLE,
+  1: SESSIONS_TABLE + PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES + BRIEFINGS_TABLE,
+  2: PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES + BRIEFINGS_TABLE,
+  3: EVENT_TABLES + BRIEFINGS_TABLE,
+  4: BRIEFINGS_TABLE,
 };
 
 function inTransaction<T>(db: DatabaseSync, work: () => T): T {
@@ -316,6 +369,25 @@ export function openStore(dataDir: string): Store {
         AND e.session_id IS NOT NULL AND e.type IN (${TURN_EVENT_TYPES.map((type) => `'${type}'`).join(", ")})
     ) WHERE latest = 1
     ORDER BY session_id
+  `);
+  const briefingEvents = db.prepare(`
+    SELECT event_id, session_id, type, payload, observed_at FROM (
+      SELECT e.event_id, e.session_id, e.type, e.payload, e.observed_at,
+             ROW_NUMBER() OVER (PARTITION BY e.type ORDER BY e.observed_at DESC, e.event_id DESC) AS recency
+      FROM ${PROCESSED_EVENTS}
+        AND e.type IN (${BRIEFING_EVENT_TYPES.map((type) => `'${type}'`).join(", ")})
+    ) WHERE recency <= ${BRIEFING_EVENTS_PER_TYPE}
+    ORDER BY observed_at DESC, event_id DESC
+  `);
+  const highestProcessed = db.prepare(`SELECT MAX(e.event_id) AS event_id FROM ${PROCESSED_EVENTS}`);
+  const briefingOf = db.prepare(
+    "SELECT project_id, content_hash, text, generated_at FROM briefings WHERE project_id = ?",
+  );
+  const upsertBriefing = db.prepare(`
+    INSERT INTO briefings (project_id, content_hash, text, generated_at)
+    VALUES (:project_id, :content_hash, :text, :generated_at)
+    ON CONFLICT (project_id) DO UPDATE SET
+      content_hash = excluded.content_hash, text = excluded.text, generated_at = excluded.generated_at
   `);
 
   const getById = (projectId: string) => byId.get(projectId) as Project | undefined;
@@ -438,6 +510,19 @@ export function openStore(dataDir: string): Store {
     },
     latestTurnStates(projectId) {
       return turnStates.all(projectId).map((row) => ({ ...row })) as unknown as TurnState[];
+    },
+    recentBriefingEvents(projectId) {
+      return briefingEvents.all(projectId).map((row) => ({ ...row })) as unknown as BriefingEventRow[];
+    },
+    highestProcessedEventId(projectId) {
+      return (highestProcessed.get(projectId) as { event_id: number | null }).event_id;
+    },
+    getBriefing(projectId) {
+      const row = briefingOf.get(projectId) as StoredBriefing | undefined;
+      return row && { ...row };
+    },
+    saveBriefing(briefing) {
+      upsertBriefing.run({ ...briefing });
     },
     close() {
       db.close();

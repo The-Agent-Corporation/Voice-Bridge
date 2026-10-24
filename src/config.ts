@@ -4,12 +4,22 @@ import { PROVIDERS, type Provider } from "./adapters/types.js";
 import { BridgeError } from "./errors.js";
 
 export const PROJECT_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
+/** A plain file name in the repository root: no separators, no `..`, no leading dot. */
+const BRIEFING_FILE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+export const DEFAULT_BRIEFING_FILE = "VOICE.md";
+export const DEFAULT_MAX_BRIEFING_TOKENS = 800;
+/** The floor leaves room for the briefing at its most cut-down render level. */
+export const MIN_BRIEFING_TOKENS = 300;
+export const MAX_BRIEFING_TOKENS = 8000;
 
 export interface VoiceConfig {
   schema_version: 1;
   project_id: string;
   display_name: string;
   allowed_providers: Provider[];
+  briefing_file: string;
+  max_briefing_tokens: number;
 }
 
 export function voiceConfigPath(repoRoot: string): string {
@@ -64,6 +74,8 @@ export function readVoiceConfig(repoRoot: string): VoiceConfig {
     project_id: raw.project_id,
     display_name: raw.display_name.trim(),
     allowed_providers: readAllowedProviders(raw.allowed_providers),
+    briefing_file: readBriefingFile(raw.briefing_file),
+    max_briefing_tokens: readMaxBriefingTokens(raw.max_briefing_tokens),
   };
 }
 
@@ -81,4 +93,26 @@ function readAllowedProviders(value: unknown): Provider[] {
     );
   }
   return [...new Set(value)];
+}
+
+function readBriefingFile(value: unknown): string {
+  if (value === undefined) return DEFAULT_BRIEFING_FILE;
+  if (typeof value !== "string" || !BRIEFING_FILE_PATTERN.test(value) || value.includes("..")) {
+    throw new BridgeError(
+      "invalid_briefing_file",
+      "briefing_file must be a plain file name in the repository root, such as \"VOICE.md\"",
+    );
+  }
+  return value;
+}
+
+function readMaxBriefingTokens(value: unknown): number {
+  if (value === undefined) return DEFAULT_MAX_BRIEFING_TOKENS;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < MIN_BRIEFING_TOKENS || value > MAX_BRIEFING_TOKENS) {
+    throw new BridgeError(
+      "invalid_max_briefing_tokens",
+      `max_briefing_tokens must be an integer from ${MIN_BRIEFING_TOKENS} to ${MAX_BRIEFING_TOKENS}`,
+    );
+  }
+  return value;
 }

@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { ProviderHomes } from "./adapters/homes.js";
+import { refreshBriefing } from "./briefingFile.js";
 import { BridgeError, requireString } from "./errors.js";
 import { ingestEvent } from "./events.js";
 import { getPrimarySession, pinPrimary, unpinPrimary } from "./primary.js";
@@ -30,7 +31,16 @@ const TOOLS: Record<string, Tool> = {
   pin_primary: ({ store, providerHomes }, body) =>
     pinPrimary(store, requireString(body, "project_id"), requireString(body, "session_id"), providerHomes),
   unpin_primary: ({ store, providerHomes }, body) => unpinPrimary(store, requireString(body, "project_id"), providerHomes),
-  ingest_event: ({ store }, body) => ingestEvent(store, body),
+  ingest_event: ({ store }, body) => {
+    const result = ingestEvent(store, body);
+    // A duplicate refreshes too: the content hash, not the duplicate flag, decides whether the file is rewritten.
+    const projectId = requireString(body, "project_id");
+    const briefing = refreshBriefing(store, projectId);
+    if (briefing.write === "failed") {
+      console.error(`voice-bridge: VOICE.md not written for ${projectId}: ${briefing.error}`);
+    }
+    return result;
+  },
   get_project_status: ({ store }, body) => getProjectStatus(store, requireString(body, "project_id")),
 };
 

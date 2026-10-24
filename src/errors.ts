@@ -10,6 +10,8 @@ const STATUS_BY_CODE = {
   invalid_project_id: 400,
   missing_display_name: 400,
   invalid_allowed_providers: 400,
+  invalid_briefing_file: 400,
+  invalid_max_briefing_tokens: 400,
   project_id_conflict: 400,
   path_already_registered: 400,
   invalid_request: 400,

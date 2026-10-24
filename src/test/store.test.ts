@@ -3,18 +3,18 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { after, test } from "node:test";
 import { resolveStoredPrimary } from "../primary.js";
-import { openStore, STORE_FILE, type Store } from "../store.js";
+import { BRIEFING_EVENTS_PER_TYPE, openStore, STORE_FILE, type EventType, type NewEvent, type Store } from "../store.js";
 import { removeTempDirs, tempDir } from "./helpers.js";
 
 after(removeTempDirs);
 
-const ALL_TABLES = ["events", "pin_audit", "primary_pins", "projects", "sessions", "source_watermarks"];
+const ALL_TABLES = ["briefings", "events", "pin_audit", "primary_pins", "projects", "sessions", "source_watermarks"];
 
 test("a store with an unknown schema version refuses to open and is left untouched", () => {
   const dataDir = tempDir();
   const file = path.join(dataDir, STORE_FILE);
   const seed = new DatabaseSync(file);
-  seed.exec("PRAGMA user_version = 5;");
+  seed.exec("PRAGMA user_version = 6;");
   seed.close();
 
   assert.throws(() => openStore(dataDir), { code: "store_version_unsupported" });
@@ -22,13 +22,13 @@ test("a store with an unknown schema version refuses to open and is left untouch
   const db = new DatabaseSync(file);
   try {
     assert.deepEqual(db.prepare("SELECT name FROM sqlite_master").all(), []);
-    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 5);
+    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 6);
   } finally {
     db.close();
   }
 });
 
-test("a version 1 store gains the sessions, pin and event tables and keeps its projects", () => {
+test("a version 1 store gains the sessions, pin, event and briefing tables and keeps its projects", () => {
   const dataDir = tempDir();
   const file = path.join(dataDir, STORE_FILE);
   const seed = new DatabaseSync(file);
@@ -57,7 +57,7 @@ test("a version 1 store gains the sessions, pin and event tables and keeps its p
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 4);
+    assert.equal(userVersion(db), 5);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
@@ -75,7 +75,7 @@ function tableNames(db: DatabaseSync): unknown[] {
     .map((row) => row.name);
 }
 
-test("a version 2 store gains the pin and event tables and keeps its projects and sessions", () => {
+test("a version 2 store gains the pin, event and briefing tables and keeps its projects and sessions", () => {
   const dataDir = tempDir();
   const file = path.join(dataDir, STORE_FILE);
   const seed = new DatabaseSync(file);
@@ -117,14 +117,14 @@ test("a version 2 store gains the pin and event tables and keeps its projects an
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 4);
+    assert.equal(userVersion(db), 5);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
   }
 });
 
-test("a version 3 store gains the event tables and keeps its projects, sessions and pin", () => {
+test("a version 3 store gains the event and briefing tables and keeps its projects, sessions and pin", () => {
   const dataDir = tempDir();
   const file = path.join(dataDir, STORE_FILE);
   const seed = new DatabaseSync(file);
@@ -180,10 +180,78 @@ test("a version 3 store gains the event tables and keeps its projects, sessions 
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 4);
+    assert.equal(userVersion(db), 5);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
+  }
+});
+
+test("a version 4 store gains the briefings table and keeps its events and watermarks", () => {
+  const dataDir = tempDir();
+  const file = path.join(dataDir, STORE_FILE);
+  const seeded = openStore(dataDir);
+  seeded.upsert({ project_id: "kept", display_name: "Kept", canonical_path: "/x/kept" });
+  seeded.ingestEvent(storedEvent("kept", 1));
+  seeded.close();
+  const seed = new DatabaseSync(file);
+  seed.exec("DROP TABLE briefings; PRAGMA user_version = 4;");
+  seed.close();
+
+  for (let open = 0; open < 2; open++) {
+    const store = openStore(dataDir);
+    try {
+      assert.deepEqual(store.listWatermarks("kept").map((row) => ({ ...row })), [
+        { source: "hook", watermark: 1, highest_stored: 1 },
+      ]);
+      assert.equal(store.highestProcessedEventId("kept"), 1);
+      assert.equal(store.getBriefing("kept"), undefined);
+    } finally {
+      store.close();
+    }
+  }
+
+  const db = new DatabaseSync(file);
+  try {
+    assert.equal(userVersion(db), 5);
+    assert.deepEqual(tableNames(db), ALL_TABLES);
+  } finally {
+    db.close();
+  }
+});
+
+function storedEvent(projectId: string, sequence: number, type: EventType = "progress"): NewEvent {
+  return {
+    project_id: projectId,
+    session_id: null,
+    source: "hook",
+    source_event_id: `hook-${sequence}`,
+    source_sequence: sequence,
+    type,
+    payload: "{}",
+    observed_at: new Date(Date.UTC(2026, 9, 24, 12, 0, sequence)).toISOString(),
+  };
+}
+
+test("briefing events are processed ones only, newest first and capped per type", () => {
+  const dataDir = tempDir();
+  const store = openStore(dataDir);
+  try {
+    store.upsert({ project_id: "p", display_name: "P", canonical_path: "/x/p" });
+    const total = BRIEFING_EVENTS_PER_TYPE + 5;
+    for (let sequence = 1; sequence <= total; sequence++) store.ingestEvent(storedEvent("p", sequence));
+    store.ingestEvent(storedEvent("p", total + 1, "blocker"));
+    store.ingestEvent(storedEvent("p", total + 3, "blocker"));
+
+    const events = store.recentBriefingEvents("p");
+    const progress = events.filter((event) => event.type === "progress");
+    assert.equal(progress.length, BRIEFING_EVENTS_PER_TYPE);
+    assert.equal(progress[0]!.event_id, total);
+    assert.deepEqual(events.filter((event) => event.type === "blocker").map((event) => event.event_id), [total + 1]);
+    assert.equal(events[0]!.type, "blocker");
+    assert.equal(store.highestProcessedEventId("p"), total + 1);
+  } finally {
+    store.close();
   }
 });
 

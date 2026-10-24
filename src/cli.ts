@@ -123,6 +123,7 @@ async function run(args: string[]): Promise<number> {
     console.log(project.display_name);
     console.log(`freshness: ${project.freshness}`);
     console.log(project.briefing);
+    if (project.briefing_write === "failed") console.error(`VOICE.md not written: ${project.briefing_write_error}`);
     return 0;
   }
   if (command === "sessions" && arg && rest.length === 0) {
