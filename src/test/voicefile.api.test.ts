@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { chmodSync, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { chmodSync, existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
 import { after, before, describe, mock, test } from "node:test";
@@ -96,6 +96,24 @@ describe("VOICE.md generation", () => {
     const file = readFileSync(path.join(repo, "VOICE.md"), "utf8");
     assert.ok(tokens(file) <= 800, `${tokens(file)} tokens`);
     assert.match(file, /## Blockers and pending questions\nBlockers:\n- reported at .+: review pending\nPending questions:\n- q-\d+: merge now\?/);
+  });
+
+  test("a deleted or hand-edited VOICE.md is rewritten from the store on the next refresh", async () => {
+    const { projectId, repo } = await register();
+    const file = path.join(repo, "VOICE.md");
+    await ingest(projectId, 1, "progress", { summary: "restore me" });
+
+    rmSync(file);
+    assert.equal((await ingest(projectId, 1, "progress", { summary: "restore me" })).duplicate, true);
+    const restored = readFileSync(file, "utf8");
+    assert.match(restored, /restore me/);
+    assert.equal((await open(projectId)).briefing, restored);
+
+    writeFileSync(file, "hand edited\n");
+    const opened = await open(projectId);
+    assert.equal(opened.briefing_write, "written");
+    assert.equal(readFileSync(file, "utf8"), opened.briefing);
+    assert.match(opened.briefing, /restore me/);
   });
 
   test("max_briefing_tokens: 300 keeps a heavy briefing within 300 tokens", async () => {
