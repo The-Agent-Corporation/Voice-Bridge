@@ -8,6 +8,7 @@ import { runProbe } from "./probe.js";
 import type { OpenedProject, ProjectSummary, RegisterResult } from "./registry.js";
 import type { SessionList } from "./sessions.js";
 import type { ProjectStatus } from "./status.js";
+import type { InboxItem } from "./store.js";
 import { readClientToken } from "./token.js";
 
 const USAGE = `usage:
@@ -19,6 +20,7 @@ const USAGE = `usage:
   voice-bridge primary <project_id> --pin <session_id>
   voice-bridge primary <project_id> --unpin
   voice-bridge status <project_id> [--why]
+  voice-bridge inbox [--project <project_id>] [--status <status>]
   voice-bridge probe`;
 
 class CliError extends Error {
@@ -102,6 +104,19 @@ function primaryRequest(projectId: string, rest: string[]): { tool: string; body
   return undefined;
 }
 
+const INBOX_FLAGS: Record<string, string> = { "--project": "project_id", "--status": "status" };
+
+function inboxRequest(args: string[]): Record<string, string> | undefined {
+  const body: Record<string, string> = {};
+  for (let i = 0; i < args.length; i += 2) {
+    const field = Object.hasOwn(INBOX_FLAGS, args[i]!) ? INBOX_FLAGS[args[i]!] : undefined;
+    const value = args[i + 1];
+    if (!field || !value || Object.hasOwn(body, field)) return undefined;
+    body[field] = value;
+  }
+  return body;
+}
+
 async function run(args: string[]): Promise<number> {
   const [command, arg, ...rest] = args;
   if (command === "register" && arg && rest.length === 0) {
@@ -156,6 +171,15 @@ async function run(args: string[]): Promise<number> {
       console.log(`reasons: ${status.freshness_reasons.join(", ") || "-"}`);
       for (const [source, watermark] of Object.entries(status.watermarks)) console.log(`watermark\t${source}\t${watermark}`);
       console.log(`last_event_id: ${status.last_event_id ?? "-"}`);
+    }
+    return 0;
+  }
+  const inbox = command === "inbox" ? inboxRequest(args.slice(1)) : undefined;
+  if (inbox) {
+    const { items } = await callTool<{ items: InboxItem[] }>("list_inbox", inbox);
+    if (items.length === 0) console.log("inbox is empty");
+    for (const q of items) {
+      console.log([q.question_id, q.project_id, q.status, q.priority ?? "-", q.created_at, q.summary || "(no summary)"].join("\t"));
     }
     return 0;
   }

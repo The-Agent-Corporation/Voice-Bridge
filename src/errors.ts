@@ -19,6 +19,7 @@ const STATUS_BY_CODE = {
   unauthorized: 401,
   unknown_tool: 404,
   project_not_found: 404,
+  inbox_question_not_found: 404,
   not_found: 404,
   method_not_allowed: 405,
   event_conflict: 409,

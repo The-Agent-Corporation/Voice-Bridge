@@ -1,4 +1,5 @@
 import { BridgeError, requireString } from "./errors.js";
+import { questionFields } from "./inbox.js";
 import { EVENT_TYPES, type EventType, type NewEvent, type Store } from "./store.js";
 
 export const MAX_PAYLOAD_BYTES = 16 * 1024;
@@ -13,7 +14,8 @@ function isEventType(value: unknown): value is EventType {
 
 /**
  * Validates the whole request before touching the store, so a rejected event stores nothing.
- * The payload is kept as JSON text; it is never interpreted here, only the briefing renderer reads its named fields.
+ * The payload is kept as JSON text. Only the briefing renderer reads its named fields, and for `user_question`
+ * the inbox, whose fields are read here and applied in the same transaction as the event.
  */
 export function ingestEvent(store: Store, body: Record<string, unknown>): { event_id: number; duplicate: boolean } {
   const projectId = requireString(body, "project_id");
@@ -52,5 +54,5 @@ export function ingestEvent(store: Store, body: Record<string, unknown>): { even
     payload,
     observed_at: new Date(observedAt).toISOString(),
   };
-  return store.ingestEvent(event);
+  return store.ingestEvent(event, body.type === "user_question" ? questionFields(body.payload) : undefined);
 }

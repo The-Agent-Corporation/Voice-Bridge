@@ -3,6 +3,7 @@ import type { ProviderHomes } from "./adapters/homes.js";
 import { refreshBriefing } from "./briefingFile.js";
 import { BridgeError, requireString } from "./errors.js";
 import { ingestEvent } from "./events.js";
+import { dismissInboxQuestion, listInbox } from "./inbox.js";
 import { getPrimarySession, pinPrimary, unpinPrimary } from "./primary.js";
 import { listProjects, openProject, registerProject } from "./registry.js";
 import { listSessions } from "./sessions.js";
@@ -47,6 +48,8 @@ const TOOLS: Record<string, Tool> = {
     return result;
   },
   get_project_status: ({ store }, body) => getProjectStatus(store, requireString(body, "project_id")),
+  list_inbox: ({ store }, body) => listInbox(store, body),
+  dismiss_inbox_question: ({ store }, body) => dismissInboxQuestion(store, body),
 };
 
 function sendJson(res: ServerResponse, status: number, payload: unknown): void {

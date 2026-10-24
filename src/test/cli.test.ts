@@ -114,12 +114,45 @@ describe("voice-bridge CLI", () => {
     assert.match(unknown.stderr, /project_not_found/);
   });
 
+  test("inbox lists items and filters by project and status", async () => {
+    const token = readClientToken(dataDir);
+    const ingested = await call(bridge.port, token, "ingest_event", {
+      project_id: "desktop-agent",
+      session_id: "s1",
+      source: "inbox-hook",
+      source_event_id: "q1",
+      source_sequence: 1,
+      type: "user_question",
+      payload: { question_id: "ask-1", summary: "Ship it?", priority: "high" },
+      observed_at: "2026-10-24T13:00:00.000Z",
+    });
+    assert.equal(ingested.status, 200);
+
+    const listed = await cli("inbox", "--project", "desktop-agent");
+    assert.equal(listed.status, 0, listed.stderr);
+    assert.equal(
+      listed.stdout,
+      `q-${ingested.body.event_id}\tdesktop-agent\topen\thigh\t2026-10-24T13:00:00.000Z\tShip it?\n`,
+    );
+
+    const cancelled = await cli("inbox", "--status", "cancelled", "--project", "desktop-agent");
+    assert.equal(cancelled.status, 0, cancelled.stderr);
+    assert.equal(cancelled.stdout, "inbox is empty\n");
+
+    const unknown = await cli("inbox", "--project", "nope");
+    assert.equal(unknown.status, 1);
+    assert.match(unknown.stderr, /project_not_found/);
+  });
+
   test("bad usage exits 2", async () => {
     assert.equal((await cli("unregister")).status, 2);
     for (const args of [["status"], ["status", "desktop-agent", "--bogus"], ["status", "desktop-agent", "--why", "x"]]) {
       assert.equal((await cli(...args)).status, 2, args.join(" "));
     }
     for (const args of [["primary"], ["primary", "desktop-agent", "--pin"], ["primary", "desktop-agent", "--unpin", "x"], ["primary", "desktop-agent", "--bogus"]]) {
+      assert.equal((await cli(...args)).status, 2, args.join(" "));
+    }
+    for (const args of [["inbox", "--project"], ["inbox", "--status"], ["inbox", "--bogus"], ["inbox", "--project", "a", "--project", "b"], ["inbox", "extra"]]) {
       assert.equal((await cli(...args)).status, 2, args.join(" "));
     }
   });
