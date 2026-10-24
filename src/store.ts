@@ -14,14 +14,6 @@ export interface Project {
   updated_at: string;
 }
 
-interface ProjectRow {
-  project_id: string;
-  display_name: string;
-  canonical_path: string;
-  created_at: string;
-  updated_at: string;
-}
-
 export interface Store {
   getById(projectId: string): Project | undefined;
   list(): Project[];
@@ -31,16 +23,6 @@ export interface Store {
    */
   upsert(project: Omit<Project, "created_at" | "updated_at">): { project: Project; created: boolean };
   close(): void;
-}
-
-function toProject(row: ProjectRow): Project {
-  return {
-    project_id: row.project_id,
-    display_name: row.display_name,
-    canonical_path: row.canonical_path,
-    created_at: row.created_at,
-    updated_at: row.updated_at,
-  };
 }
 
 /** Migrating stored data is a human decision, so an unknown schema version refuses to open. */
@@ -88,20 +70,13 @@ export function openStore(dataDir: string): Store {
     WHERE projects.canonical_path = excluded.canonical_path
   `);
 
-  const getById = (projectId: string) => {
-    const row = byId.get(projectId) as ProjectRow | undefined;
-    return row && toProject(row);
-  };
-
-  const getByPath = (canonicalPath: string) => {
-    const row = byPath.get(canonicalPath) as ProjectRow | undefined;
-    return row && toProject(row);
-  };
+  const getById = (projectId: string) => byId.get(projectId) as Project | undefined;
+  const getByPath = (canonicalPath: string) => byPath.get(canonicalPath) as Project | undefined;
 
   return {
     getById,
     list() {
-      return (all.all() as unknown as ProjectRow[]).map(toProject);
+      return all.all() as unknown as Project[];
     },
     upsert(project) {
       const existing = getById(project.project_id);
