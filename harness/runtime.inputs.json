@@ -4,11 +4,13 @@
   "holdout": ".factory/holdout/HOLDOUT.md",
   "driver": "http",
   "http": {
-    "start": "",
+    "start": "node dist/daemon.js --port {port}",
     "health_path": "/health",
-    "health_contains": "",
+    "health_contains": "\"status\":\"ok\"",
     "boot_timeout_s": 45,
-    "env": {}
+    "env": {
+      "VOICE_BRIDGE_DATA_DIR": "{state}"
+    }
   },
   "cli": {
     "invoke": "",
