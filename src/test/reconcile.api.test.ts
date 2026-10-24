@@ -161,6 +161,81 @@ test("reconciling again, or twice at once, records one event per commit", async 
   }
 });
 
+test("a reconcile event held back by a sequence gap is not recorded again", async () => {
+  const h = await start();
+  try {
+    const repo = await registerAndIngest(h);
+    const gap = await h.tool("ingest_event", { ...hookEvent(1, "posted as the reconciler"), source: "reconcile", source_event_id: "outside-3", source_sequence: 3 });
+    assert.equal(gap.status, 200, JSON.stringify(gap.body));
+    const sha = commitEmpty(repo);
+    for (let n = 0; n < 2; n++) assert.equal((await h.tool("reconcile_project")).status, 200);
+    assert.equal(reconcileCommitRows(h.dataDir, sha), 1);
+    assert.ok((await h.tool("get_project_status")).body.freshness_reasons.includes("sequence_gap"));
+  } finally {
+    await h.bridge.close();
+  }
+});
+
+test("a hook commit that lands while reconcile reads HEAD stays the newest recorded commit", async () => {
+  let hold: Promise<void> | null = null;
+  let readStarted!: () => void;
+  const started = new Promise<void>((resolve) => (readStarted = resolve));
+  const h = await start(tempDir(), {
+    readHead: async (root) => {
+      const head = await readHead(root);
+      if (hold) {
+        readStarted();
+        await hold;
+      }
+      return head;
+    },
+  });
+  try {
+    const repo = await registerAndIngest(h);
+    const stale = commitEmpty(repo, "read by reconcile");
+    let release!: () => void;
+    hold = new Promise((resolve) => (release = resolve));
+    const reconciling = h.tool("reconcile_project");
+    await started;
+    hold = null;
+    const fresh = commitEmpty(repo, "posted by the hook");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const hook = await h.tool("ingest_event", {
+      ...hookEvent(2, ""),
+      type: "git_commit",
+      payload: { commit: fresh },
+      observed_at: new Date().toISOString(),
+    });
+    assert.equal(hook.status, 200, JSON.stringify(hook.body));
+    release();
+
+    const reconciled = (await reconciling).body;
+    assert.equal(reconciled.head_commit, stale);
+    assert.equal(reconciled.status.freshness, "unverified");
+    assert.match(voiceFile(repo), new RegExp(`^Commit: ${fresh}$`, "m"));
+    const again = (await h.tool("reconcile_project")).body;
+    assert.equal(again.recorded_event_id, null);
+    assert.equal(again.status.freshness, "current");
+    assert.equal(reconcileCommitRows(h.dataDir, fresh), 0);
+  } finally {
+    await h.bridge.close();
+  }
+});
+
+test("open_project on an uncertain project starts the reconciliation that repairs it", async () => {
+  const h = await start();
+  try {
+    const repo = await registerAndIngest(h);
+    const sha = commitEmpty(repo);
+    assert.equal((await h.tool("open_project")).body.uncertain, true);
+    const repaired = await waitFor(() => h.tool("get_project_status").then((r) => r.body), (s) => s.freshness === "current");
+    assert.equal(repaired.freshness, "current", JSON.stringify(repaired));
+    assert.match(voiceFile(repo), new RegExp(`^Commit: ${sha}$`, "m"));
+  } finally {
+    await h.bridge.close();
+  }
+});
+
 test("an event stored but never refreshed is lagging after a restart until startup reconciliation finishes", async () => {
   const { dataDir, repo } = await crashedAfterStore();
   const gated = gatedReadHead();

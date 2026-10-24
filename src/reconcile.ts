@@ -62,7 +62,7 @@ export function createReconciler({ store, readHead, intervalMs }: { store: Store
   let closed = false;
 
   /** Compare-then-record runs with no await in between, and the daemon is the store's only writer, so two runs cannot both record. */
-  function recordCommit(projectId: string, commit: string): number {
+  function recordCommit(projectId: string, commit: string, observedAt: string): number {
     const highest = store.listWatermarks(projectId).find((row) => row.source === RECONCILE_SOURCE)?.highest_stored ?? 0;
     const sequence = highest + 1;
     return store.ingestEvent({
@@ -73,18 +73,24 @@ export function createReconciler({ store, readHead, intervalMs }: { store: Store
       source_sequence: sequence,
       type: "git_commit",
       payload: JSON.stringify({ commit }),
-      observed_at: new Date().toISOString(),
+      observed_at: observedAt,
     }).event_id;
   }
 
   async function runOnce(projectId: string): Promise<ReconcileResult> {
     const project = requireProject(store, projectId);
+    // Dated before the read, so a hook commit that lands while Git answers sorts newer than this run's.
+    const observedAt = new Date().toISOString();
     const head = await readHead(project.canonical_path);
     if (closed) throw shuttingDown();
 
     const recordedBefore = latestRecordedCommit(store.recentCommitEvents(projectId));
+    // A sequence gap holds this run's earlier events above the watermark, out of the processed view.
+    const pendingOwn = latestRecordedCommit(store.pendingCommitEvents(projectId, RECONCILE_SOURCE));
     const recordedEventId =
-      head.state === "commit" && compareHead(head, recordedBefore) === "moved" ? recordCommit(projectId, head.commit) : null;
+      head.state === "commit" && compareHead(head, recordedBefore) === "moved" && compareHead(head, pendingOwn) === "moved"
+        ? recordCommit(projectId, head.commit, observedAt)
+        : null;
     const check = compareHead(head, latestRecordedCommit(store.recentCommitEvents(projectId)));
     // Every admitted event, including the one just recorded, reaches the briefing here, and only through its updater.
     const briefing = refreshBriefing(store, projectId, { head: check });

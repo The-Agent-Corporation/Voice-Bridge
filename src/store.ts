@@ -153,6 +153,8 @@ export interface Store {
   recentBriefingEvents(projectId: string): BriefingEventRow[];
   /** The briefing's window of processed `git_commit` events, newest first, ties broken by event_id. */
   recentCommitEvents(projectId: string): Pick<BriefingEventRow, "type" | "payload">[];
+  /** The source's stored `git_commit` events above its watermark, highest sequence first. */
+  pendingCommitEvents(projectId: string, source: string): Pick<BriefingEventRow, "type" | "payload">[];
   /** The highest event_id among processed events, or null when none is processed. */
   highestProcessedEventId(projectId: string): number | null;
   getBriefing(projectId: string): StoredBriefing | undefined;
@@ -408,6 +410,12 @@ export function openStore(dataDir: string): Store {
     SELECT e.type, e.payload FROM ${PROCESSED_EVENTS} AND e.type = 'git_commit'
     ORDER BY e.observed_at DESC, e.event_id DESC LIMIT ${BRIEFING_EVENTS_PER_TYPE}
   `);
+  const pendingCommits = db.prepare(`
+    SELECT e.type, e.payload FROM events e
+    LEFT JOIN source_watermarks w ON w.project_id = e.project_id AND w.source = e.source
+    WHERE e.project_id = ? AND e.source = ? AND e.type = 'git_commit' AND e.source_sequence > COALESCE(w.watermark, 0)
+    ORDER BY e.source_sequence DESC LIMIT ${BRIEFING_EVENTS_PER_TYPE}
+  `);
   const highestProcessed = db.prepare(`SELECT MAX(e.event_id) AS event_id FROM ${PROCESSED_EVENTS}`);
   const briefingOf = db.prepare(
     "SELECT project_id, content_hash, text, generated_at FROM briefings WHERE project_id = ?",
@@ -550,6 +558,9 @@ export function openStore(dataDir: string): Store {
     },
     recentCommitEvents(projectId) {
       return commitEvents.all(projectId).map((row) => ({ ...row })) as unknown as Pick<BriefingEventRow, "type" | "payload">[];
+    },
+    pendingCommitEvents(projectId, source) {
+      return pendingCommits.all(projectId, source).map((row) => ({ ...row })) as unknown as Pick<BriefingEventRow, "type" | "payload">[];
     },
     highestProcessedEventId(projectId) {
       return (highestProcessed.get(projectId) as { event_id: number | null }).event_id;
