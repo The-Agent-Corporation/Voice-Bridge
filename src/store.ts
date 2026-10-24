@@ -49,11 +49,10 @@ const SESSIONS_TABLE = `
   CREATE TABLE IF NOT EXISTS sessions (
     project_id        TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
     session_id        TEXT NOT NULL,
-    provider          TEXT NOT NULL CHECK (provider IN ('codex', 'claude-code')),
+    provider          TEXT NOT NULL,
     native_session_id TEXT NOT NULL,
     worktree_id       TEXT NOT NULL,
-    observed_state    TEXT NOT NULL CHECK (observed_state IN
-                        ('saved', 'connected_idle', 'connected_running', 'waiting_user', 'unreachable', 'unknown')),
+    observed_state    TEXT NOT NULL,
     last_activity_at  TEXT,
     capabilities      TEXT NOT NULL,
     PRIMARY KEY (project_id, session_id)

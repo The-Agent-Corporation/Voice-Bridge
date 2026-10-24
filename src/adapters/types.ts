@@ -1,4 +1,6 @@
-export type Provider = "codex" | "claude-code";
+export const PROVIDERS = ["codex", "claude-code"] as const;
+
+export type Provider = (typeof PROVIDERS)[number];
 
 export type ObservedState =
   | "saved"

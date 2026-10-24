@@ -1,10 +1,9 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import type { Provider } from "./adapters/types.js";
+import { PROVIDERS, type Provider } from "./adapters/types.js";
 import { BridgeError } from "./errors.js";
 
 export const PROJECT_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
-export const PROVIDERS: readonly Provider[] = ["codex", "claude-code"];
 
 export interface VoiceConfig {
   schema_version: 1;
