@@ -160,8 +160,9 @@ function collectFacts(state: BriefingState): Facts {
   const scrub = (text: string) =>
     identifiers.reduce((result, id) => result.split(id).join("[session]"), redactSecrets(text));
   // Collapsing whitespace keeps every field on one line, and escaping a leading `#` keeps it from
-  // reading as a heading, so no payload can change the file's structure.
-  const clean = (text: string) => scrub(text).replace(/[\s\p{Cc}]+/gu, " ").trim().replace(/^#/, "\\#");
+  // reading as a heading, so no payload can change the file's structure. Collapsing comes first so a
+  // secret split by a newline or tab is still whole when it is redacted.
+  const clean = (text: string) => scrub(text.replace(/[\s\p{Cc}]+/gu, " ").trim()).replace(/^#/, "\\#");
 
   const parsed = state.events.map((event) => ({ ...event, fields: parseObject(event.payload) }));
   const ofType = (type: BriefingEventRow["type"]) => parsed.filter((event) => event.type === type);
@@ -331,7 +332,10 @@ function renderAt(state: BriefingState, facts: Facts, level: BudgetLevel, genera
   ];
 }
 
-/** A second redaction and scrub over the whole text backs up the per-field pass; the budget is measured after it. */
+/**
+ * A second redaction and scrub, line by line, backs up the per-field pass; the budget is measured after it.
+ * Line by line, an unterminated private key is redacted to the end of its own line, never the rest of the file.
+ */
 function finalize(lines: string[], scrub: (text: string) => string): string {
-  return `${scrub(lines.join("\n"))}\n`;
+  return `${lines.join("\n").split("\n").map(scrub).join("\n")}\n`;
 }

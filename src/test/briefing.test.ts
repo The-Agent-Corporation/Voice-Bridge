@@ -130,6 +130,19 @@ test("each secret pattern is redacted, including a private key's body", () => {
   assert.equal(text.match(/\[REDACTED\]/g)?.length, 5);
 });
 
+test("a private-key header split across lines is redacted in its own field and keeps every later section", () => {
+  const text = render(state([
+    event("plan_updated", { next_steps: ["ship it"] }),
+    event("user_question", { summary: "merge now?" }),
+    event("progress", { summary: "-----BEGIN RSA\nPRIVATE\tKEY-----\nMIIEsecretbody", current_task: "tests" }),
+  ]));
+  assert.deepEqual(headings(text), [...SECTION_HEADINGS]);
+  assert.doesNotMatch(text, /PRIVATE|MIIEsecretbody/);
+  assert.match(text, /Current task: tests\n/);
+  assert.match(text, /q-\d+: merge now\?/);
+  assert.match(section(text, "Next steps"), /ship it/);
+});
+
 test("a secret straddling the field cut is redacted before the cut, leaving no fragment", () => {
   const summary = `${"a".repeat(270)}sk-abcdefghijklmnop1234`;
   const text = render(state([event("progress", { summary })]));
