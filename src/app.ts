@@ -1,8 +1,9 @@
-import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
 import path from "node:path";
 import { resolveProviderHomes } from "./adapters/homes.js";
+import { writeFileAtomic } from "./atomicFile.js";
 import { resolveBuildId } from "./buildId.js";
 import { ensureDataDir } from "./dataDir.js";
 import { createBridgeServer } from "./server.js";
@@ -36,9 +37,7 @@ export function daemonInfoPath(dataDir: string): string {
 
 /** Written so the CLI can find a daemon whose port was chosen at start. */
 function writeDaemonInfo(dataDir: string, info: DaemonInfo): void {
-  const tmp = `${daemonInfoPath(dataDir)}.tmp`;
-  writeFileSync(tmp, JSON.stringify(info), { mode: 0o600 });
-  renameSync(tmp, daemonInfoPath(dataDir));
+  writeFileAtomic(daemonInfoPath(dataDir), JSON.stringify(info), { mode: 0o600 });
 }
 
 function removeOwnDaemonInfo(dataDir: string): void {

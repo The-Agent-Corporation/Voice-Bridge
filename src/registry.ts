@@ -1,12 +1,12 @@
 import { realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import type { ProviderHomes } from "./adapters/homes.js";
-import { buildBriefing, type Briefing } from "./briefing.js";
+import { refreshBriefing, type BriefingRefresh } from "./briefingFile.js";
 import { readVoiceConfig } from "./config.js";
 import { BridgeError } from "./errors.js";
 import { runGit } from "./git.js";
 import { discoverProjectSessions, type DiscoveryCounts } from "./sessions.js";
-import { getProjectStatus } from "./status.js";
+import type { ProjectStatus } from "./status.js";
 import type { Store } from "./store.js";
 
 export interface ProjectSummary {
@@ -20,9 +20,12 @@ export interface RegisterResult extends ProjectSummary, DiscoveryCounts {
 }
 
 export interface OpenedProject extends ProjectSummary {
-  freshness: Briefing["freshness"];
-  last_confirmed_activity: Briefing["last_confirmed_activity"];
+  freshness: ProjectStatus["freshness"];
+  last_confirmed_activity: ProjectStatus["last_confirmed_activity"];
+  /** The same text that is in the project's briefing file. */
   briefing: string;
+  briefing_write: BriefingRefresh["write"];
+  briefing_write_error: string | null;
 }
 
 function canonicalRepoRoot(inputPath: string): string {
@@ -90,13 +93,15 @@ export function listProjects(store: Store): ProjectSummary[] {
 export function openProject(store: Store, projectId: string): OpenedProject {
   const project = store.getById(projectId);
   if (!project) throw new BridgeError("project_not_found", `no project registered with id ${projectId}`);
-  const briefing = buildBriefing(project, getProjectStatus(store, projectId));
+  const briefing = refreshBriefing(store, projectId);
   return {
     project_id: project.project_id,
     display_name: project.display_name,
     canonical_path: project.canonical_path,
-    freshness: briefing.freshness,
-    last_confirmed_activity: briefing.last_confirmed_activity,
+    freshness: briefing.status.freshness,
+    last_confirmed_activity: briefing.status.last_confirmed_activity,
     briefing: briefing.text,
+    briefing_write: briefing.write,
+    briefing_write_error: briefing.error,
   };
 }

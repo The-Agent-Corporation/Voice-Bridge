@@ -13,7 +13,7 @@ function isEventType(value: unknown): value is EventType {
 
 /**
  * Validates the whole request before touching the store, so a rejected event stores nothing.
- * The payload is kept as JSON text and never read back, interpreted or passed on.
+ * The payload is kept as JSON text; it is never interpreted here, only the briefing renderer reads its named fields.
  */
 export function ingestEvent(store: Store, body: Record<string, unknown>): { event_id: number; duplicate: boolean } {
   const projectId = requireString(body, "project_id");
