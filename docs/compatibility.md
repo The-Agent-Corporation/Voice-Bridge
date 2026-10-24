@@ -1,6 +1,6 @@
 # Provider compatibility
 
-What the Codex and Claude Code installed on the build machine could prove. The source is one `node dist/cli.js probe` run, copied cell for cell from its JSON. Rerun the probe whenever either provider is upgraded. The matrix holds only for these versions.
+What the Codex and Claude Code installed on the build machine could prove. The source is one `node dist/cli.js probe` run, copied cell for cell from its JSON. A test (`src/test/probe.test.ts`) fails if a fixed cell or a reason code here stops matching the code. Rerun the probe whenever either provider is upgraded. The matrix holds only for these versions.
 
 - **Probed:** 2026-10-24 12:45 EDT, on `darwin-arm64`
 - **codex:** `/opt/homebrew/bin/codex` → `/opt/homebrew/Caskroom/codex/0.145.0/codex-aarch64-apple-darwin`, `codex-cli 0.145.0`
@@ -43,6 +43,7 @@ The app-server is labelled `[experimental]` in `codex app-server --help` for thi
 
 | Reason | Meaning | Fallback |
 |---|---|---|
+| `not_installed` | The provider's binary is in no absolute `PATH` entry, so nothing was run. | Every surface of that provider is treated as `unreachable` (PRD §8). |
 | `needs_credentials` | Proving the cell needs a credentialed model turn or the user's own session store. The probe never uses either. | The session stays read-only; nothing is delivered to it. |
 | `no_check` | The probe has no check for this surface that leaves provider state untouched. | The surface is treated as `unreachable` for messages (PRD §8). |
 | `needs_foreign_session` | Attaching needs a session the probe did not start. | Never attach to a session the bridge did not start. Deliver only to threads of an app-server the bridge started. |

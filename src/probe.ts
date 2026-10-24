@@ -48,7 +48,7 @@ const every = (reason: StaticReason): StaticRow =>
   Object.fromEntries(CAPABILITIES.map((capability) => [capability, reason])) as StaticRow;
 
 /** Cells the probe has no safe live check for. Only Codex's app_server is checked live (codexAppServer.ts). */
-const STATIC_REASONS: { codex: Record<Exclude<SurfaceName<"codex">, "app_server">, StaticRow>; "claude-code": Record<SurfaceName<"claude-code">, StaticRow> } = {
+export const STATIC_REASONS: { codex: Record<Exclude<SurfaceName<"codex">, "app_server">, StaticRow>; "claude-code": Record<SurfaceName<"claude-code">, StaticRow> } = {
   codex: {
     cli: {
       discover: "no_check",

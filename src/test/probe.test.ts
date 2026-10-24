@@ -5,8 +5,9 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileS
 import path from "node:path";
 import { after, describe, test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
-import { runProbe as probeInProcess, resolveExecutable, type ProbeReport } from "../probe.js";
-import { CAPABILITIES, type CapabilityResult } from "../probeReport.js";
+import { PACKAGE_ROOT } from "../buildId.js";
+import { runProbe as probeInProcess, resolveExecutable, STATIC_REASONS, SURFACES, type ProbeReport } from "../probe.js";
+import { CAPABILITIES, UNVERIFIED_REASONS, type CapabilityResult } from "../probeReport.js";
 import { CLI_ENTRY, removeTempDirs, tempDir } from "./helpers.js";
 
 after(removeTempDirs);
@@ -269,6 +270,44 @@ describe("voice-bridge probe", () => {
       assert.match(cell.detail, /codexHome mismatch: "\/elsewhere"/);
     }
     assert.deepEqual(readFileSync(log, "utf8").trim().split("\n"), ["initialize"]);
+  });
+});
+
+describe("docs/compatibility.md", () => {
+  const doc = readFileSync(path.join(PACKAGE_ROOT, "docs", "compatibility.md"), "utf8");
+  const tableRows = (header: string) => {
+    const lines = doc.split("\n");
+    const start = lines.findIndex((line) => line.startsWith(header));
+    assert.notEqual(start, -1, `no table headed ${header}`);
+    const rows: string[][] = [];
+    for (const line of lines.slice(start + 2)) {
+      if (!line.startsWith("|")) break;
+      rows.push(line.split("|").slice(1, -1).map((cell) => cell.trim()));
+    }
+    return { header: lines[start]!.split("|").slice(1, -1).map((cell) => cell.trim()), rows };
+  };
+
+  test("the matrix has the seven capabilities, every surface, and the code's fixed reason in every fixed cell", () => {
+    const { header, rows } = tableRows("| Provider | Surface |");
+    assert.deepEqual(header, ["Provider", "Surface", ...CAPABILITIES]);
+    const expected = Object.entries(SURFACES).flatMap(([provider, surfaces]) => surfaces.map((surface) => `${provider}/${surface}`));
+    assert.deepEqual(rows.map(([provider, surface]) => `${provider}/${surface}`), expected);
+    for (const [provider, surface, ...values] of rows) {
+      const fixed = (STATIC_REASONS as Record<string, Record<string, Record<string, string>>>)[provider!]![surface!];
+      CAPABILITIES.forEach((capability, index) => {
+        const value = values[index]!;
+        const where = `${provider}/${surface}/${capability}`;
+        if (fixed !== undefined) assert.equal(value, `unverified (${fixed[capability]})`, where);
+        else assert.match(value, /^(supported|unsupported|unverified \((\w+)\))$/, where);
+        const reason = /^unverified \((\w+)\)$/.exec(value)?.[1];
+        if (reason !== undefined) assert.ok((UNVERIFIED_REASONS as readonly string[]).includes(reason), where);
+      });
+    }
+  });
+
+  test("the failure table explains exactly the code's unverified reasons", () => {
+    const { rows } = tableRows("| Reason | Meaning | Fallback |");
+    assert.deepEqual(rows.map(([reason]) => reason).sort(), UNVERIFIED_REASONS.map((reason) => `\`${reason}\``).sort());
   });
 });
 

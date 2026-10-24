@@ -7,14 +7,16 @@ export type Capability = (typeof CAPABILITIES)[number];
  * Why a cell has its status. `resume_is_not_attach` marks surfaces whose resume
  * replays a saved session: that never counts as `live_attach`.
  */
-export type UnverifiedReason =
-  | "not_installed"
-  | "no_check"
-  | "needs_credentials"
-  | "needs_foreign_session"
-  | "needs_pending_question"
-  | "resume_is_not_attach"
-  | "check_failed";
+export const UNVERIFIED_REASONS = [
+  "not_installed",
+  "no_check",
+  "needs_credentials",
+  "needs_foreign_session",
+  "needs_pending_question",
+  "resume_is_not_attach",
+  "check_failed",
+] as const;
+export type UnverifiedReason = (typeof UNVERIFIED_REASONS)[number];
 export type ProbeReason = "proved" | "method_not_found" | UnverifiedReason;
 
 export type Evidence = Pick<Ended, "command" | "pid" | "exit_code" | "signal" | "timed_out"> & {
