@@ -28,6 +28,8 @@ const STATUS_BY_CODE = {
   git_failed: 500,
   session_discovery_failed: 500,
   build_id_unavailable: 503,
+  shutting_down: 503,
+  invalid_reconcile_interval: 500,
   store_version_unsupported: 500,
   insecure_token_file: 500,
   empty_token_file: 500,

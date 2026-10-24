@@ -3,10 +3,12 @@ import type { ProviderHomes } from "./adapters/homes.js";
 import { refreshBriefing } from "./briefingFile.js";
 import { BridgeError, requireString } from "./errors.js";
 import { ingestEvent } from "./events.js";
+import type { HeadReader } from "./head.js";
 import { getPrimarySession, pinPrimary, unpinPrimary } from "./primary.js";
 import { listProjects, openProject, registerProject } from "./registry.js";
 import { listSessions } from "./sessions.js";
-import { getProjectStatus } from "./status.js";
+import type { Reconciler } from "./reconcile.js";
+import { getLiveProjectStatus } from "./status.js";
 import type { Store } from "./store.js";
 import { tokenMatches } from "./token.js";
 
@@ -17,6 +19,8 @@ export interface BridgeServerOptions {
   token: string;
   buildId: string | null;
   providerHomes: ProviderHomes;
+  reconciler: Reconciler;
+  readHead: HeadReader;
 }
 
 type Tool = (options: BridgeServerOptions, body: Record<string, unknown>) => unknown;
@@ -24,7 +28,8 @@ type Tool = (options: BridgeServerOptions, body: Record<string, unknown>) => unk
 const TOOLS: Record<string, Tool> = {
   register_project: ({ store, providerHomes }, body) => registerProject(store, requireString(body, "path"), providerHomes),
   list_projects: ({ store }) => ({ projects: listProjects(store) }),
-  open_project: ({ store }, body) => openProject(store, requireString(body, "project_id")),
+  open_project: ({ store, reconciler, readHead }, body) =>
+    openProject(store, requireString(body, "project_id"), { reconciler, readHead }),
   list_sessions: ({ store, providerHomes }, body) => listSessions(store, requireString(body, "project_id"), providerHomes),
   get_primary_session: ({ store, providerHomes }, body) =>
     getPrimarySession(store, requireString(body, "project_id"), providerHomes),
@@ -46,7 +51,8 @@ const TOOLS: Record<string, Tool> = {
     if (failure !== undefined) console.error(`voice-bridge: VOICE.md not written for ${projectId}: ${failure}`);
     return result;
   },
-  get_project_status: ({ store }, body) => getProjectStatus(store, requireString(body, "project_id")),
+  get_project_status: ({ store, readHead }, body) => getLiveProjectStatus(store, requireString(body, "project_id"), readHead),
+  reconcile_project: ({ reconciler }, body) => reconciler.reconcile(requireString(body, "project_id")),
 };
 
 function sendJson(res: ServerResponse, status: number, payload: unknown): void {

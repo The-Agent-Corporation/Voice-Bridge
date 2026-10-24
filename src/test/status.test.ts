@@ -50,6 +50,30 @@ const CASES: { name: string; input: FreshnessInput; freshness: string; reasons: 
     freshness: "current",
     reasons: [],
   },
+  {
+    name: "events not yet refreshed into the briefing are lagging",
+    input: { watermarks: contiguous, latestTurnStates: [], pendingRefresh: true },
+    freshness: "lagging",
+    reasons: ["pending_refresh"],
+  },
+  {
+    name: "a moved HEAD outranks a pending refresh and a conflict, and every reason is listed in order",
+    input: { watermarks: contiguous, latestTurnStates: disagreeing, pendingRefresh: true, head: "moved" },
+    freshness: "unverified",
+    reasons: ["head_moved", "pending_refresh", "turn_state_conflict"],
+  },
+  {
+    name: "a HEAD that cannot be read is unverified, never current",
+    input: { watermarks: contiguous, latestTurnStates: [], head: "unreadable" },
+    freshness: "unverified",
+    reasons: ["head_unreadable"],
+  },
+  {
+    name: "a matching HEAD adds no reason",
+    input: { watermarks: contiguous, latestTurnStates: [], pendingRefresh: false, head: "matches" },
+    freshness: "current",
+    reasons: [],
+  },
 ];
 
 for (const { name, input, freshness, reasons } of CASES) {

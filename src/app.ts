@@ -6,6 +6,8 @@ import { resolveProviderHomes } from "./adapters/homes.js";
 import { writeFileAtomic } from "./atomicFile.js";
 import { resolveBuildId } from "./buildId.js";
 import { ensureDataDir } from "./dataDir.js";
+import { readHead as readGitHead, type HeadReader } from "./head.js";
+import { createReconciler, parseReconcileInterval } from "./reconcile.js";
 import { createBridgeServer } from "./server.js";
 import { openStore } from "./store.js";
 import { ensureClientToken } from "./token.js";
@@ -29,6 +31,8 @@ export interface StartOptions {
   dataDir: string;
   port: number;
   env?: NodeJS.ProcessEnv;
+  /** Tests replace the HEAD read to hold a reconciliation open; the daemon always reads Git. */
+  readHead?: HeadReader;
 }
 
 export function daemonInfoPath(dataDir: string): string {
@@ -49,12 +53,14 @@ function removeOwnDaemonInfo(dataDir: string): void {
   }
 }
 
-export async function startBridge({ dataDir, port, env = process.env }: StartOptions): Promise<RunningBridge> {
+export async function startBridge({ dataDir, port, env = process.env, readHead = readGitHead }: StartOptions): Promise<RunningBridge> {
+  const intervalMs = parseReconcileInterval(env);
   ensureDataDir(dataDir);
   const token = ensureClientToken(dataDir);
   const buildId = resolveBuildId(env);
   const store = openStore(dataDir);
-  const server = createBridgeServer({ store, token, buildId, providerHomes: resolveProviderHomes(env) });
+  const reconciler = createReconciler({ store, readHead, intervalMs });
+  const server = createBridgeServer({ store, token, buildId, providerHomes: resolveProviderHomes(env), reconciler, readHead });
 
   try {
     await new Promise<void>((resolve, reject) => {
@@ -65,12 +71,15 @@ export async function startBridge({ dataDir, port, env = process.env }: StartOpt
       });
     });
   } catch (error) {
+    await reconciler.close();
     store.close();
     throw error;
   }
 
   const address = server.address() as AddressInfo;
   writeDaemonInfo(dataDir, { port: address.port, pid: process.pid });
+  // In the background, so the daemon answers while a crash or a missed hook is being repaired.
+  reconciler.triggerAll();
 
   return {
     server,
@@ -81,6 +90,7 @@ export async function startBridge({ dataDir, port, env = process.env }: StartOpt
         server.close(() => resolve());
         server.closeAllConnections();
       });
+      await reconciler.close();
       store.close();
       removeOwnDaemonInfo(dataDir);
     },

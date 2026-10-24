@@ -48,6 +48,15 @@ export function makeRepo(config: unknown = PRD_SAMPLE, { git = true } = {}): str
   return dir;
 }
 
+/** Makes an empty commit in `repo` and returns its full hash. */
+export function commitEmpty(repo: string, message = "empty"): string {
+  const commit = runGit(["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-q", "-m", message], repo);
+  if (!commit.ok) throw new Error(`git commit failed in ${repo}: ${commit.detail}`);
+  const head = runGit(["rev-parse", "HEAD"], repo);
+  if (!head.ok) throw new Error(`git rev-parse failed in ${repo}: ${head.detail}`);
+  return head.stdout;
+}
+
 /** Empty provider homes, so a daemon under test never reads the developer's real sessions. */
 export function fixtureHomes(): { VOICE_BRIDGE_CODEX_HOME: string; VOICE_BRIDGE_CLAUDE_HOME: string } {
   return { VOICE_BRIDGE_CODEX_HOME: tempDir("voice-bridge-codex-"), VOICE_BRIDGE_CLAUDE_HOME: tempDir("voice-bridge-claude-") };

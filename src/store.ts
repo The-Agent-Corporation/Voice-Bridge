@@ -4,7 +4,7 @@ import type { DiscoveredSession, Provider } from "./adapters/types.js";
 import { BridgeError } from "./errors.js";
 
 export const STORE_FILE = "bridge.sqlite";
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 const SQLITE_CONSTRAINT_UNIQUE = 2067;
 
 export interface Project {
@@ -151,11 +151,16 @@ export interface Store {
    * newest first, ties broken by event_id.
    */
   recentBriefingEvents(projectId: string): BriefingEventRow[];
+  /** The briefing's window of processed `git_commit` events, newest first, ties broken by event_id. */
+  recentCommitEvents(projectId: string): Pick<BriefingEventRow, "type" | "payload">[];
   /** The highest event_id among processed events, or null when none is processed. */
   highestProcessedEventId(projectId: string): number | null;
   getBriefing(projectId: string): StoredBriefing | undefined;
   /** Inserts or replaces the project's briefing record. */
   saveBriefing(briefing: StoredBriefing): void;
+  /** The highest event_id the last finished briefing refresh rendered from, or null before the first. */
+  getRefreshMark(projectId: string): number | null;
+  saveRefreshMark(projectId: string, refreshedThrough: number): void;
   close(): void;
 }
 
@@ -242,13 +247,27 @@ const BRIEFINGS_TABLE = `
   );
 `;
 
+/**
+ * Kept apart from `briefings`, which is saved only when the file is written: a refresh that finds the file
+ * unchanged, or cannot write it, has still run every admitted event through the briefing.
+ */
+const REFRESH_MARKS_TABLE = `
+  CREATE TABLE IF NOT EXISTS refresh_marks (
+    project_id        TEXT PRIMARY KEY REFERENCES projects(project_id) ON DELETE CASCADE,
+    refreshed_through INTEGER NOT NULL
+  );
+`;
+
+const BRIEFING_TABLES = BRIEFINGS_TABLE + REFRESH_MARKS_TABLE;
+
 /** Tables each known version still lacks; every step only adds tables and leaves stored rows alone. */
 const MIGRATIONS: Record<number, string> = {
-  0: PROJECTS_TABLE + SESSIONS_TABLE + PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES + BRIEFINGS_TABLE,
-  1: SESSIONS_TABLE + PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES + BRIEFINGS_TABLE,
-  2: PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES + BRIEFINGS_TABLE,
-  3: EVENT_TABLES + BRIEFINGS_TABLE,
-  4: BRIEFINGS_TABLE,
+  0: PROJECTS_TABLE + SESSIONS_TABLE + PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES + BRIEFING_TABLES,
+  1: SESSIONS_TABLE + PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES + BRIEFING_TABLES,
+  2: PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES + BRIEFING_TABLES,
+  3: EVENT_TABLES + BRIEFING_TABLES,
+  4: BRIEFING_TABLES,
+  5: REFRESH_MARKS_TABLE,
 };
 
 function inTransaction<T>(db: DatabaseSync, work: () => T): T {
@@ -379,6 +398,10 @@ export function openStore(dataDir: string): Store {
     ) WHERE recency <= ${BRIEFING_EVENTS_PER_TYPE}
     ORDER BY observed_at DESC, event_id DESC
   `);
+  const commitEvents = db.prepare(`
+    SELECT e.type, e.payload FROM ${PROCESSED_EVENTS} AND e.type = 'git_commit'
+    ORDER BY e.observed_at DESC, e.event_id DESC LIMIT ${BRIEFING_EVENTS_PER_TYPE}
+  `);
   const highestProcessed = db.prepare(`SELECT MAX(e.event_id) AS event_id FROM ${PROCESSED_EVENTS}`);
   const briefingOf = db.prepare(
     "SELECT project_id, content_hash, text, generated_at FROM briefings WHERE project_id = ?",
@@ -388,6 +411,11 @@ export function openStore(dataDir: string): Store {
     VALUES (:project_id, :content_hash, :text, :generated_at)
     ON CONFLICT (project_id) DO UPDATE SET
       content_hash = excluded.content_hash, text = excluded.text, generated_at = excluded.generated_at
+  `);
+  const refreshMarkOf = db.prepare("SELECT refreshed_through FROM refresh_marks WHERE project_id = ?");
+  const upsertRefreshMark = db.prepare(`
+    INSERT INTO refresh_marks (project_id, refreshed_through) VALUES (?, ?)
+    ON CONFLICT (project_id) DO UPDATE SET refreshed_through = excluded.refreshed_through
   `);
 
   const getById = (projectId: string) => byId.get(projectId) as Project | undefined;
@@ -514,6 +542,9 @@ export function openStore(dataDir: string): Store {
     recentBriefingEvents(projectId) {
       return briefingEvents.all(projectId).map((row) => ({ ...row })) as unknown as BriefingEventRow[];
     },
+    recentCommitEvents(projectId) {
+      return commitEvents.all(projectId).map((row) => ({ ...row })) as unknown as Pick<BriefingEventRow, "type" | "payload">[];
+    },
     highestProcessedEventId(projectId) {
       return (highestProcessed.get(projectId) as { event_id: number | null }).event_id;
     },
@@ -523,6 +554,12 @@ export function openStore(dataDir: string): Store {
     },
     saveBriefing(briefing) {
       upsertBriefing.run({ ...briefing });
+    },
+    getRefreshMark(projectId) {
+      return (refreshMarkOf.get(projectId) as { refreshed_through: number } | undefined)?.refreshed_through ?? null;
+    },
+    saveRefreshMark(projectId, refreshedThrough) {
+      upsertRefreshMark.run(projectId, refreshedThrough);
     },
     close() {
       db.close();

@@ -3,18 +3,19 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { after, test } from "node:test";
 import { resolveStoredPrimary } from "../primary.js";
+import { getProjectStatus, type ProjectStatus } from "../status.js";
 import { BRIEFING_EVENTS_PER_TYPE, openStore, STORE_FILE, type EventType, type NewEvent, type Store } from "../store.js";
 import { removeTempDirs, tempDir } from "./helpers.js";
 
 after(removeTempDirs);
 
-const ALL_TABLES = ["briefings", "events", "pin_audit", "primary_pins", "projects", "sessions", "source_watermarks"];
+const ALL_TABLES = ["briefings", "events", "pin_audit", "primary_pins", "projects", "refresh_marks", "sessions", "source_watermarks"];
 
 test("a store with an unknown schema version refuses to open and is left untouched", () => {
   const dataDir = tempDir();
   const file = path.join(dataDir, STORE_FILE);
   const seed = new DatabaseSync(file);
-  seed.exec("PRAGMA user_version = 6;");
+  seed.exec("PRAGMA user_version = 7;");
   seed.close();
 
   assert.throws(() => openStore(dataDir), { code: "store_version_unsupported" });
@@ -22,7 +23,7 @@ test("a store with an unknown schema version refuses to open and is left untouch
   const db = new DatabaseSync(file);
   try {
     assert.deepEqual(db.prepare("SELECT name FROM sqlite_master").all(), []);
-    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 6);
+    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 7);
   } finally {
     db.close();
   }
@@ -57,7 +58,7 @@ test("a version 1 store gains the sessions, pin, event and briefing tables and k
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 5);
+    assert.equal(userVersion(db), 6);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
@@ -117,7 +118,7 @@ test("a version 2 store gains the pin, event and briefing tables and keeps its p
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 5);
+    assert.equal(userVersion(db), 6);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
@@ -180,7 +181,7 @@ test("a version 3 store gains the event and briefing tables and keeps its projec
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 5);
+    assert.equal(userVersion(db), 6);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
@@ -213,12 +214,63 @@ test("a version 4 store gains the briefings table and keeps its events and water
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 5);
+    assert.equal(userVersion(db), 6);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
   }
 });
+
+test("a version 5 store gains the refresh_marks table and keeps its events, watermarks and briefing", () => {
+  const dataDir = tempDir();
+  const file = path.join(dataDir, STORE_FILE);
+  const seeded = openStore(dataDir);
+  seeded.upsert({ project_id: "kept", display_name: "Kept", canonical_path: "/x/kept" });
+  seeded.ingestEvent(storedEvent("kept", 1));
+  seeded.saveBriefing({ project_id: "kept", content_hash: "h", text: "kept\n", generated_at: "2026-10-24T12:00:00.000Z" });
+  seeded.close();
+  const seed = new DatabaseSync(file);
+  seed.exec("DROP TABLE refresh_marks; PRAGMA user_version = 5;");
+  seed.close();
+
+  for (let open = 0; open < 2; open++) {
+    const store = openStore(dataDir);
+    try {
+      assert.equal(store.highestProcessedEventId("kept"), 1);
+      assert.equal(store.getBriefing("kept")?.text, "kept\n");
+      assert.equal(store.getRefreshMark("kept"), null);
+    } finally {
+      store.close();
+    }
+  }
+
+  const db = new DatabaseSync(file);
+  try {
+    assert.equal(userVersion(db), 6);
+    assert.deepEqual(tableNames(db), ALL_TABLES);
+  } finally {
+    db.close();
+  }
+});
+
+test("an admitted event is lagging until a refresh records it, and current after", () => {
+  const store = openStore(tempDir());
+  try {
+    store.upsert({ project_id: "p", display_name: "P", canonical_path: "/x/p" });
+    store.ingestEvent(storedEvent("p", 1));
+    const { event_id } = store.ingestEvent(storedEvent("p", 2));
+    assert.deepEqual(pick(getProjectStatus(store, "p")), { freshness: "lagging", freshness_reasons: ["pending_refresh"] });
+    store.saveRefreshMark("p", event_id - 1);
+    assert.equal(getProjectStatus(store, "p").freshness, "lagging");
+    store.saveRefreshMark("p", event_id);
+    assert.equal(store.getRefreshMark("p"), event_id);
+    assert.deepEqual(pick(getProjectStatus(store, "p")), { freshness: "current", freshness_reasons: [] });
+  } finally {
+    store.close();
+  }
+});
+
+const pick = ({ freshness, freshness_reasons }: ProjectStatus) => ({ freshness, freshness_reasons });
 
 function storedEvent(projectId: string, sequence: number, type: EventType = "progress"): NewEvent {
   return {

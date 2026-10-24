@@ -1,12 +1,14 @@
 import { realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import type { ProviderHomes } from "./adapters/homes.js";
-import { refreshBriefing, type BriefingRefresh } from "./briefingFile.js";
+import { previewBriefing, refreshBriefing, type BriefingRefresh } from "./briefingFile.js";
 import { readVoiceConfig } from "./config.js";
 import { BridgeError } from "./errors.js";
 import { runGit } from "./git.js";
+import type { HeadReader } from "./head.js";
+import type { Reconciler } from "./reconcile.js";
 import { discoverProjectSessions, type DiscoveryCounts } from "./sessions.js";
-import type { ProjectStatus } from "./status.js";
+import { getLiveHeadCheck, getProjectStatus, type ProjectStatus } from "./status.js";
 import type { Store } from "./store.js";
 
 export interface ProjectSummary {
@@ -21,10 +23,14 @@ export interface RegisterResult extends ProjectSummary, DiscoveryCounts {
 
 export interface OpenedProject extends ProjectSummary {
   freshness: ProjectStatus["freshness"];
+  freshness_reasons: ProjectStatus["freshness_reasons"];
+  /** True when the project is `lagging` or `unverified`: the briefing holds the last confirmed facts only. */
+  uncertain: boolean;
   last_confirmed_activity: ProjectStatus["last_confirmed_activity"];
-  /** The same text that is in the project's briefing file. */
+  /** The same text that is in the project's briefing file, unless `briefing_write` is `deferred`. */
   briefing: string;
-  briefing_write: BriefingRefresh["write"];
+  /** `deferred` when the project is uncertain: the reconciliation open started writes the file instead. */
+  briefing_write: BriefingRefresh["write"] | "deferred";
   briefing_write_error: string | null;
 }
 
@@ -90,15 +96,44 @@ export function listProjects(store: Store): ProjectSummary[] {
   }));
 }
 
-export function openProject(store: Store, projectId: string): OpenedProject {
+/**
+ * Answers from what the store has confirmed. An uncertain project is answered without writing its
+ * briefing, and its reconciliation is started but never awaited, so the only wait is the HEAD read.
+ */
+export async function openProject(
+  store: Store,
+  projectId: string,
+  { reconciler, readHead }: { reconciler: Reconciler; readHead: HeadReader },
+): Promise<OpenedProject> {
   const project = store.getById(projectId);
   if (!project) throw new BridgeError("project_not_found", `no project registered with id ${projectId}`);
-  const briefing = refreshBriefing(store, projectId);
-  return {
+  const head = await getLiveHeadCheck(store, projectId, readHead);
+  const status = getProjectStatus(store, projectId, { head });
+  const uncertain = status.freshness === "lagging" || status.freshness === "unverified";
+  const summary = {
     project_id: project.project_id,
     display_name: project.display_name,
     canonical_path: project.canonical_path,
+  };
+  if (uncertain) {
+    reconciler.trigger(projectId);
+    return {
+      ...summary,
+      freshness: status.freshness,
+      freshness_reasons: status.freshness_reasons,
+      uncertain,
+      last_confirmed_activity: status.last_confirmed_activity,
+      briefing: previewBriefing(store, projectId, status),
+      briefing_write: "deferred",
+      briefing_write_error: null,
+    };
+  }
+  const briefing = refreshBriefing(store, projectId, { head });
+  return {
+    ...summary,
     freshness: briefing.status.freshness,
+    freshness_reasons: briefing.status.freshness_reasons,
+    uncertain,
     last_confirmed_activity: briefing.status.last_confirmed_activity,
     briefing: briefing.text,
     briefing_write: briefing.write,

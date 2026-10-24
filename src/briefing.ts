@@ -1,4 +1,5 @@
 import { PROVIDERS } from "./adapters/types.js";
+import { latestRecordedCommit, type HeadCheck } from "./head.js";
 import { getProjectStatus, type ProjectStatus } from "./status.js";
 import { BRIEFING_EVENTS_PER_TYPE, type BriefingEventRow, type Store } from "./store.js";
 
@@ -38,7 +39,6 @@ export const BUDGET_LEVELS: readonly BudgetLevel[] = [
 
 const DISPLAY_NAME_CHARS = 80;
 const OMITTED = "(omitted to fit the briefing budget)";
-const COMMIT_PATTERN = /^[0-9a-f]{7,64}$/;
 /** Shorter identifiers are left alone so a short test id cannot mangle ordinary words. */
 const MIN_SCRUBBED_ID_LENGTH = 8;
 
@@ -62,8 +62,13 @@ export interface BriefingState {
   session_identifiers: readonly string[];
 }
 
-export function loadBriefingState(store: Store, project: { project_id: string; display_name: string }): BriefingState {
-  const status = getProjectStatus(store, project.project_id);
+/** The render is the refresh, so the status it states never counts the render itself as pending. */
+export function loadBriefingState(
+  store: Store,
+  project: { project_id: string; display_name: string },
+  options: { head?: HeadCheck } = {},
+): BriefingState {
+  const status = getProjectStatus(store, project.project_id, { head: options.head, refreshing: true });
   const events = store.recentBriefingEvents(project.project_id);
   const identifiers = new Set<string>();
   for (const session of store.listSessions(project.project_id)) {
@@ -182,10 +187,6 @@ function collectFacts(state: BriefingState): Facts {
 
   const agentEvent = parsed.find((event) => event.type.startsWith("session_") || event.type.startsWith("turn_"));
   const agentProvider = agentEvent?.session_id ? providerOf(agentEvent.session_id) : undefined;
-  const commit = ofType("git_commit")
-    .map((event) => stringField(event.fields, "commit"))
-    .find((value): value is string => value !== null && COMMIT_PATTERN.test(value));
-
   return {
     scrub,
     displayName: truncate(clean(state.display_name), DISPLAY_NAME_CHARS),
@@ -201,7 +202,7 @@ function collectFacts(state: BriefingState): Facts {
     questions: pendingQuestions(questionEvents, ofType("user_decision"), clean),
     questionsAtCap: questionEvents.length >= BRIEFING_EVENTS_PER_TYPE,
     agent: agentProvider ?? "not identified",
-    commit: commit ?? null,
+    commit: latestRecordedCommit(state.events),
   };
 }
 
