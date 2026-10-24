@@ -133,7 +133,10 @@ export interface QuestionFields {
 }
 
 export interface InboxItem {
-  /** `q-<event_id>` of the event that created the item, the id the briefing shows for the question. */
+  /**
+   * `q-<source_event_id>`. VOICE.md shows the same id unless that event is not yet processed or has
+   * fallen outside the briefing's 200-event window.
+   */
   question_id: string;
   project_id: string;
   origin_session_id: string | null;
@@ -143,10 +146,11 @@ export interface InboxItem {
   summary: string;
   priority: string | null;
   status: InboxStatus;
-  /** The bridge's `event_id` of the creating event, not the producer's `source_event_id` string. */
+  /**
+   * The bridge's `event_id` of the identity's earliest stored `user_question`, which may predate the inbox;
+   * not the producer's `source_event_id` string.
+   */
   source_event_id: number;
-  /** The bridge's `event_id` of the newest event applied to the item. */
-  last_event_id: number;
   created_at: string;
   updated_at: string;
   dismissed_at: string | null;
@@ -320,7 +324,6 @@ const INBOX_TABLES = `
     priority              TEXT,
     status                TEXT NOT NULL CHECK (status IN (${INBOX_STATUSES.map((status) => `'${status}'`).join(", ")})),
     source_event_id       INTEGER NOT NULL,
-    last_event_id         INTEGER NOT NULL,
     created_at            TEXT NOT NULL,
     updated_at            TEXT NOT NULL,
     dismissed_at          TEXT,
@@ -491,19 +494,25 @@ export function openStore(dataDir: string): Store {
   `);
   const insertInboxItem = db.prepare(`
     INSERT INTO inbox_items (question_id, project_id, origin_session_id, origin_question_id, type, summary, priority,
-                             status, source_event_id, last_event_id, created_at, updated_at)
+                             status, source_event_id, created_at, updated_at)
     VALUES (:question_id, :project_id, :origin_session_id, :origin_question_id, :type, :summary, :priority,
-            :status, :event_id, :event_id, :observed_at, :observed_at)
+            :status, :source_event_id, :observed_at, :observed_at)
   `);
   const updateInboxItem = db.prepare(`
     UPDATE inbox_items SET
       summary = COALESCE(:summary, summary),
       type = COALESCE(:type, type),
       priority = COALESCE(:priority, priority),
-      status = CASE WHEN :withdrawn AND status = 'open' THEN 'obsolete' ELSE status END,
-      last_event_id = :event_id,
       updated_at = :observed_at
     WHERE question_id = :question_id
+  `);
+  const withdrawInboxItem = db.prepare(
+    "UPDATE inbox_items SET status = 'obsolete' WHERE question_id = ? AND status = 'open'",
+  );
+  const earliestQuestionEvent = db.prepare(`
+    SELECT MIN(event_id) AS event_id FROM events
+    WHERE project_id = ? AND session_id IS ? AND type = 'user_question'
+      AND json_type(payload, '$.question_id') = 'text' AND json_extract(payload, '$.question_id') = ?
   `);
   const insertNotification = db.prepare(
     "INSERT INTO inbox_notifications (question_id, project_id, created_at) VALUES (?, ?, ?)",
@@ -528,21 +537,28 @@ export function openStore(dataDir: string): Store {
             | { question_id: string; status: InboxStatus; updated_at: string }
             | undefined);
     if (known) {
-      // A late event older than what the item already shows changes nothing.
-      if (event.observed_at < known.updated_at) return;
-      updateInboxItem.run({
-        question_id: known.question_id,
-        summary: question.summary,
-        type: question.type,
-        priority: question.priority,
-        withdrawn: question.withdrawn ? 1 : 0,
-        event_id: eventId,
-        observed_at: event.observed_at,
-      });
+      // A late event cannot overwrite newer fields, but its withdrawal still counts: open → obsolete only moves one way.
+      if (event.observed_at >= known.updated_at) {
+        updateInboxItem.run({
+          question_id: known.question_id,
+          summary: question.summary,
+          type: question.type,
+          priority: question.priority,
+          observed_at: event.observed_at,
+        });
+      }
+      if (question.withdrawn) withdrawInboxItem.run(known.question_id);
       return;
     }
     if (question.withdrawn && question.origin_question_id === null) return;
-    const questionId = `q-${eventId}`;
+    // A question asked before the inbox existed keeps the id the briefing already gave it.
+    const sourceEventId =
+      question.origin_question_id === null
+        ? eventId
+        : ((earliestQuestionEvent.get(event.project_id, event.session_id, question.origin_question_id) as {
+            event_id: number;
+          }).event_id);
+    const questionId = `q-${sourceEventId}`;
     // A withdrawal seen first leaves an obsolete placeholder, so the late original cannot open and notify.
     insertInboxItem.run({
       question_id: questionId,
@@ -553,7 +569,7 @@ export function openStore(dataDir: string): Store {
       summary: question.summary ?? "",
       priority: question.priority,
       status: question.withdrawn ? "obsolete" : "open",
-      event_id: eventId,
+      source_event_id: sourceEventId,
       observed_at: event.observed_at,
     });
     if (!question.withdrawn) insertNotification.run(questionId, event.project_id, new Date().toISOString());

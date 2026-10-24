@@ -153,3 +153,60 @@ test("the inbox and the briefing give the same events the same question ids", ()
   assert.equal(inboxIds.length, 5);
   assert.deepEqual(briefingIds, inboxIds);
 });
+
+test("a withdrawal observed before the item's newest event still makes it obsolete, keeping the newer fields", () => {
+  ask({ question_id: "q", summary: "first" }, { second: 1 });
+  ask({ question_id: "q", summary: "newest" }, { second: 5 });
+  ask({ question_id: "q", withdrawn: true, summary: "late" }, { second: 3 });
+  assert.deepEqual(
+    items().map(({ status, summary, updated_at }) => ({ status, summary, updated_at })),
+    [{ status: "obsolete", summary: "newest", updated_at: "2026-10-24T12:00:05.000Z" }],
+  );
+  assert.equal(notificationCount(), 1);
+});
+
+test("withdrawing a dismissed question leaves it cancelled with its dismissal", () => {
+  const id = ask({ question_id: "q", summary: "ask" }, { second: 1 });
+  const dismissed = store.dismissInboxQuestion(`q-${id}`)!;
+  ask({ question_id: "q", withdrawn: true }, { second: 2 });
+  assert.deepEqual(
+    items().map(({ status, dismissed_at }) => ({ status, dismissed_at })),
+    [{ status: "cancelled", dismissed_at: dismissed.item.dismissed_at }],
+  );
+  assert.equal(notificationCount(), 1);
+});
+
+test("dismissing a withdrawn question leaves it obsolete with no dismissal", () => {
+  const id = ask({ question_id: "q", summary: "ask" }, { second: 1 });
+  ask({ question_id: "q", withdrawn: true }, { second: 2 });
+  const result = store.dismissInboxQuestion(`q-${id}`)!;
+  assert.equal(result.dismissed, false);
+  assert.equal(result.item.status, "obsolete");
+  assert.equal(result.item.dismissed_at, null);
+  assert.deepEqual(items().map(({ status, dismissed_at }) => ({ status, dismissed_at })), [{ status: "obsolete", dismissed_at: null }]);
+});
+
+test("a question first asked before the inbox existed keeps the briefing's id when its agent asks again", () => {
+  sequence++;
+  const before = store.ingestEvent({
+    project_id: "a",
+    session_id: "s1",
+    source: "hook",
+    source_event_id: `hook-${sequence}`,
+    source_sequence: sequence,
+    type: "user_question",
+    payload: JSON.stringify({ question_id: "q", summary: "asked before the upgrade" }),
+    observed_at: "2026-10-24T12:00:01.000Z",
+  }).event_id;
+  ask({ question_id: "q", summary: "asked again" }, { second: 3 });
+
+  const text = renderBriefing(loadBriefingState(store, { project_id: "a", display_name: "a" }), {
+    maxTokens: 2000,
+    generatedAt: "2026-10-24T12:00:00.000Z",
+  });
+  const item = store.listInbox({}).find((each) => each.origin_question_id === "q")!;
+  assert.equal(item.question_id, `q-${before}`);
+  assert.equal(item.source_event_id, before);
+  assert.match(text, new RegExp(`^- q-${before}: asked again$`, "m"));
+  assert.equal(store.dismissInboxQuestion(`q-${before}`)!.dismissed, true);
+});
