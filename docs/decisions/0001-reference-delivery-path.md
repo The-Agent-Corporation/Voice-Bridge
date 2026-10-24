@@ -12,7 +12,7 @@ MISSION Q2: after the Milestone 0 spike, which single bridge-controlled provider
 
 ## Evidence
 
-From the `voice-bridge probe` run of 2026-10-24 12:44 EDT, with `codex-cli 0.145.0` at `/opt/homebrew/Caskroom/codex/0.145.0/codex-aarch64-apple-darwin` (full matrix in [docs/compatibility.md](../compatibility.md)). On the `app_server` surface:
+From the `voice-bridge probe` run of 2026-10-24 12:45 EDT, with `codex-cli 0.145.0` at `/opt/homebrew/Caskroom/codex/0.145.0/codex-aarch64-apple-darwin` (full matrix in [docs/compatibility.md](../compatibility.md)). On the `app_server` surface:
 
 | capability | status | check |
 |---|---|---|

@@ -116,7 +116,7 @@ const STATIC_DETAIL: Record<StaticReason, string> = {
   resume_is_not_attach: "resume reopens a saved session; it does not attach to a live one, so it proves nothing about live_attach",
 };
 
-export function unverified(reason: UnverifiedReason, detail: string, evidence: Evidence[] = []): CapabilityResult {
+function unverified(reason: UnverifiedReason, detail: string, evidence: Evidence[] = []): CapabilityResult {
   return { status: "unverified", reason, detail, evidence };
 }
 

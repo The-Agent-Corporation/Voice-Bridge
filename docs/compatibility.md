@@ -2,7 +2,7 @@
 
 What the Codex and Claude Code installed on the build machine could prove. The source is one `node dist/cli.js probe` run, copied cell for cell from its JSON. Rerun the probe whenever either provider is upgraded. The matrix holds only for these versions.
 
-- **Probed:** 2026-10-24 12:44 EDT, on `darwin-arm64`
+- **Probed:** 2026-10-24 12:45 EDT, on `darwin-arm64`
 - **codex:** `/opt/homebrew/bin/codex` → `/opt/homebrew/Caskroom/codex/0.145.0/codex-aarch64-apple-darwin`, `codex-cli 0.145.0`
 - **claude-code:** `/Users/aaronwhaley/.local/bin/claude` → `/Users/aaronwhaley/.local/share/claude/versions/2.1.289`, `2.1.289 (Claude Code)`
 
@@ -32,7 +32,7 @@ The probe runs every provider by its resolved realpath and never by a bare name.
   3. `thread/start {cwd, ephemeral: true}`, then `thread/read`, proves **inspect**: the same thread id came back.
   4. A `thread/started` notification for that thread proves **events**.
   5. `turn/start` proves **next_turn**: it returned a turn id and a `turn/started` notification followed. No credentials are present, so the upstream model call fails with 401, no model runs and nothing is billed.
-  6. `turn/steer {expectedTurnId}` is sent at once. On this machine it returned `-32600: no active turn to steer`, in each of the five runs on 2026-10-24: the credential-less turn had already ended. The cell stays `check_failed`, not `unsupported`.
+  6. `turn/steer {expectedTurnId}` is sent at once. On this machine it returned `-32600: no active turn to steer`, in each of the six runs on 2026-10-24: the credential-less turn had already ended. The cell stays `check_failed`, not `unsupported`.
   7. `turn/interrupt`, which is cleanup and not evidence. Then stdin closes.
 - Requests the server sends to the client, such as approvals or `item/tool/requestUserInput`, are recorded and never answered.
 - Every child leads its own process group. The group is SIGKILLed and polled until it is empty, even after a clean exit, because the Codex app-server leaves a grandchild behind. `probe` exits 1 if any group survives.

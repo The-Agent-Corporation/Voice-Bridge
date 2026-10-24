@@ -249,10 +249,11 @@ export async function probeCodexAppServer(
   const checks = await runChecks(rpc, options.cwd, codexHome);
   const ended = await session.finish();
 
+  // Evidence keeps the tail of `observed`, so the short markers go last and survive a long stderr.
   const observed = [
-    rpc.serverRequests.length > 0 ? `server requests left unanswered: ${rpc.serverRequests.join(", ")}` : "",
-    rpc.strayLines.length > 0 ? `non-JSON stdout: ${rpc.strayLines.join(" | ")}` : "",
     ended.spawn_error ?? (ended.stderr.trim() === "" ? "" : `stderr: ${ended.stderr.trim()}`),
+    rpc.strayLines.length > 0 ? `non-JSON stdout: ${rpc.strayLines.join(" | ")}` : "",
+    rpc.serverRequests.length > 0 ? `server requests left unanswered: ${rpc.serverRequests.join(", ")}` : "",
   ]
     .filter((part) => part !== "")
     .join("; ");
