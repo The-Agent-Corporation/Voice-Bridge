@@ -4,10 +4,9 @@ import path from "node:path";
 import { writeFileAtomic } from "./atomicFile.js";
 import { loadBriefingState, renderBriefing, type BriefingState } from "./briefing.js";
 import { DEFAULT_MAX_BRIEFING_TOKENS, readVoiceConfig, type VoiceConfig } from "./config.js";
-import { BridgeError } from "./errors.js";
 import type { HeadCheck } from "./head.js";
 import type { ProjectStatus } from "./status.js";
-import type { Project, Store } from "./store.js";
+import { requireProject, type Project, type Store } from "./store.js";
 
 /** The generation time the content hash is rendered with, so the wall clock never changes the hash. */
 const HASH_GENERATED_AT = new Date(0).toISOString();
@@ -31,12 +30,6 @@ function readFileIfPresent(file: string): string | undefined {
   } catch {
     return undefined;
   }
-}
-
-function requireProject(store: Store, projectId: string): Project {
-  const project = store.getById(projectId);
-  if (!project) throw new BridgeError("project_not_found", `no project registered with id ${projectId}`);
-  return project;
 }
 
 /** The project's configured budget, or the default when its config cannot be read. */

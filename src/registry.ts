@@ -9,7 +9,7 @@ import type { HeadReader } from "./head.js";
 import type { Reconciler } from "./reconcile.js";
 import { discoverProjectSessions, type DiscoveryCounts } from "./sessions.js";
 import { getLiveHeadCheck, getProjectStatus, type ProjectStatus } from "./status.js";
-import type { Store } from "./store.js";
+import { requireProject, type Store } from "./store.js";
 
 export interface ProjectSummary {
   project_id: string;
@@ -105,8 +105,7 @@ export async function openProject(
   projectId: string,
   { reconciler, readHead }: { reconciler: Reconciler; readHead: HeadReader },
 ): Promise<OpenedProject> {
-  const project = store.getById(projectId);
-  if (!project) throw new BridgeError("project_not_found", `no project registered with id ${projectId}`);
+  const project = requireProject(store, projectId);
   const head = await getLiveHeadCheck(store, projectId, readHead);
   const status = getProjectStatus(store, projectId, { head });
   const uncertain = status.freshness === "lagging" || status.freshness === "unverified";

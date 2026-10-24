@@ -300,6 +300,12 @@ export function sessionId(provider: Provider, nativeSessionId: string): string {
   return `${provider}:${nativeSessionId}`;
 }
 
+export function requireProject(store: Store, projectId: string): Project {
+  const project = store.getById(projectId);
+  if (!project) throw new BridgeError("project_not_found", `no project registered with id ${projectId}`);
+  return project;
+}
+
 export function openStore(dataDir: string): Store {
   const file = path.join(dataDir, STORE_FILE);
   const db = new DatabaseSync(file);

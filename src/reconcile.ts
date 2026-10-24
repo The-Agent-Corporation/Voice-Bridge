@@ -2,7 +2,7 @@ import { refreshBriefing, type BriefingRefresh } from "./briefingFile.js";
 import { BridgeError } from "./errors.js";
 import { compareHead, latestRecordedCommit, type HeadReader } from "./head.js";
 import { getProjectStatus, type ProjectStatus } from "./status.js";
-import type { Store } from "./store.js";
+import { requireProject, type Store } from "./store.js";
 
 export const DEFAULT_RECONCILE_INTERVAL_MS = 60_000;
 const MIN_RECONCILE_INTERVAL_MS = 1_000;
@@ -78,8 +78,7 @@ export function createReconciler({ store, readHead, intervalMs }: { store: Store
   }
 
   async function runOnce(projectId: string): Promise<ReconcileResult> {
-    const project = store.getById(projectId);
-    if (!project) throw new BridgeError("project_not_found", `no project registered with id ${projectId}`);
+    const project = requireProject(store, projectId);
     const head = await readHead(project.canonical_path);
     if (closed) throw shuttingDown();
 

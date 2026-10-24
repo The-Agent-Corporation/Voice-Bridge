@@ -1,6 +1,5 @@
-import { BridgeError } from "./errors.js";
 import { compareHead, latestRecordedCommit, type HeadCheck, type HeadReader } from "./head.js";
-import type { EventType, Store, TurnState, WatermarkRow } from "./store.js";
+import { requireProject, type EventType, type Store, type TurnState, type WatermarkRow } from "./store.js";
 
 export type Freshness = "current" | "lagging" | "unverified" | "conflicted";
 
@@ -64,12 +63,6 @@ export function computeFreshness(input: FreshnessInput): Pick<ProjectStatus, "fr
         ? "conflicted"
         : "current";
   return { freshness, freshness_reasons: reasons };
-}
-
-function requireProject(store: Store, projectId: string) {
-  const project = store.getById(projectId);
-  if (!project) throw new BridgeError("project_not_found", `no project registered with id ${projectId}`);
-  return project;
 }
 
 /**
