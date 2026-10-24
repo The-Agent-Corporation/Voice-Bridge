@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { after, afterEach, beforeEach, describe, test } from "node:test";
 import type { AgentAdapter, SessionCapabilities } from "../adapters/types.js";
-import { getMessage, MESSAGE_TTL_MS, planSend, submitMessage, type SendRequest } from "../messages.js";
+import { cancelMessage, getMessage, MESSAGE_TTL_MS, planSend, submitMessage, type SendRequest } from "../messages.js";
 import type { PrimaryRoute } from "../primary.js";
 import { openStore, type Store, type StoredSession } from "../store.js";
 import { removeTempDirs, tempDir } from "./helpers.js";
@@ -113,7 +113,36 @@ describe("submitMessage", () => {
     assert.equal(receipt.state, "delivered");
     assert.equal(receipt.reason, "adapter_receipt");
     assert.equal(receipt.provider_ref, "turn-1");
-    assert.deepEqual(receipt.transitions.map((t) => t.state), ["accepted", "queued", "delivered"]);
+    assert.deepEqual(receipt.transitions.map((t) => t.state), ["accepted", "queued", "delivering", "delivered"]);
+  });
+
+  test("a cancel or expiry during the adapter call cannot hide its outcome", async () => {
+    let release!: () => void;
+    const held = adapter(() => new Promise((resolve) => (release = () => resolve({ provider_ref: "turn-1" }))));
+    const sending = submitMessage(store, request("k"), CONNECTED, session(true), held, clock);
+    const { message_id } = store.findMessageByKey("k")!;
+    const cancel = cancelMessage(store, { message_id }, clock);
+    assert.equal(cancel.cancelled, false);
+    assert.equal(cancel.state, "delivering");
+    assert.equal(getMessage(store, { message_id }, () => new Date(NOW.getTime() + MESSAGE_TTL_MS + 1)).state, "delivering");
+    release();
+    const receipt = await sending;
+    assert.equal(receipt.state, "delivered");
+    assert.equal(receipt.provider_ref, "turn-1");
+  });
+
+  test("a retry under the same key during the adapter call is a duplicate and is not sent again", async () => {
+    const pending: (() => void)[] = [];
+    const held = adapter(() => new Promise((resolve) => pending.push(() => resolve({ provider_ref: "turn-1" }))));
+    const first = submitMessage(store, request("k"), CONNECTED, session(true), held, clock);
+    const retrying = submitMessage(store, request("k"), CONNECTED, session(true), held, clock);
+    assert.equal(calls.length, 1);
+    for (const release of pending) release();
+    const [delivered, retry] = await Promise.all([first, retrying]);
+    assert.equal(retry.duplicate, true);
+    assert.equal(retry.state, "delivering");
+    assert.equal(retry.message_id, delivered.message_id);
+    assert.equal(delivered.state, "delivered");
   });
 
   test("a session without the next_turn capability is never called", async () => {

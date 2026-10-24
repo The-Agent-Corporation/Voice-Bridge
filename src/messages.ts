@@ -7,6 +7,7 @@ import { adapterFor } from "./sessions.js";
 import {
   matchDuplicateMessage,
   MESSAGE_MODES,
+  type MessageChange,
   type MessageIdentity,
   type MessageMode,
   type NewMessage,
@@ -87,8 +88,9 @@ export function planSend(route: PrimaryRoute, mode: MessageMode, approveQueue: b
 
 /**
  * Stores the message, then delivers it only when it heads its project's queue for a session that can
- * take a next turn. The row is committed as queued before the adapter is called, so a crash during
- * delivery leaves it queued, never lost. Nothing here starts a process.
+ * take a next turn. Such a message is committed as `delivering` before the adapter is called, so a
+ * cancel, an expiry or a retry under its key during the call cannot touch it, and a crash during the
+ * call leaves it `delivering`, never resent. Nothing here starts a process.
  */
 export async function submitMessage(
   store: Store,
@@ -108,11 +110,11 @@ export async function submitMessage(
     created_at: now.toISOString(),
     expires_at: new Date(now.getTime() + MESSAGE_TTL_MS).toISOString(),
   });
-  if (duplicate || message.reason !== "awaiting_delivery" || !primary || !adapter?.sendNextTurn) {
+  if (duplicate || message.state !== "delivering" || !primary || !adapter?.sendNextTurn) {
     return { ...receipt(message), duplicate };
   }
 
-  let to: Parameters<Store["transitionMessage"]>[2];
+  let to: MessageChange;
   try {
     const { provider_ref } = await adapter.sendNextTurn(primary.native_session_id, request.text, request.idempotency_key);
     to = { state: "delivered", reason: "adapter_receipt", detail: `delivered to ${primary.session_id}`, provider_ref };
@@ -121,8 +123,9 @@ export async function submitMessage(
     console.error(`voice-bridge: message ${message.message_id} not delivered to ${primary.session_id}: ${detail}`);
     to = { state: "failed", reason: "delivery_failed", detail };
   }
-  const delivered = store.transitionMessage(message.message_id, "queued", to, clock().toISOString())!;
-  return { ...receipt(delivered.message), duplicate: false };
+  const outcome = store.transitionMessage(message.message_id, "delivering", to, clock().toISOString());
+  if (!outcome) throw new BridgeError("message_not_found", `message ${message.message_id} was removed during delivery`);
+  return { ...receipt(outcome.message), duplicate: false };
 }
 
 /**

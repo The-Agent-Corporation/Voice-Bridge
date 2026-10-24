@@ -165,12 +165,14 @@ export interface InboxNotification {
 }
 
 /**
- * The message states of docs/PRD.md Appendix A but `draft`, which the bridge never stores; this build
- * writes `accepted`, `queued`, `delivered`, `failed`, `expired` and `cancelled`.
+ * The message states of docs/PRD.md Appendix A but `draft`, which the bridge never stores, plus
+ * `delivering`: handed to the adapter, outcome not yet known, so neither cancel nor expiry may touch it.
+ * This build writes `accepted`, `queued`, `delivering`, `delivered`, `failed`, `expired` and `cancelled`.
  */
 export const MESSAGE_STATES = [
   "accepted",
   "queued",
+  "delivering",
   "delivered",
   "acknowledged",
   "started",
@@ -196,6 +198,7 @@ export type MessageReason =
   | "awaiting_controllable_session"
   | "awaiting_earlier_messages"
   | "awaiting_delivery"
+  | "handed_to_adapter"
   | "adapter_receipt"
   | "cancelled_by_user"
   | "expired_unsent";
@@ -244,9 +247,9 @@ export interface NewMessage {
   approve_queue: boolean;
   idempotency_key: string;
   /**
-   * The routing decision. `deliverable` stores `queued` with reason `awaiting_delivery`, or
-   * `awaiting_earlier_messages` when the project already has a queued message, which must go first;
-   * any other decision is stored as given.
+   * The routing decision. `deliverable` stores `delivering`, through `queued` with `awaiting_delivery`,
+   * or `queued` with `awaiting_earlier_messages` when the project already has a queued or delivering
+   * message, which must go first; any other decision is stored as given.
    */
   decision: { deliverable: true } | { deliverable: false; state: MessageState; reason: MessageReason; detail: string };
   created_at: string;
@@ -698,7 +701,9 @@ export function openStore(dataDir: string): Store {
   const nextSequence = db.prepare(
     "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM messages WHERE project_id = ?",
   );
-  const queuedInProject = db.prepare("SELECT 1 FROM messages WHERE project_id = ? AND state = 'queued' LIMIT 1");
+  const pendingInProject = db.prepare(
+    "SELECT 1 FROM messages WHERE project_id = ? AND state IN ('queued', 'delivering') LIMIT 1",
+  );
   const insertMessage = db.prepare(`
     INSERT INTO messages (message_id, project_id, session_id, sequence, mode, body, approve_queue, idempotency_key,
                           state, reason, detail, created_at, updated_at, expires_at)
@@ -950,11 +955,12 @@ export function openStore(dataDir: string): Store {
         const stored = findMessageByKey(message.idempotency_key);
         if (stored) return { message: matchDuplicateMessage(stored, message), duplicate: true };
         const { decision } = message;
-        const { state, reason, detail } = !decision.deliverable
+        const headOfQueue = decision.deliverable && !pendingInProject.get(message.project_id);
+        const { state, reason, detail }: MessageChange = !decision.deliverable
           ? decision
-          : queuedInProject.get(message.project_id)
-            ? { state: "queued" as const, reason: "awaiting_earlier_messages" as const, detail: "an earlier message in this project is still queued" }
-            : { state: "queued" as const, reason: "awaiting_delivery" as const, detail: "handing the message to the primary session" };
+          : headOfQueue
+            ? { state: "delivering", reason: "handed_to_adapter", detail: "handing the message to the primary session" }
+            : { state: "queued", reason: "awaiting_earlier_messages", detail: "an earlier message in this project is still pending" };
         const { sequence } = nextSequence.get(message.project_id) as { sequence: number };
         insertMessage.run({
           message_id: message.message_id,
@@ -972,6 +978,7 @@ export function openStore(dataDir: string): Store {
           expires_at: message.expires_at,
         });
         insertTransition.run(message.message_id, "accepted", "authenticated", message.created_at);
+        if (headOfQueue) insertTransition.run(message.message_id, "queued", "awaiting_delivery", message.created_at);
         insertTransition.run(message.message_id, state, reason, message.created_at);
         return { message: getMessage(message.message_id)!, duplicate: false };
       });

@@ -509,11 +509,17 @@ test("message sequences count from 1 in each project", () => {
   }
 });
 
-test("a deliverable message waits behind an earlier queued one in its project", () => {
+test("a deliverable message is claimed for delivery, and later ones wait behind it", () => {
   const { store } = seededStore();
   try {
-    assert.equal(store.createMessage(newMessage("a", { decision: { deliverable: true } })).message.reason, "awaiting_delivery");
+    const first = store.createMessage(newMessage("a", { decision: { deliverable: true } })).message;
+    assert.deepEqual(
+      first.transitions.map((t) => `${t.state}/${t.reason}`),
+      ["accepted/authenticated", "queued/awaiting_delivery", "delivering/handed_to_adapter"],
+    );
     assert.equal(store.createMessage(newMessage("b", { decision: { deliverable: true } })).message.reason, "awaiting_earlier_messages");
+    store.expireMessages("2030-01-01T00:00:00.000Z");
+    assert.equal(store.getMessage("m-a")?.state, "delivering");
   } finally {
     store.close();
   }
