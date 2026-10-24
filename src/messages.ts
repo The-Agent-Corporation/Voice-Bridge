@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ProviderHomes } from "./adapters/homes.js";
-import type { AgentAdapter, Provider } from "./adapters/types.js";
+import type { AgentAdapter } from "./adapters/types.js";
 import { BridgeError, requireString } from "./errors.js";
 import { getPrimarySession, type PrimaryRoute } from "./primary.js";
 import { adapterFor } from "./sessions.js";
@@ -133,17 +133,15 @@ export async function sendToPrimary(
   store: Store,
   body: Record<string, unknown>,
   homes: ProviderHomes,
-  clock: Clock = systemClock,
-  adapters: (provider: Provider) => AgentAdapter = (provider) => adapterFor(provider, homes),
 ): Promise<MessageReceipt & { duplicate: boolean }> {
   const request = sendRequest(body);
-  store.expireMessages(clock().toISOString());
+  store.expireMessages(systemClock().toISOString());
   const stored = store.findMessageByKey(request.idempotency_key);
   if (stored) return { ...receipt(matchDuplicateMessage(stored, messageIdentity(request))), duplicate: true };
 
   const route = await getPrimarySession(store, request.project_id, homes);
   const primary = store.listSessions(request.project_id).find((s) => s.session_id === route.primary_session_id);
-  return submitMessage(store, request, route, primary, primary && adapters(primary.provider), clock);
+  return submitMessage(store, request, route, primary, primary && adapterFor(primary.provider, homes));
 }
 
 export function getMessage(store: Store, body: Record<string, unknown>, clock: Clock = systemClock): MessageReceipt {

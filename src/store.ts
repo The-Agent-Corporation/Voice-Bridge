@@ -200,6 +200,13 @@ export type MessageReason =
   | "cancelled_by_user"
   | "expired_unsent";
 
+export interface MessageChange {
+  state: MessageState;
+  reason: MessageReason;
+  detail: string;
+  provider_ref?: string;
+}
+
 export interface MessageTransition {
   state: MessageState;
   reason: MessageReason;
@@ -337,7 +344,7 @@ export interface Store {
   transitionMessage(
     messageId: string,
     from: MessageState,
-    to: { state: MessageState; reason: MessageReason; detail: string; provider_ref?: string },
+    to: MessageChange,
     at: string,
   ): { message: StoredMessage; changed: boolean } | undefined;
   /** Moves every queued message whose `expires_at` is at or before `now` to `expired`, in one transaction. */
@@ -766,6 +773,26 @@ export function openStore(dataDir: string): Store {
   const getMessage = (messageId: string) => storedMessage(messageById.get(messageId));
   const findMessageByKey = (key: string) => storedMessage(messageByKey.get(key));
 
+  const EXPIRED: MessageChange = {
+    state: "expired",
+    reason: "expired_unsent",
+    detail: "the message was not delivered before it expired",
+  };
+  /** Updates the message only if it is still in `from`, and records the transition when it did. */
+  const applyTransition = (messageId: string, from: MessageState, to: MessageChange, at: string): boolean => {
+    const { changes } = updateMessageState.run({
+      message_id: messageId,
+      from,
+      state: to.state,
+      reason: to.reason,
+      detail: to.detail,
+      provider_ref: to.provider_ref ?? null,
+      at,
+    });
+    if (changes > 0) insertTransition.run(messageId, to.state, to.reason, at);
+    return changes > 0;
+  };
+
   const getById = (projectId: string) => byId.get(projectId) as Project | undefined;
   const getByPath = (canonicalPath: string) => byPath.get(canonicalPath) as Project | undefined;
 
@@ -951,33 +978,15 @@ export function openStore(dataDir: string): Store {
     },
     transitionMessage(messageId, from, to, at) {
       return inTransaction(db, () => {
-        const { changes } = updateMessageState.run({
-          message_id: messageId,
-          from,
-          state: to.state,
-          reason: to.reason,
-          detail: to.detail,
-          provider_ref: to.provider_ref ?? null,
-          at,
-        });
-        if (changes > 0) insertTransition.run(messageId, to.state, to.reason, at);
+        const changed = applyTransition(messageId, from, to, at);
         const message = getMessage(messageId);
-        return message && { message, changed: changes > 0 };
+        return message && { message, changed };
       });
     },
     expireMessages(now) {
       inTransaction(db, () => {
         for (const { message_id } of expiredMessages.all(now) as { message_id: string }[]) {
-          updateMessageState.run({
-            message_id,
-            from: "queued",
-            state: "expired",
-            reason: "expired_unsent",
-            detail: "the message was not delivered before it expired",
-            provider_ref: null,
-            at: now,
-          });
-          insertTransition.run(message_id, "expired", "expired_unsent", now);
+          applyTransition(message_id, "queued", EXPIRED, now);
         }
       });
     },
