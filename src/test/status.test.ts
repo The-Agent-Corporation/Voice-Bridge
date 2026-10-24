@@ -11,26 +11,25 @@ const disagreeing = [turn("s1", "hook", "turn_started"), turn("s1", "reconcile",
 const CASES: { name: string; input: FreshnessInput; freshness: string; reasons: string[] }[] = [
   {
     name: "no events is unverified",
-    input: { eventCount: 0, watermarks: [], latestTurnStates: [] },
+    input: { watermarks: [], latestTurnStates: [] },
     freshness: "unverified",
     reasons: ["no_events"],
   },
   {
     name: "a gap and a conflict are unverified and list every reason in order",
-    input: { eventCount: 3, watermarks: gapped, latestTurnStates: disagreeing },
+    input: { watermarks: gapped, latestTurnStates: disagreeing },
     freshness: "unverified",
-    reasons: ["sequence_gap", "turn_state_conflict", "unprocessed_events"],
+    reasons: ["sequence_gap", "turn_state_conflict"],
   },
   {
     name: "a conflict alone is conflicted",
-    input: { eventCount: 2, watermarks: contiguous, latestTurnStates: disagreeing },
+    input: { watermarks: contiguous, latestTurnStates: disagreeing },
     freshness: "conflicted",
     reasons: ["turn_state_conflict"],
   },
   {
     name: "turn_completed against turn_failed is conflicted",
     input: {
-      eventCount: 2,
       watermarks: contiguous,
       latestTurnStates: [turn("s1", "hook", "turn_completed"), turn("s1", "reconcile", "turn_failed")],
     },
@@ -40,7 +39,6 @@ const CASES: { name: string; input: FreshnessInput; freshness: string; reasons: 
   {
     name: "sources agreeing, or disagreeing about different sessions, are current",
     input: {
-      eventCount: 4,
       watermarks: contiguous,
       latestTurnStates: [
         turn("s1", "hook", "turn_started"),

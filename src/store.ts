@@ -107,7 +107,6 @@ export interface Store {
   ingestEvent(event: NewEvent): { event_id: number; duplicate: boolean };
   /** One row per source that has stored events, ordered by source. */
   listWatermarks(projectId: string): WatermarkRow[];
-  countEvents(projectId: string): number;
   /** The processed event (at or below its source's watermark) observed last, ties broken by event_id. */
   latestProcessedEvent(projectId: string): ProcessedEvent | undefined;
   /** Per session and source, the type of the processed turn event with the highest sequence. */
@@ -286,12 +285,13 @@ export function openStore(dataDir: string): Store {
     VALUES (:project_id, :session_id, :source, :source_event_id, :source_sequence, :type, :payload,
             :observed_at, :received_at)
   `);
-  const ensureWatermark = db.prepare(`
-    INSERT INTO source_watermarks (project_id, source, watermark) VALUES (?, ?, 0)
-    ON CONFLICT (project_id, source) DO NOTHING
+  const watermarkOf = db.prepare(`
+    SELECT COALESCE((SELECT watermark FROM source_watermarks WHERE project_id = ? AND source = ?), 0) AS watermark
   `);
-  const watermarkOf = db.prepare("SELECT watermark FROM source_watermarks WHERE project_id = ? AND source = ?");
-  const setWatermark = db.prepare("UPDATE source_watermarks SET watermark = ? WHERE project_id = ? AND source = ?");
+  const upsertWatermark = db.prepare(`
+    INSERT INTO source_watermarks (project_id, source, watermark) VALUES (?, ?, ?)
+    ON CONFLICT (project_id, source) DO UPDATE SET watermark = excluded.watermark
+  `);
   const watermarksOf = db.prepare(`
     SELECT w.source, w.watermark, MAX(e.source_sequence) AS highest_stored
     FROM source_watermarks w JOIN events e ON e.project_id = w.project_id AND e.source = w.source
@@ -299,7 +299,6 @@ export function openStore(dataDir: string): Store {
     GROUP BY w.source, w.watermark
     ORDER BY w.source
   `);
-  const eventCount = db.prepare("SELECT COUNT(*) AS n FROM events WHERE project_id = ?");
   const PROCESSED_EVENTS = `
     events e JOIN source_watermarks w ON w.project_id = e.project_id AND w.source = e.source
     WHERE e.project_id = ? AND e.source_sequence <= w.watermark
@@ -424,19 +423,14 @@ export function openStore(dataDir: string): Store {
           );
         }
         const { lastInsertRowid } = insertEvent.run({ ...event, received_at: new Date().toISOString() });
-        ensureWatermark.run(event.project_id, event.source);
         let { watermark } = watermarkOf.get(event.project_id, event.source) as { watermark: number };
-        const start = watermark;
         while (eventBySequence.get(event.project_id, event.source, watermark + 1)) watermark++;
-        if (watermark !== start) setWatermark.run(watermark, event.project_id, event.source);
+        upsertWatermark.run(event.project_id, event.source, watermark);
         return { event_id: Number(lastInsertRowid), duplicate: false };
       });
     },
     listWatermarks(projectId) {
       return watermarksOf.all(projectId) as unknown as WatermarkRow[];
-    },
-    countEvents(projectId) {
-      return (eventCount.get(projectId) as { n: number }).n;
     },
     latestProcessedEvent(projectId) {
       const row = latestProcessed.get(projectId) as ProcessedEvent | undefined;

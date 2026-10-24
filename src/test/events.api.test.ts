@@ -111,7 +111,7 @@ describe("event ingest and project status", () => {
 
     const held = await status("gapped");
     assert.equal(held.freshness, "unverified");
-    assert.deepEqual(held.freshness_reasons, ["sequence_gap", "unprocessed_events"]);
+    assert.deepEqual(held.freshness_reasons, ["sequence_gap"]);
     assert.deepEqual(held.watermarks, { gap: 1 });
     assert.equal(held.last_event_id, first.event_id);
 

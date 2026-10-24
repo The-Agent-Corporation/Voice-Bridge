@@ -172,7 +172,7 @@ test("a version 3 store gains the event tables and keeps its projects, sessions 
       assert.equal(store.getById("kept")?.canonical_path, "/x/kept");
       assert.deepEqual(store.listSessions("kept").map((s) => s.session_id), ["codex:s1"]);
       assert.equal(store.getPin("kept")?.session_id, "codex:s1");
-      assert.equal(store.countEvents("kept"), 0);
+      assert.deepEqual(store.listWatermarks("kept"), []);
     } finally {
       store.close();
     }

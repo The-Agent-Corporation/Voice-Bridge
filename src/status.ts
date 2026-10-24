@@ -3,19 +3,9 @@ import type { EventType, Store, TurnState, WatermarkRow } from "./store.js";
 
 export type Freshness = "current" | "lagging" | "unverified" | "conflicted";
 
-/** Listed in this order in `freshness_reasons`. */
-const REASONS = ["no_events", "sequence_gap", "turn_state_conflict", "unprocessed_events"] as const;
-export type FreshnessReason = (typeof REASONS)[number];
-
-/** Highest rank first: missing evidence outranks disagreement, which outranks held events. */
-const PRECEDENCE: readonly { freshness: Freshness; reasons: readonly FreshnessReason[] }[] = [
-  { freshness: "unverified", reasons: ["no_events", "sequence_gap"] },
-  { freshness: "conflicted", reasons: ["turn_state_conflict"] },
-  { freshness: "lagging", reasons: ["unprocessed_events"] },
-];
+export type FreshnessReason = "no_events" | "sequence_gap" | "turn_state_conflict";
 
 export interface FreshnessInput {
-  eventCount: number;
   watermarks: readonly WatermarkRow[];
   latestTurnStates: readonly TurnState[];
 }
@@ -40,21 +30,19 @@ function hasTurnConflict(states: readonly TurnState[]): boolean {
 }
 
 /**
- * Every condition that holds is reported. Events are processed in the request, so an event above
- * its watermark is always waiting behind a gap: `unprocessed_events` comes with `sequence_gap`, and
- * `lagging` stays outranked until something other than a gap can hold events back.
+ * Every reason that holds is listed; missing evidence outranks disagreement. Events are processed in
+ * the request, so only a gap holds events above a watermark and `lagging` cannot occur yet.
  */
 export function computeFreshness(input: FreshnessInput): Pick<ProjectStatus, "freshness" | "freshness_reasons"> {
-  const held = input.watermarks.some((row) => row.highest_stored > row.watermark);
-  const holds: Record<FreshnessReason, boolean> = {
-    no_events: input.eventCount === 0,
-    sequence_gap: held,
-    turn_state_conflict: hasTurnConflict(input.latestTurnStates),
-    unprocessed_events: held,
-  };
-  const reasons = REASONS.filter((reason) => holds[reason]);
-  const winner = PRECEDENCE.find((rank) => rank.reasons.some((reason) => holds[reason]));
-  return { freshness: winner?.freshness ?? "current", freshness_reasons: reasons };
+  const noEvents = input.watermarks.length === 0;
+  const gap = input.watermarks.some((row) => row.highest_stored > row.watermark);
+  const conflict = hasTurnConflict(input.latestTurnStates);
+  const reasons: FreshnessReason[] = [];
+  if (noEvents) reasons.push("no_events");
+  if (gap) reasons.push("sequence_gap");
+  if (conflict) reasons.push("turn_state_conflict");
+  const freshness: Freshness = noEvents || gap ? "unverified" : conflict ? "conflicted" : "current";
+  return { freshness, freshness_reasons: reasons };
 }
 
 export function getProjectStatus(store: Store, projectId: string): ProjectStatus {
@@ -66,7 +54,6 @@ export function getProjectStatus(store: Store, projectId: string): ProjectStatus
   return {
     project_id: projectId,
     ...computeFreshness({
-      eventCount: store.countEvents(projectId),
       watermarks,
       latestTurnStates: store.latestTurnStates(projectId),
     }),
