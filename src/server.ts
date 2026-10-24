@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { ProviderHomes } from "./adapters/homes.js";
 import { BridgeError } from "./errors.js";
+import { getPrimarySession, pinPrimary, unpinPrimary } from "./primary.js";
 import { listProjects, openProject, registerProject } from "./registry.js";
 import { listSessions } from "./sessions.js";
 import type { Store } from "./store.js";
@@ -30,6 +31,11 @@ const TOOLS: Record<string, Tool> = {
   list_projects: ({ store }) => ({ projects: listProjects(store) }),
   open_project: ({ store }, body) => openProject(store, requireString(body, "project_id")),
   list_sessions: ({ store, providerHomes }, body) => listSessions(store, requireString(body, "project_id"), providerHomes),
+  get_primary_session: ({ store, providerHomes }, body) =>
+    getPrimarySession(store, requireString(body, "project_id"), providerHomes),
+  pin_primary: ({ store, providerHomes }, body) =>
+    pinPrimary(store, requireString(body, "project_id"), requireString(body, "session_id"), providerHomes),
+  unpin_primary: ({ store, providerHomes }, body) => unpinPrimary(store, requireString(body, "project_id"), providerHomes),
 };
 
 function sendJson(res: ServerResponse, status: number, payload: unknown): void {

@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { daemonInfoPath, LISTEN_ADDRESS, type DaemonInfo } from "./app.js";
 import { resolveDataDir } from "./dataDir.js";
+import type { PrimaryResult } from "./primary.js";
 import { runProbe } from "./probe.js";
 import type { OpenedProject, ProjectSummary, RegisterResult } from "./registry.js";
 import type { SessionList } from "./sessions.js";
@@ -13,6 +14,9 @@ const USAGE = `usage:
   voice-bridge projects
   voice-bridge open <project_id>
   voice-bridge sessions <project_id>
+  voice-bridge primary <project_id>
+  voice-bridge primary <project_id> --pin <session_id>
+  voice-bridge primary <project_id> --unpin
   voice-bridge probe`;
 
 class CliError extends Error {
@@ -87,6 +91,15 @@ async function callTool<T>(tool: string, body: Record<string, unknown>): Promise
   return payload;
 }
 
+function primaryRequest(projectId: string, rest: string[]): { tool: string; body: Record<string, string> } | undefined {
+  if (rest.length === 0) return { tool: "get_primary_session", body: { project_id: projectId } };
+  if (rest.length === 1 && rest[0] === "--unpin") return { tool: "unpin_primary", body: { project_id: projectId } };
+  if (rest.length === 2 && rest[0] === "--pin" && rest[1]) {
+    return { tool: "pin_primary", body: { project_id: projectId, session_id: rest[1] } };
+  }
+  return undefined;
+}
+
 async function run(args: string[]): Promise<number> {
   const [command, arg, ...rest] = args;
   if (command === "register" && arg && rest.length === 0) {
@@ -117,6 +130,17 @@ async function run(args: string[]): Promise<number> {
       console.log([s.provider, s.native_session_id, s.observed_state, s.last_activity_at ?? "-", s.worktree_id].join("\t"));
     }
     if (skipped_records > 0) console.log(`skipped_records: ${skipped_records}`);
+    return 0;
+  }
+  const primary = command === "primary" && arg ? primaryRequest(arg, rest) : undefined;
+  if (primary) {
+    const result = await callTool<PrimaryResult>(primary.tool, primary.body);
+    console.log(`route: ${result.route}`);
+    console.log(`primary: ${result.primary_session_id ?? "-"}`);
+    console.log(`connected: ${result.connected_session_id ?? "-"}`);
+    console.log(`available: ${result.available}\tmutating_allowed: ${result.mutating_allowed}`);
+    console.log(`reason: ${result.reason}`);
+    if (result.skipped_records > 0) console.log(`skipped_records: ${result.skipped_records}`);
     return 0;
   }
   if (command === "probe" && arg === undefined) {
