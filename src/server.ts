@@ -34,11 +34,16 @@ const TOOLS: Record<string, Tool> = {
   ingest_event: ({ store }, body) => {
     const result = ingestEvent(store, body);
     // A duplicate refreshes too: the content hash, not the duplicate flag, decides whether the file is rewritten.
+    // The event is already committed, so a failed refresh is logged rather than reported as a failed ingest.
     const projectId = requireString(body, "project_id");
-    const briefing = refreshBriefing(store, projectId);
-    if (briefing.write === "failed") {
-      console.error(`voice-bridge: VOICE.md not written for ${projectId}: ${briefing.error}`);
+    let failure: unknown;
+    try {
+      const briefing = refreshBriefing(store, projectId);
+      if (briefing.write === "failed") failure = briefing.error;
+    } catch (error) {
+      failure = error instanceof Error ? error.message : error;
     }
+    if (failure !== undefined) console.error(`voice-bridge: VOICE.md not written for ${projectId}: ${failure}`);
     return result;
   },
   get_project_status: ({ store }, body) => getProjectStatus(store, requireString(body, "project_id")),

@@ -6,7 +6,7 @@ import { readVoiceConfig } from "./config.js";
 import { BridgeError } from "./errors.js";
 import { runGit } from "./git.js";
 import { discoverProjectSessions, type DiscoveryCounts } from "./sessions.js";
-import { getProjectStatus, type ProjectStatus } from "./status.js";
+import type { ProjectStatus } from "./status.js";
 import type { Store } from "./store.js";
 
 export interface ProjectSummary {
@@ -94,13 +94,12 @@ export function openProject(store: Store, projectId: string): OpenedProject {
   const project = store.getById(projectId);
   if (!project) throw new BridgeError("project_not_found", `no project registered with id ${projectId}`);
   const briefing = refreshBriefing(store, projectId);
-  const status = getProjectStatus(store, projectId);
   return {
     project_id: project.project_id,
     display_name: project.display_name,
     canonical_path: project.canonical_path,
-    freshness: status.freshness,
-    last_confirmed_activity: status.last_confirmed_activity,
+    freshness: briefing.status.freshness,
+    last_confirmed_activity: briefing.status.last_confirmed_activity,
     briefing: briefing.text,
     briefing_write: briefing.write,
     briefing_write_error: briefing.error,

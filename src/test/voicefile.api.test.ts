@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import type { AddressInfo } from "node:net";
 import path from "node:path";
-import { after, before, describe, test } from "node:test";
+import { after, before, describe, mock, test } from "node:test";
+import { resolveProviderHomes } from "../adapters/homes.js";
 import { startBridge, type RunningBridge } from "../app.js";
 import { SECTION_HEADINGS } from "../briefing.js";
+import { createBridgeServer } from "../server.js";
+import { openStore } from "../store.js";
 import { readClientToken } from "../token.js";
 import { call, fixtureHomes, makeRepo, PRD_SAMPLE, removeTempDirs, tempDir, writeClaudeSession } from "./helpers.js";
 
@@ -182,4 +186,39 @@ describe("VOICE.md generation", () => {
       chmodSync(repo, 0o755);
     }
   });
+});
+
+test("an ingest whose briefing refresh throws still reports the committed event", async () => {
+  const store = openStore(tempDir());
+  store.saveBriefing = () => {
+    throw new Error("disk full");
+  };
+  const server = createBridgeServer({ store, token: "t", buildId: null, providerHomes: resolveProviderHomes(fixtureHomes()) });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+  const errors = mock.method(console, "error", () => {});
+  try {
+    const repo = makeRepo({ ...PRD_SAMPLE, project_id: "voice-throws" });
+    assert.equal((await call(port, "t", "register_project", { path: repo })).status, 200);
+    const event = {
+      project_id: "voice-throws",
+      session_id: "s1",
+      source: "hook",
+      source_event_id: "voice-throws-1",
+      source_sequence: 1,
+      type: "progress",
+      payload: { summary: "stored" },
+      observed_at: new Date().toISOString(),
+    };
+    const first = await call(port, "t", "ingest_event", event);
+    assert.equal(first.status, 200, JSON.stringify(first.body));
+    assert.equal(first.body.duplicate, false);
+    assert.equal((await call(port, "t", "ingest_event", event)).body.duplicate, true);
+    assert.match(String(errors.mock.calls[0]?.arguments[0]), /VOICE\.md not written for voice-throws: disk full/);
+  } finally {
+    errors.mock.restore();
+    await new Promise((resolve) => server.close(resolve));
+    store.close();
+    removeTempDirs();
+  }
 });
