@@ -32,8 +32,9 @@ test("GET /build-id reports FACTORY_RUNTIME_CANDIDATE exactly when set", async (
 });
 
 test("GET /build-id falls back to git rev-parse HEAD when the candidate is unset or empty", async (t) => {
-  const head = runGit(["rev-parse", "HEAD"], PACKAGE_ROOT);
-  assert.ok(head, "the package root must be a Git checkout for this test");
+  const git = runGit(["rev-parse", "HEAD"], PACKAGE_ROOT);
+  assert.ok(git.ok, "the package root must be a Git checkout for this test");
+  const head = git.stdout;
   for (const env of [daemonEnv(), daemonEnv({ FACTORY_RUNTIME_CANDIDATE: "" })]) {
     const daemon = await spawnDaemon(env);
     t.after(() => daemon.stop());

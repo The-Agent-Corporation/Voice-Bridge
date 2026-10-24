@@ -1,10 +1,16 @@
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, symlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, symlinkSync } from "node:fs";
 import path from "node:path";
 import { after, before, describe, test } from "node:test";
 import { startBridge, type RunningBridge } from "../app.js";
 import { readClientToken } from "../token.js";
 import { call, makeRepo, PRD_SAMPLE, removeTempDirs, tempDir, writeVoiceConfig } from "./helpers.js";
+
+function subdirectoryOf(dir: string): string {
+  const sub = path.join(dir, "sub");
+  mkdirSync(sub);
+  return sub;
+}
 
 describe("bridge API", () => {
   let bridge: RunningBridge;
@@ -68,6 +74,16 @@ describe("bridge API", () => {
     assert.equal(projects[0].canonical_path, repo);
   });
 
+  test("registering through a differently-cased spelling keeps the on-disk path", async (t) => {
+    const recased = repo.toUpperCase();
+    if (recased === repo || !existsSync(recased)) return t.skip("this file system is case-sensitive");
+    const response = await call(bridge.port, token, "register_project", { path: recased });
+    assert.equal(response.status, 200);
+    assert.equal(response.body.created, false);
+    assert.equal(response.body.canonical_path, repo);
+    assert.equal((await list()).length, 1);
+  });
+
   test("rejects bad registrations with a cause-naming 400 and stores nothing", async () => {
     const { project_id: _omitted, ...withoutId } = PRD_SAMPLE;
     const cases = [
@@ -76,6 +92,7 @@ describe("bridge API", () => {
       { code: "not_a_git_work_tree", path: makeRepo({ ...PRD_SAMPLE, project_id: "no-git" }, { git: false }) },
       { code: "project_id_conflict", path: makeRepo(PRD_SAMPLE) },
       { code: "invalid_path", path: "relative/path" },
+      { code: "not_work_tree_root", path: subdirectoryOf(makeRepo({ ...PRD_SAMPLE, project_id: "sub" })) },
     ];
     const before = await list();
     for (const { code, path: target } of cases) {
@@ -85,6 +102,45 @@ describe("bridge API", () => {
       assert.deepEqual(await list(), before, `${code} stored something`);
     }
     assert.equal(before[0].canonical_path, repo);
+  });
+
+  test("a git that cannot run is a 500 git_failed naming the cause, not a user error", async () => {
+    const before = await list();
+    const target = makeRepo({ ...PRD_SAMPLE, project_id: "no-git-binary" });
+    const savedPath = process.env.PATH;
+    process.env.PATH = tempDir();
+    let response;
+    try {
+      response = await call(bridge.port, token, "register_project", { path: target });
+    } finally {
+      process.env.PATH = savedPath;
+    }
+    assert.equal(response.status, 500);
+    assert.equal(response.body.error.code, "git_failed");
+    assert.match(response.body.error.message, /ENOENT/);
+    assert.deepEqual(await list(), before);
+  });
+
+  test("tools answer malformed JSON with 400, a wrong method with 405 and an oversized body with 413", async () => {
+    const post = (body: string) =>
+      fetch(`http://127.0.0.1:${bridge.port}/tools/list_projects`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        body,
+      });
+    const malformed = await post("{");
+    assert.equal(malformed.status, 400);
+    assert.equal((await malformed.json()).error.code, "invalid_request");
+
+    const wrongMethod = await fetch(`http://127.0.0.1:${bridge.port}/tools/list_projects`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    assert.equal(wrongMethod.status, 405);
+    assert.equal((await wrongMethod.json()).error.code, "method_not_allowed");
+
+    const oversized = await post(JSON.stringify({ padding: "x".repeat(64 * 1024) }));
+    assert.equal(oversized.status, 413);
+    assert.equal((await oversized.json()).error.code, "request_too_large");
   });
 
   test("rejects registering a known path under a new project_id and stores nothing", async () => {

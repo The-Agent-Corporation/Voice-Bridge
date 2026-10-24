@@ -28,7 +28,7 @@ function canonicalRepoRoot(inputPath: string): string {
   }
   let canonical: string;
   try {
-    canonical = realpathSync(inputPath);
+    canonical = realpathSync.native(inputPath);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       throw new BridgeError("path_not_found", `${inputPath} does not exist`);
@@ -38,11 +38,15 @@ function canonicalRepoRoot(inputPath: string): string {
   if (!statSync(canonical).isDirectory()) {
     throw new BridgeError("invalid_path", `${canonical} is not a directory`);
   }
-  const toplevel = runGit(["rev-parse", "--show-toplevel"], canonical);
-  if (!toplevel) {
-    throw new BridgeError("not_a_git_work_tree", `${canonical} is not inside a Git work tree`);
+  const git = runGit(["rev-parse", "--show-toplevel"], canonical);
+  if (!git.ok) {
+    if (git.notARepository) {
+      throw new BridgeError("not_a_git_work_tree", `${canonical} is not inside a Git work tree`);
+    }
+    throw new BridgeError("git_failed", `git could not inspect ${canonical}: ${git.detail}`);
   }
-  if (realpathSync(toplevel) !== canonical) {
+  const toplevel = git.stdout;
+  if (realpathSync.native(toplevel) !== canonical) {
     throw new BridgeError("not_work_tree_root", `${canonical} is not the root of its Git work tree (${toplevel})`);
   }
   return canonical;

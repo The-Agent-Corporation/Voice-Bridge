@@ -7,5 +7,6 @@ export const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.
 export function resolveBuildId(env: NodeJS.ProcessEnv, packageRoot: string = PACKAGE_ROOT): string | null {
   const candidate = env.FACTORY_RUNTIME_CANDIDATE;
   if (candidate) return candidate;
-  return runGit(["rev-parse", "HEAD"], packageRoot) || null;
+  const head = runGit(["rev-parse", "HEAD"], packageRoot);
+  return head.ok && head.stdout ? head.stdout : null;
 }

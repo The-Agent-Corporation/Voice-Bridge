@@ -19,6 +19,7 @@ const STATUS_BY_CODE = {
   method_not_allowed: 405,
   request_too_large: 413,
   internal_error: 500,
+  git_failed: 500,
   build_id_unavailable: 503,
   store_version_unsupported: 500,
   insecure_token_file: 500,

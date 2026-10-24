@@ -41,7 +41,8 @@ export function writeVoiceConfig(dir: string, config: unknown): void {
 /** A fresh Git work tree holding `config` as its `.voice/config.json`; returns its realpath. */
 export function makeRepo(config: unknown = PRD_SAMPLE, { git = true } = {}): string {
   const dir = tempDir("voice-bridge-repo-");
-  if (git && runGit(["init", "-q"], dir) === null) throw new Error(`git init failed in ${dir}`);
+  const init = git ? runGit(["init", "-q"], dir) : undefined;
+  if (init && !init.ok) throw new Error(`git init failed in ${dir}: ${init.detail}`);
   writeVoiceConfig(dir, config);
   return dir;
 }
