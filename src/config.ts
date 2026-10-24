@@ -8,7 +8,6 @@ export interface VoiceConfig {
   schema_version: 1;
   project_id: string;
   display_name: string;
-  raw: Record<string, unknown>;
 }
 
 export function voiceConfigPath(repoRoot: string): string {
@@ -58,5 +57,5 @@ export function readVoiceConfig(repoRoot: string): VoiceConfig {
     throw new BridgeError("missing_display_name", ".voice/config.json needs a non-empty display_name");
   }
 
-  return { schema_version: 1, project_id: raw.project_id, display_name: raw.display_name.trim(), raw };
+  return { schema_version: 1, project_id: raw.project_id, display_name: raw.display_name.trim() };
 }

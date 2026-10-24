@@ -10,7 +10,6 @@ export interface Project {
   project_id: string;
   display_name: string;
   canonical_path: string;
-  config: Record<string, unknown>;
   created_at: string;
   updated_at: string;
 }
@@ -19,17 +18,18 @@ interface ProjectRow {
   project_id: string;
   display_name: string;
   canonical_path: string;
-  config_json: string;
   created_at: string;
   updated_at: string;
 }
 
 export interface Store {
   getById(projectId: string): Project | undefined;
-  getByPath(canonicalPath: string): Project | undefined;
   list(): Project[];
-  /** Inserts the project, or refreshes name and config for the same id at the same path. */
-  upsert(project: Omit<Project, "created_at" | "updated_at">): Project;
+  /**
+   * Inserts the project, or refreshes its name for the same id at the same path.
+   * One id maps to one canonical path; either conflict throws and writes nothing.
+   */
+  upsert(project: Omit<Project, "created_at" | "updated_at">): { project: Project; created: boolean };
   close(): void;
 }
 
@@ -38,7 +38,6 @@ function toProject(row: ProjectRow): Project {
     project_id: row.project_id,
     display_name: row.display_name,
     canonical_path: row.canonical_path,
-    config: JSON.parse(row.config_json) as Record<string, unknown>,
     created_at: row.created_at,
     updated_at: row.updated_at,
   };
@@ -59,7 +58,6 @@ function initSchema(db: DatabaseSync, file: string): void {
       project_id     TEXT PRIMARY KEY,
       canonical_path TEXT NOT NULL UNIQUE,
       display_name   TEXT NOT NULL,
-      config_json    TEXT NOT NULL,
       created_at     TEXT NOT NULL,
       updated_at     TEXT NOT NULL
     );
@@ -82,11 +80,10 @@ export function openStore(dataDir: string): Store {
   const byPath = db.prepare("SELECT * FROM projects WHERE canonical_path = ?");
   const all = db.prepare("SELECT * FROM projects ORDER BY project_id");
   const upsert = db.prepare(`
-    INSERT INTO projects (project_id, canonical_path, display_name, config_json, created_at, updated_at)
-    VALUES (:project_id, :canonical_path, :display_name, :config_json, :now, :now)
+    INSERT INTO projects (project_id, canonical_path, display_name, created_at, updated_at)
+    VALUES (:project_id, :canonical_path, :display_name, :now, :now)
     ON CONFLICT (project_id) DO UPDATE SET
       display_name = excluded.display_name,
-      config_json = excluded.config_json,
       updated_at = excluded.updated_at
     WHERE projects.canonical_path = excluded.canonical_path
   `);
@@ -96,43 +93,46 @@ export function openStore(dataDir: string): Store {
     return row && toProject(row);
   };
 
+  const getByPath = (canonicalPath: string) => {
+    const row = byPath.get(canonicalPath) as ProjectRow | undefined;
+    return row && toProject(row);
+  };
+
   return {
     getById,
-    getByPath(canonicalPath) {
-      const row = byPath.get(canonicalPath) as ProjectRow | undefined;
-      return row && toProject(row);
-    },
     list() {
       return (all.all() as unknown as ProjectRow[]).map(toProject);
     },
     upsert(project) {
+      const existing = getById(project.project_id);
       let changes: number | bigint;
       try {
         ({ changes } = upsert.run({
           project_id: project.project_id,
           canonical_path: project.canonical_path,
           display_name: project.display_name,
-          config_json: JSON.stringify(project.config),
           now: new Date().toISOString(),
         }));
       } catch (error) {
         // The project_id conflict is absorbed by ON CONFLICT, so a unique failure here is the path.
         if ((error as { errcode?: number }).errcode === SQLITE_CONSTRAINT_UNIQUE) {
+          const holder = getByPath(project.canonical_path)?.project_id ?? "another project_id";
           throw new BridgeError(
             "path_already_registered",
-            `${project.canonical_path} is already registered under another project_id`,
+            `${project.canonical_path} is already registered as ${holder}`,
           );
         }
         throw error;
       }
       const stored = getById(project.project_id);
       if (changes === 0 || !stored) {
+        const holder = stored?.canonical_path ?? "another path";
         throw new BridgeError(
           "project_id_conflict",
-          `project_id ${project.project_id} is already registered at another path`,
+          `project_id ${project.project_id} is already registered at ${holder}`,
         );
       }
-      return stored;
+      return { project: stored, created: existing === undefined };
     },
     close() {
       db.close();

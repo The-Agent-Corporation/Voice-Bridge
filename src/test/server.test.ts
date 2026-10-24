@@ -4,7 +4,7 @@ import path from "node:path";
 import { after, before, describe, test } from "node:test";
 import { startBridge, type RunningBridge } from "../app.js";
 import { readClientToken } from "../token.js";
-import { call, makeRepo, PRD_SAMPLE, removeTempDirs, tempDir } from "./helpers.js";
+import { call, makeRepo, PRD_SAMPLE, removeTempDirs, tempDir, writeVoiceConfig } from "./helpers.js";
 
 describe("bridge API", () => {
   let bridge: RunningBridge;
@@ -85,6 +85,20 @@ describe("bridge API", () => {
       assert.deepEqual(await list(), before, `${code} stored something`);
     }
     assert.equal(before[0].canonical_path, repo);
+  });
+
+  test("rejects registering a known path under a new project_id and stores nothing", async () => {
+    const before = await list();
+    writeVoiceConfig(repo, { ...PRD_SAMPLE, project_id: "renamed" });
+    try {
+      const response = await call(bridge.port, token, "register_project", { path: repo });
+      assert.equal(response.status, 400);
+      assert.equal(response.body.error.code, "path_already_registered");
+      assert.match(response.body.error.message, /desktop-agent/);
+      assert.deepEqual(await list(), before);
+    } finally {
+      writeVoiceConfig(repo, PRD_SAMPLE);
+    }
   });
 
   test("open_project returns an honest, unverified briefing", async () => {

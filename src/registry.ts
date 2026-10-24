@@ -48,37 +48,21 @@ function canonicalRepoRoot(inputPath: string): string {
   return canonical;
 }
 
-/** Every check runs before the single write, so a rejected registration stores nothing. */
+/** Path and config checks run before the write, and the store rejects id/path conflicts, so a rejected registration stores nothing. */
 export function registerProject(store: Store, inputPath: string): RegisterResult {
   const canonical = canonicalRepoRoot(inputPath);
   const config = readVoiceConfig(canonical);
 
-  const sameId = store.getById(config.project_id);
-  if (sameId && sameId.canonical_path !== canonical) {
-    throw new BridgeError(
-      "project_id_conflict",
-      `project_id ${config.project_id} is already registered at ${sameId.canonical_path}`,
-    );
-  }
-  const samePath = store.getByPath(canonical);
-  if (samePath && samePath.project_id !== config.project_id) {
-    throw new BridgeError(
-      "path_already_registered",
-      `${canonical} is already registered as ${samePath.project_id}`,
-    );
-  }
-
-  const stored = store.upsert({
+  const { project, created } = store.upsert({
     project_id: config.project_id,
     display_name: config.display_name,
     canonical_path: canonical,
-    config: config.raw,
   });
   return {
-    project_id: stored.project_id,
-    display_name: stored.display_name,
-    canonical_path: stored.canonical_path,
-    created: sameId === undefined,
+    project_id: project.project_id,
+    display_name: project.display_name,
+    canonical_path: project.canonical_path,
+    created,
   };
 }
 
