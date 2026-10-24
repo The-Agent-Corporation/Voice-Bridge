@@ -1,13 +1,16 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import type { Provider } from "./adapters/types.js";
 import { BridgeError } from "./errors.js";
 
 export const PROJECT_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
+export const PROVIDERS: readonly Provider[] = ["codex", "claude-code"];
 
 export interface VoiceConfig {
   schema_version: 1;
   project_id: string;
   display_name: string;
+  allowed_providers: Provider[];
 }
 
 export function voiceConfigPath(repoRoot: string): string {
@@ -57,5 +60,26 @@ export function readVoiceConfig(repoRoot: string): VoiceConfig {
     throw new BridgeError("missing_display_name", ".voice/config.json needs a non-empty display_name");
   }
 
-  return { schema_version: 1, project_id: raw.project_id, display_name: raw.display_name.trim() };
+  return {
+    schema_version: 1,
+    project_id: raw.project_id,
+    display_name: raw.display_name.trim(),
+    allowed_providers: readAllowedProviders(raw.allowed_providers),
+  };
+}
+
+function isProvider(value: unknown): value is Provider {
+  return PROVIDERS.includes(value as Provider);
+}
+
+/** Absent means every V1 provider: discovery only reads saved records and grants no capability. */
+function readAllowedProviders(value: unknown): Provider[] {
+  if (value === undefined) return [...PROVIDERS];
+  if (!Array.isArray(value) || !value.every(isProvider)) {
+    throw new BridgeError(
+      "invalid_allowed_providers",
+      `allowed_providers must be an array of ${PROVIDERS.map((p) => JSON.stringify(p)).join(" or ")}`,
+    );
+  }
+  return [...new Set(value)];
 }

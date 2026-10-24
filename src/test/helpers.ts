@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { zstdCompressSync } from "node:zlib";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
@@ -45,6 +46,39 @@ export function makeRepo(config: unknown = PRD_SAMPLE, { git = true } = {}): str
   if (init && !init.ok) throw new Error(`git init failed in ${dir}: ${init.detail}`);
   writeVoiceConfig(dir, config);
   return dir;
+}
+
+/** Empty provider homes, so a daemon under test never reads the developer's real sessions. */
+export function fixtureHomes(): { VOICE_BRIDGE_CODEX_HOME: string; VOICE_BRIDGE_CLAUDE_HOME: string } {
+  return { VOICE_BRIDGE_CODEX_HOME: tempDir("voice-bridge-codex-"), VOICE_BRIDGE_CLAUDE_HOME: tempDir("voice-bridge-claude-") };
+}
+
+/** A Claude Code saved session laid out as Claude Code writes it; returns the file. */
+export function writeClaudeSession(home: string, cwd: string, id: string): string {
+  const dir = path.join(home, "projects", cwd.replace(/[^A-Za-z0-9]/g, "-"));
+  mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `${id}.jsonl`);
+  const lines = [
+    { type: "queue-operation", operation: "enqueue", timestamp: "2026-10-24T12:00:00.000Z", sessionId: id },
+    { type: "attachment", cwd, sessionId: id, timestamp: "2026-10-24T12:00:01.000Z" },
+    { type: "user", cwd, sessionId: id, message: { role: "user", content: "hello" } },
+  ];
+  writeFileSync(file, lines.map((line) => JSON.stringify(line)).join("\n") + "\n");
+  return file;
+}
+
+/** A Codex saved session laid out as codex-cli writes it, optionally zstd-compressed; returns the file. */
+export function writeCodexSession(home: string, cwd: string, id: string, { zstd = false } = {}): string {
+  const dir = path.join(home, "sessions", "2026", "10", "24");
+  mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `rollout-2026-10-24T00-00-00-${id}.jsonl${zstd ? ".zst" : ""}`);
+  const lines = [
+    { timestamp: "2026-10-24T00:00:00.000Z", type: "session_meta", payload: { id, cwd, timestamp: "2026-10-24T00:00:00.000Z" } },
+    { timestamp: "2026-10-24T00:00:01.000Z", type: "event_msg", payload: { type: "user_message", message: "hello" } },
+  ];
+  const text = lines.map((line) => JSON.stringify(line)).join("\n") + "\n";
+  writeFileSync(file, zstd ? zstdCompressSync(text) : text);
+  return file;
 }
 
 export async function call(

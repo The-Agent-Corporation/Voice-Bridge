@@ -2,6 +2,7 @@ import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
 import path from "node:path";
+import { resolveProviderHomes } from "./adapters/homes.js";
 import { resolveBuildId } from "./buildId.js";
 import { ensureDataDir } from "./dataDir.js";
 import { createBridgeServer } from "./server.js";
@@ -54,7 +55,7 @@ export async function startBridge({ dataDir, port, env = process.env }: StartOpt
   const token = ensureClientToken(dataDir);
   const buildId = resolveBuildId(env);
   const store = openStore(dataDir);
-  const server = createBridgeServer({ store, token, buildId });
+  const server = createBridgeServer({ store, token, buildId, providerHomes: resolveProviderHomes(env) });
 
   try {
     await new Promise<void>((resolve, reject) => {

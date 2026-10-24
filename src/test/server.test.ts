@@ -4,7 +4,7 @@ import path from "node:path";
 import { after, before, describe, test } from "node:test";
 import { startBridge, type RunningBridge } from "../app.js";
 import { readClientToken } from "../token.js";
-import { call, makeRepo, PRD_SAMPLE, removeTempDirs, tempDir, writeVoiceConfig } from "./helpers.js";
+import { call, fixtureHomes, makeRepo, PRD_SAMPLE, removeTempDirs, tempDir, writeVoiceConfig } from "./helpers.js";
 
 function subdirectoryOf(dir: string): string {
   const sub = path.join(dir, "sub");
@@ -19,7 +19,7 @@ describe("bridge API", () => {
 
   before(async () => {
     const dataDir = tempDir();
-    bridge = await startBridge({ dataDir, port: 0, env: {} });
+    bridge = await startBridge({ dataDir, port: 0, env: fixtureHomes() });
     token = readClientToken(dataDir);
     repo = makeRepo();
   });

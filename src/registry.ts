@@ -1,9 +1,11 @@
 import { realpathSync, statSync } from "node:fs";
 import path from "node:path";
+import type { ProviderHomes } from "./adapters/homes.js";
 import { buildBriefing, type Briefing } from "./briefing.js";
 import { readVoiceConfig } from "./config.js";
 import { BridgeError } from "./errors.js";
 import { runGit } from "./git.js";
+import { discoverProjectSessions, type DiscoveryCounts } from "./sessions.js";
 import type { Store } from "./store.js";
 
 export interface ProjectSummary {
@@ -12,7 +14,7 @@ export interface ProjectSummary {
   canonical_path: string;
 }
 
-export interface RegisterResult extends ProjectSummary {
+export interface RegisterResult extends ProjectSummary, DiscoveryCounts {
   created: boolean;
 }
 
@@ -52,8 +54,12 @@ function canonicalRepoRoot(inputPath: string): string {
   return canonical;
 }
 
-/** Path and config checks run before the write, and the store rejects id/path conflicts, so a rejected registration stores nothing. */
-export function registerProject(store: Store, inputPath: string): RegisterResult {
+/**
+ * Path and config checks run before the write, and the store rejects id/path conflicts, so a
+ * rejected registration stores nothing. Session discovery runs after the write: if it fails,
+ * the project stays registered and the error says why its sessions could not be read.
+ */
+export async function registerProject(store: Store, inputPath: string, homes: ProviderHomes): Promise<RegisterResult> {
   const canonical = canonicalRepoRoot(inputPath);
   const config = readVoiceConfig(canonical);
 
@@ -62,11 +68,13 @@ export function registerProject(store: Store, inputPath: string): RegisterResult
     display_name: config.display_name,
     canonical_path: canonical,
   });
+  const discovered = await discoverProjectSessions(store, project, homes);
   return {
     project_id: project.project_id,
     display_name: project.display_name,
     canonical_path: project.canonical_path,
     created,
+    ...discovered,
   };
 }
 
