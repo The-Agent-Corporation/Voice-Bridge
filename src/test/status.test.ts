@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { computeFreshness, type FreshnessInput } from "../status.js";
-import type { EventType } from "../store.js";
+import type { TurnState } from "../store.js";
 
-const turn = (session_id: string, source: string, type: EventType) => ({ session_id, source, type });
+const turn = (session_id: string, type: TurnState["type"]) => ({ session_id, type });
 const gapped = [{ source: "hook", watermark: 1, highest_stored: 3 }];
 const contiguous = [{ source: "hook", watermark: 2, highest_stored: 2 }];
-const disagreeing = [turn("s1", "hook", "turn_started"), turn("s1", "reconcile", "turn_completed")];
+const disagreeing = [turn("s1", "turn_started"), turn("s1", "turn_completed")];
 
 const CASES: { name: string; input: FreshnessInput; freshness: string; reasons: string[] }[] = [
   {
@@ -31,20 +31,20 @@ const CASES: { name: string; input: FreshnessInput; freshness: string; reasons: 
     name: "turn_completed against turn_failed is conflicted",
     input: {
       watermarks: contiguous,
-      latestTurnStates: [turn("s1", "hook", "turn_completed"), turn("s1", "reconcile", "turn_failed")],
+      latestTurnStates: [turn("s1", "turn_completed"), turn("s1", "turn_failed")],
     },
     freshness: "conflicted",
     reasons: ["turn_state_conflict"],
   },
   {
-    name: "sources agreeing, or disagreeing about different sessions, are current",
+    name: "sources agreeing, or different turn states in different sessions, are current",
     input: {
       watermarks: contiguous,
       latestTurnStates: [
-        turn("s1", "hook", "turn_started"),
-        turn("s1", "reconcile", "turn_started"),
-        turn("s2", "hook", "turn_completed"),
-        turn("s3", "reconcile", "turn_failed"),
+        turn("s1", "turn_started"),
+        turn("s1", "turn_started"),
+        turn("s2", "turn_completed"),
+        turn("s3", "turn_failed"),
       ],
     },
     freshness: "current",

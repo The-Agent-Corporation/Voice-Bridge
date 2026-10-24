@@ -47,6 +47,9 @@ export const EVENT_TYPES = [
 
 export type EventType = (typeof EVENT_TYPES)[number];
 
+/** The types that say where a session's turn stands; conflict detection compares only these. */
+export const TURN_EVENT_TYPES = ["turn_started", "turn_completed", "turn_failed"] as const satisfies readonly EventType[];
+
 export interface NewEvent {
   project_id: string;
   session_id: string | null;
@@ -75,8 +78,7 @@ export interface ProcessedEvent {
 
 export interface TurnState {
   session_id: string;
-  source: string;
-  type: EventType;
+  type: (typeof TURN_EVENT_TYPES)[number];
 }
 
 export interface Store {
@@ -273,8 +275,7 @@ export function openStore(dataDir: string): Store {
   `);
 
   const eventBySourceId = db.prepare(`
-    SELECT event_id, project_id, session_id, source_sequence, type, payload, observed_at
-    FROM events WHERE source = ? AND source_event_id = ?
+    SELECT event_id, project_id, source_sequence FROM events WHERE source = ? AND source_event_id = ?
   `);
   const eventBySequence = db.prepare(
     "SELECT source_event_id FROM events WHERE project_id = ? AND source = ? AND source_sequence = ?",
@@ -308,13 +309,13 @@ export function openStore(dataDir: string): Store {
     ORDER BY e.observed_at DESC, e.event_id DESC LIMIT 1
   `);
   const turnStates = db.prepare(`
-    SELECT session_id, source, type FROM (
-      SELECT e.session_id, e.source, e.type,
+    SELECT session_id, type FROM (
+      SELECT e.session_id, e.type,
              ROW_NUMBER() OVER (PARTITION BY e.session_id, e.source ORDER BY e.source_sequence DESC) AS latest
       FROM ${PROCESSED_EVENTS}
-        AND e.session_id IS NOT NULL AND e.type IN ('turn_started', 'turn_completed', 'turn_failed')
+        AND e.session_id IS NOT NULL AND e.type IN (${TURN_EVENT_TYPES.map((type) => `'${type}'`).join(", ")})
     ) WHERE latest = 1
-    ORDER BY session_id, source
+    ORDER BY session_id
   `);
 
   const getById = (projectId: string) => byId.get(projectId) as Project | undefined;
@@ -400,18 +401,17 @@ export function openStore(dataDir: string): Store {
     ingestEvent(event) {
       return inTransaction(db, () => {
         const stored = eventBySourceId.get(event.source, event.source_event_id) as
-          | (Omit<NewEvent, "source" | "source_event_id"> & { event_id: number })
+          | { event_id: number; project_id: string; source_sequence: number }
           | undefined;
         if (stored) {
-          const { event_id, ...fields } = stored;
-          const same = (Object.keys(fields) as (keyof typeof fields)[]).every((key) => fields[key] === event[key]);
-          if (!same) {
+          // A retry may re-serialize its payload or re-stamp observed_at, so only its project and sequence must match.
+          if (stored.project_id !== event.project_id || stored.source_sequence !== event.source_sequence) {
             throw new BridgeError(
               "event_conflict",
-              `source ${event.source} already stored event ${event.source_event_id} with different content`,
+              `source ${event.source} already stored event ${event.source_event_id} with another project or sequence`,
             );
           }
-          return { event_id, duplicate: true };
+          return { event_id: stored.event_id, duplicate: true };
         }
         const holder = eventBySequence.get(event.project_id, event.source, event.source_sequence) as
           | { source_event_id: string }

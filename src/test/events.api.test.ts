@@ -62,11 +62,22 @@ describe("event ingest and project status", () => {
     assert.equal((await status()).watermarks.dup, 1);
   });
 
-  test("the same source_event_id with different content is a 409 event_conflict and stores nothing", async () => {
+  test("a retry with a reordered payload or a re-stamped observed_at is still a duplicate", async () => {
+    const first = await ingest(event("retry", 1, { payload: { a: 1, b: 2 } }));
+    assert.equal(first.status, 200);
+    const retry = await ingest(event("retry", 1, { payload: { b: 2, a: 1 }, observed_at: "2026-10-24T12:05:00.000Z" }));
+    assert.equal(retry.status, 200);
+    assert.deepEqual(retry.body, { event_id: first.body.event_id, duplicate: true });
+    assert.equal(storedRows("retry"), 1);
+  });
+
+  test("the same source_event_id at another sequence or project is a 409 event_conflict and stores nothing", async () => {
     assert.equal((await ingest(event("reuse", 1))).status, 200);
-    const response = await ingest(event("reuse", 1, { payload: { note: "something else" } }));
-    assert.equal(response.status, 409);
-    assert.equal(response.body.error.code, "event_conflict");
+    for (const extra of [{ source_sequence: 2 }, { project_id: "quiet" }]) {
+      const response = await ingest(event("reuse", 1, extra));
+      assert.equal(response.status, 409, JSON.stringify(extra));
+      assert.equal(response.body.error.code, "event_conflict");
+    }
     assert.equal(storedRows("reuse"), 1);
   });
 
@@ -129,6 +140,31 @@ describe("event ingest and project status", () => {
     const result = await status("split");
     assert.equal(result.freshness, "conflicted");
     assert.deepEqual(result.freshness_reasons, ["turn_state_conflict"]);
+  });
+
+  test("each source's latest processed turn event decides the conflict", async () => {
+    assert.equal((await tool("register_project", { path: makeRepo({ ...PRD_SAMPLE, project_id: "turns" }) })).status, 200);
+    const turn = (source: string, sequence: number, type: string) => ({
+      ...event(source, sequence),
+      project_id: "turns",
+      session_id: "s1",
+      type,
+    });
+    for (const body of [turn("hook2", 1, "turn_started"), turn("hook2", 2, "turn_completed"), turn("reconcile2", 1, "turn_completed")]) {
+      assert.equal((await ingest(body)).status, 200);
+    }
+    assert.deepEqual((await status("turns")).freshness_reasons, []);
+
+    assert.equal((await ingest(turn("hook2", 3, "progress"))).status, 200);
+    assert.deepEqual((await status("turns")).freshness_reasons, []);
+
+    assert.equal((await ingest(turn("reconcile2", 2, "turn_failed"))).status, 200);
+    const conflicted = await status("turns");
+    assert.equal(conflicted.freshness, "conflicted");
+    assert.deepEqual(conflicted.freshness_reasons, ["turn_state_conflict"]);
+
+    assert.equal((await ingest(turn("hook2", 5, "turn_failed"))).status, 200);
+    assert.deepEqual((await status("turns")).freshness_reasons, ["sequence_gap", "turn_state_conflict"]);
   });
 
   test("a 17 KiB payload is a 413 payload_too_large and stores nothing", async () => {
