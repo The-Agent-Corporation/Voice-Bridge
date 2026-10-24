@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { rmSync } from "node:fs";
+import path from "node:path";
 import { after, describe, test } from "node:test";
 import { compareHead, readHead, type HeadRead } from "../head.js";
 import { createReconciler, DEFAULT_RECONCILE_INTERVAL_MS, parseReconcileInterval } from "../reconcile.js";
@@ -47,6 +49,14 @@ describe("readHead", () => {
     assert.deepEqual(await readHead(repo), { state: "unborn" });
     const sha = commitEmpty(repo);
     assert.deepEqual(await readHead(repo), { state: "commit", commit: sha });
+  });
+
+  test("a HEAD whose commit object is missing is unreadable, not unborn", async () => {
+    const repo = makeRepo();
+    const sha = commitEmpty(repo);
+    rmSync(path.join(repo, ".git", "objects", sha.slice(0, 2), sha.slice(2)));
+    const head = await readHead(repo);
+    assert.equal(head.state, "unreadable");
   });
 
   test("a directory outside any repository is unreadable, not unborn", async () => {

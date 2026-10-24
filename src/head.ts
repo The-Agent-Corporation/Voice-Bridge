@@ -1,4 +1,4 @@
-import { runGitAsync } from "./git.js";
+import { runGitAsync, type GitResult } from "./git.js";
 import type { BriefingEventRow } from "./store.js";
 
 /** A hook may post a short hash, so 7 hex digits is the shortest commit a `git_commit` payload is read as. */
@@ -19,9 +19,19 @@ export const readHead: HeadReader = async (repoRoot) => {
   const result = await runGitAsync(["rev-parse", "--verify", "-q", "HEAD^{commit}"], repoRoot);
   if (result.ok) return { state: "commit", commit: result.stdout };
   // With -q, an unborn HEAD is a silent exit 1; anything else (128, a timeout, no git) is a failure to read.
-  if (result.status === 1 && result.stderr === "") return { state: "unborn" };
-  return { state: "unreadable", detail: result.detail };
+  if (!silentExit1(result)) return { state: "unreadable", detail: result.detail };
+  // A HEAD whose commit object is missing or corrupt exits the same way, so unborn needs proof:
+  // HEAD names a branch and that branch does not exist yet.
+  const branch = await runGitAsync(["symbolic-ref", "-q", "HEAD"], repoRoot);
+  if (branch.ok && silentExit1(await runGitAsync(["show-ref", "--verify", "-q", branch.stdout], repoRoot))) {
+    return { state: "unborn" };
+  }
+  return { state: "unreadable", detail: `HEAD does not resolve to a commit: ${result.detail}` };
 };
+
+function silentExit1(result: GitResult): boolean {
+  return !result.ok && result.status === 1 && result.stderr === "";
+}
 
 /** The newest `git_commit` event's commit, from events ordered newest first; the briefing's Provenance shows the same one. */
 export function latestRecordedCommit(events: readonly Pick<BriefingEventRow, "type" | "payload">[]): string | null {
