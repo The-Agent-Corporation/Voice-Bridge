@@ -19,7 +19,9 @@ const STATUS_BY_CODE = {
   project_not_found: 404,
   not_found: 404,
   method_not_allowed: 405,
+  event_conflict: 409,
   request_too_large: 413,
+  payload_too_large: 413,
   internal_error: 500,
   git_failed: 500,
   session_discovery_failed: 500,
@@ -41,4 +43,12 @@ export class BridgeError extends Error {
     this.code = code;
     this.status = STATUS_BY_CODE[code];
   }
+}
+
+export function requireString(body: Record<string, unknown>, field: string): string {
+  const value = body[field];
+  if (typeof value !== "string" || !value) {
+    throw new BridgeError("invalid_request", `${field} must be a non-empty string`);
+  }
+  return value;
 }

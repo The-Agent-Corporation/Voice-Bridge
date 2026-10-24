@@ -8,11 +8,13 @@ import { removeTempDirs, tempDir } from "./helpers.js";
 
 after(removeTempDirs);
 
+const ALL_TABLES = ["events", "pin_audit", "primary_pins", "projects", "sessions", "source_watermarks"];
+
 test("a store with an unknown schema version refuses to open and is left untouched", () => {
   const dataDir = tempDir();
   const file = path.join(dataDir, STORE_FILE);
   const seed = new DatabaseSync(file);
-  seed.exec("PRAGMA user_version = 4;");
+  seed.exec("PRAGMA user_version = 5;");
   seed.close();
 
   assert.throws(() => openStore(dataDir), { code: "store_version_unsupported" });
@@ -20,13 +22,13 @@ test("a store with an unknown schema version refuses to open and is left untouch
   const db = new DatabaseSync(file);
   try {
     assert.deepEqual(db.prepare("SELECT name FROM sqlite_master").all(), []);
-    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 4);
+    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 5);
   } finally {
     db.close();
   }
 });
 
-test("a version 1 store gains the sessions and pin tables and keeps its projects", () => {
+test("a version 1 store gains the sessions, pin and event tables and keeps its projects", () => {
   const dataDir = tempDir();
   const file = path.join(dataDir, STORE_FILE);
   const seed = new DatabaseSync(file);
@@ -55,8 +57,8 @@ test("a version 1 store gains the sessions and pin tables and keeps its projects
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 3);
-    assert.deepEqual(tableNames(db), ["pin_audit", "primary_pins", "projects", "sessions"]);
+    assert.equal(userVersion(db), 4);
+    assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
   }
@@ -73,7 +75,7 @@ function tableNames(db: DatabaseSync): unknown[] {
     .map((row) => row.name);
 }
 
-test("a version 2 store gains the pin tables and keeps its projects and sessions", () => {
+test("a version 2 store gains the pin and event tables and keeps its projects and sessions", () => {
   const dataDir = tempDir();
   const file = path.join(dataDir, STORE_FILE);
   const seed = new DatabaseSync(file);
@@ -115,8 +117,71 @@ test("a version 2 store gains the pin tables and keeps its projects and sessions
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 3);
-    assert.deepEqual(tableNames(db), ["pin_audit", "primary_pins", "projects", "sessions"]);
+    assert.equal(userVersion(db), 4);
+    assert.deepEqual(tableNames(db), ALL_TABLES);
+  } finally {
+    db.close();
+  }
+});
+
+test("a version 3 store gains the event tables and keeps its projects, sessions and pin", () => {
+  const dataDir = tempDir();
+  const file = path.join(dataDir, STORE_FILE);
+  const seed = new DatabaseSync(file);
+  seed.exec(`
+    CREATE TABLE projects (
+      project_id     TEXT PRIMARY KEY,
+      canonical_path TEXT NOT NULL UNIQUE,
+      display_name   TEXT NOT NULL,
+      created_at     TEXT NOT NULL,
+      updated_at     TEXT NOT NULL
+    );
+    CREATE TABLE sessions (
+      project_id        TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+      session_id        TEXT NOT NULL,
+      provider          TEXT NOT NULL,
+      native_session_id TEXT NOT NULL,
+      worktree_id       TEXT NOT NULL,
+      observed_state    TEXT NOT NULL,
+      last_activity_at  TEXT,
+      capabilities      TEXT NOT NULL,
+      PRIMARY KEY (project_id, session_id)
+    );
+    CREATE TABLE primary_pins (
+      project_id TEXT PRIMARY KEY REFERENCES projects(project_id) ON DELETE CASCADE,
+      session_id TEXT NOT NULL,
+      pinned_at  TEXT NOT NULL
+    );
+    CREATE TABLE pin_audit (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      action     TEXT NOT NULL CHECK (action IN ('pin', 'unpin')),
+      at         TEXT NOT NULL
+    );
+    INSERT INTO projects VALUES ('kept', '/x/kept', 'Kept', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
+    INSERT INTO sessions VALUES ('kept', 'codex:s1', 'codex', 's1', '/x/kept', 'saved', NULL, '{}');
+    INSERT INTO primary_pins VALUES ('kept', 'codex:s1', '2026-01-02T00:00:00.000Z');
+    PRAGMA user_version = 3;
+  `);
+  seed.close();
+
+  for (let open = 0; open < 2; open++) {
+    const store = openStore(dataDir);
+    try {
+      assert.equal(store.getById("kept")?.canonical_path, "/x/kept");
+      assert.deepEqual(store.listSessions("kept").map((s) => s.session_id), ["codex:s1"]);
+      assert.equal(store.getPin("kept")?.session_id, "codex:s1");
+      assert.deepEqual(store.listWatermarks("kept"), []);
+    } finally {
+      store.close();
+    }
+  }
+
+  const db = new DatabaseSync(file);
+  try {
+    assert.equal(userVersion(db), 4);
+    assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
   }
