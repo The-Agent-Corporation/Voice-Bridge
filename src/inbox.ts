@@ -1,11 +1,6 @@
-import { redactSecrets } from "./briefing.js";
+import { oneLine, redactSecrets, stringField } from "./briefing.js";
 import { BridgeError, requireString } from "./errors.js";
 import { INBOX_STATUSES, type InboxItem, type InboxStatus, type QuestionFields, type Store } from "./store.js";
-
-function stringField(fields: Record<string, unknown>, field: string): string | null {
-  const value = fields[field];
-  return typeof value === "string" ? value : null;
-}
 
 /**
  * Reads a `user_question` payload as leniently as the briefing does: a missing or mistyped field is
@@ -29,7 +24,7 @@ function isInboxStatus(value: unknown): value is InboxStatus {
 
 /** The summary goes to a voice model and a terminal, so it is one line with credentials redacted. */
 function presented(item: InboxItem): InboxItem {
-  return { ...item, summary: redactSecrets(item.summary.replace(/[\s\p{Cc}]+/gu, " ").trim()) };
+  return { ...item, summary: redactSecrets(oneLine(item.summary)) };
 }
 
 /** Reads the store only; it is never given provider homes, so it cannot reach an adapter. */

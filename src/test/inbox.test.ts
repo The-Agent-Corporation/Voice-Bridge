@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { after, beforeEach, test } from "node:test";
+import { loadBriefingState, renderBriefing } from "../briefing.js";
 import { questionFields } from "../inbox.js";
 import { openStore, type NewEvent, type QuestionFields, type Store } from "../store.js";
 import { removeTempDirs, tempDir } from "./helpers.js";
@@ -12,6 +13,7 @@ let sequence = 0;
 beforeEach(() => {
   store?.close();
   store = openStore(tempDir());
+  sequence = 0;
   for (const id of ["a", "b"]) store.upsert({ project_id: id, display_name: id, canonical_path: `/x/${id}` });
 });
 
@@ -130,4 +132,24 @@ test("questionFields counts a mistyped field as absent", () => {
     priority: "p",
     withdrawn: true,
   });
+});
+
+test("the inbox and the briefing give the same events the same question ids", () => {
+  ask({ question_id: "q", summary: "first" }, { second: 1 });
+  ask({ question_id: "q", summary: "reworded" }, { second: 2 });
+  ask({ question_id: "q", summary: "other session" }, { second: 3, session: "s2" });
+  ask({ question_id: "q", summary: "no session" }, { second: 4, session: null });
+  ask({ summary: "no origin id" }, { second: 5 });
+  ask({ summary: "no origin id again" }, { second: 6 });
+  ask({ question_id: "gone", summary: "withdraw me" }, { second: 7 });
+  ask({ question_id: "gone", withdrawn: true }, { second: 8 });
+
+  const text = renderBriefing(loadBriefingState(store, { project_id: "a", display_name: "a" }), {
+    maxTokens: 2000,
+    generatedAt: "2026-10-24T12:00:00.000Z",
+  });
+  const briefingIds = [...text.matchAll(/^- (q-\d+): /gm)].map((match) => match[1]).sort();
+  const inboxIds = store.listInbox({ project_id: "a", status: "open" }).map((item) => item.question_id).sort();
+  assert.equal(inboxIds.length, 5);
+  assert.deepEqual(briefingIds, inboxIds);
 });
