@@ -17,31 +17,66 @@ class CliError extends Error {
   }
 }
 
-function readDaemonPort(dataDir: string): number {
+const REQUEST_TIMEOUT_MS = 15_000;
+
+/** Signal 0 only probes; it fails for a dead pid, and for another user's process, which cannot be our daemon. */
+function isRunning(pid: number): boolean {
   try {
-    const info = JSON.parse(readFileSync(daemonInfoPath(dataDir), "utf8")) as Partial<DaemonInfo>;
-    if (typeof info.port === "number") return info.port;
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** The port is trusted only while its recorded pid lives, so the token never goes to a port a dead daemon left behind. */
+function readDaemonPort(dataDir: string): number {
+  let info: Partial<DaemonInfo> = {};
+  try {
+    info = JSON.parse(readFileSync(daemonInfoPath(dataDir), "utf8")) as Partial<DaemonInfo>;
   } catch {
     // Treated the same as a daemon that never started.
   }
+  if (typeof info.port === "number" && typeof info.pid === "number" && isRunning(info.pid)) return info.port;
   throw new CliError("daemon_not_running", `no running daemon found for ${dataDir}`);
+}
+
+function requestFailure(error: unknown, address: string): CliError {
+  if (error instanceof DOMException && error.name === "TimeoutError") {
+    return new CliError(
+      "daemon_timeout",
+      `the daemon at ${address} did not answer within ${REQUEST_TIMEOUT_MS / 1000} s; the request may still have been applied`,
+    );
+  }
+  const cause = (error as { cause?: { code?: string; message?: string } }).cause;
+  if (cause?.code === "ECONNREFUSED") {
+    return new CliError("daemon_not_running", `nothing is listening on ${address}`);
+  }
+  const reason = cause ? `${cause.code ?? "error"}: ${cause.message}` : String(error);
+  return new CliError(
+    "daemon_request_failed",
+    `the request to ${address} failed (${reason}); it may or may not have been applied`,
+  );
 }
 
 async function callTool<T>(tool: string, body: Record<string, unknown>): Promise<T> {
   const dataDir = resolveDataDir(process.env);
   const port = readDaemonPort(dataDir);
   const token = readClientToken(dataDir);
+  const address = `${LISTEN_ADDRESS}:${port}`;
   let response: Response;
+  let payload: T & { error?: { code: string; message: string } };
   try {
-    response = await fetch(`http://${LISTEN_ADDRESS}:${port}/tools/${tool}`, {
+    response = await fetch(`http://${address}/tools/${tool}`, {
       method: "POST",
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
-  } catch {
-    throw new CliError("daemon_not_running", `could not reach the daemon on ${LISTEN_ADDRESS}:${port}`);
+    payload = (await response.json()) as typeof payload;
+  } catch (error) {
+    throw requestFailure(error, address);
   }
-  const payload = (await response.json()) as T & { error?: { code: string; message: string } };
   if (!response.ok) {
     throw new CliError(payload.error?.code ?? "http_error", payload.error?.message ?? `HTTP ${response.status}`);
   }
