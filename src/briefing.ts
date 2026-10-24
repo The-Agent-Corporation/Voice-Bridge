@@ -90,6 +90,11 @@ export function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
 
+/** Collapses whitespace and control characters so the text stays on one line. */
+export function oneLine(text: string): string {
+  return text.replace(/[\s\p{Cc}]+/gu, " ").trim();
+}
+
 export function redactSecrets(text: string): string {
   return SECRET_PATTERNS.reduce((result, pattern) => result.replace(pattern, "[REDACTED]"), text);
 }
@@ -148,7 +153,7 @@ function parseObject(payload: string): Record<string, unknown> | null {
   }
 }
 
-function stringField(payload: Record<string, unknown> | null, field: string): string | null {
+export function stringField(payload: Record<string, unknown> | null, field: string): string | null {
   const value = payload?.[field];
   return typeof value === "string" ? value : null;
 }
@@ -162,7 +167,7 @@ function collectFacts(state: BriefingState): Facts {
   // Collapsing whitespace keeps every field on one line, and escaping a leading `#` keeps it from
   // reading as a heading, so no payload can change the file's structure. Collapsing comes first so a
   // secret split by a newline or tab is still whole when it is redacted.
-  const clean = (text: string) => scrub(text.replace(/[\s\p{Cc}]+/gu, " ").trim()).replace(/^#/, "\\#");
+  const clean = (text: string) => scrub(oneLine(text)).replace(/^#/, "\\#");
 
   const parsed = state.events.map((event) => ({ ...event, fields: parseObject(event.payload) }));
   const ofType = (type: BriefingEventRow["type"]) => parsed.filter((event) => event.type === type);

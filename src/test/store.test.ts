@@ -8,13 +8,22 @@ import { removeTempDirs, tempDir } from "./helpers.js";
 
 after(removeTempDirs);
 
-const ALL_TABLES = ["briefings", "events", "pin_audit", "primary_pins", "projects", "sessions", "source_watermarks"];
+const ALL_TABLES = [
+  "briefings",
+  "events",
+  "inbox_items",
+  "inbox_notifications",
+  "pin_audit", "primary_pins",
+  "projects",
+  "sessions",
+  "source_watermarks",
+];
 
 test("a store with an unknown schema version refuses to open and is left untouched", () => {
   const dataDir = tempDir();
   const file = path.join(dataDir, STORE_FILE);
   const seed = new DatabaseSync(file);
-  seed.exec("PRAGMA user_version = 6;");
+  seed.exec("PRAGMA user_version = 7;");
   seed.close();
 
   assert.throws(() => openStore(dataDir), { code: "store_version_unsupported" });
@@ -22,13 +31,13 @@ test("a store with an unknown schema version refuses to open and is left untouch
   const db = new DatabaseSync(file);
   try {
     assert.deepEqual(db.prepare("SELECT name FROM sqlite_master").all(), []);
-    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 6);
+    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 7);
   } finally {
     db.close();
   }
 });
 
-test("a version 1 store gains the sessions, pin, event and briefing tables and keeps its projects", () => {
+test("a version 1 store gains the sessions, pin, event, briefing and inbox tables and keeps its projects", () => {
   const dataDir = tempDir();
   const file = path.join(dataDir, STORE_FILE);
   const seed = new DatabaseSync(file);
@@ -57,7 +66,7 @@ test("a version 1 store gains the sessions, pin, event and briefing tables and k
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 5);
+    assert.equal(userVersion(db), 6);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
@@ -75,7 +84,7 @@ function tableNames(db: DatabaseSync): unknown[] {
     .map((row) => row.name);
 }
 
-test("a version 2 store gains the pin, event and briefing tables and keeps its projects and sessions", () => {
+test("a version 2 store gains the pin, event, briefing and inbox tables and keeps its projects and sessions", () => {
   const dataDir = tempDir();
   const file = path.join(dataDir, STORE_FILE);
   const seed = new DatabaseSync(file);
@@ -117,14 +126,14 @@ test("a version 2 store gains the pin, event and briefing tables and keeps its p
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 5);
+    assert.equal(userVersion(db), 6);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
   }
 });
 
-test("a version 3 store gains the event and briefing tables and keeps its projects, sessions and pin", () => {
+test("a version 3 store gains the event, briefing and inbox tables and keeps its projects, sessions and pin", () => {
   const dataDir = tempDir();
   const file = path.join(dataDir, STORE_FILE);
   const seed = new DatabaseSync(file);
@@ -180,14 +189,14 @@ test("a version 3 store gains the event and briefing tables and keeps its projec
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 5);
+    assert.equal(userVersion(db), 6);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
   }
 });
 
-test("a version 4 store gains the briefings table and keeps its events and watermarks", () => {
+test("a version 4 store gains the briefings and inbox tables and keeps its events and watermarks", () => {
   const dataDir = tempDir();
   const file = path.join(dataDir, STORE_FILE);
   const seeded = openStore(dataDir);
@@ -213,7 +222,40 @@ test("a version 4 store gains the briefings table and keeps its events and water
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 5);
+    assert.equal(userVersion(db), 6);
+    assert.deepEqual(tableNames(db), ALL_TABLES);
+  } finally {
+    db.close();
+  }
+});
+
+test("a version 5 store gains the inbox tables and keeps its events and briefing", () => {
+  const dataDir = tempDir();
+  const file = path.join(dataDir, STORE_FILE);
+  const seeded = openStore(dataDir);
+  seeded.upsert({ project_id: "kept", display_name: "Kept", canonical_path: "/x/kept" });
+  seeded.ingestEvent(storedEvent("kept", 1));
+  const briefing = { project_id: "kept", content_hash: "abc", text: "# Kept", generated_at: "2026-10-24T12:00:00.000Z" };
+  seeded.saveBriefing(briefing);
+  seeded.close();
+  const seed = new DatabaseSync(file);
+  seed.exec("DROP TABLE inbox_notifications; DROP TABLE inbox_items; PRAGMA user_version = 5;");
+  seed.close();
+
+  for (let open = 0; open < 2; open++) {
+    const store = openStore(dataDir);
+    try {
+      assert.equal(store.highestProcessedEventId("kept"), 1);
+      assert.deepEqual(store.getBriefing("kept"), briefing);
+      assert.deepEqual(store.listInbox({}), []);
+    } finally {
+      store.close();
+    }
+  }
+
+  const db = new DatabaseSync(file);
+  try {
+    assert.equal(userVersion(db), 6);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();

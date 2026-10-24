@@ -4,7 +4,7 @@ import type { DiscoveredSession, Provider } from "./adapters/types.js";
 import { BridgeError } from "./errors.js";
 
 export const STORE_FILE = "bridge.sqlite";
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 const SQLITE_CONSTRAINT_UNIQUE = 2067;
 
 export interface Project {
@@ -73,7 +73,7 @@ export interface NewEvent {
   source_event_id: string;
   source_sequence: number;
   type: EventType;
-  /** JSON text, kept as untrusted data; only the briefing renderer reads its named fields. */
+  /** JSON text, kept as untrusted data; only the briefing renderer and, for `user_question`, the inbox read its named fields. */
   payload: string;
   /** ISO 8601, as `Date.prototype.toISOString` writes it. */
   observed_at: string;
@@ -109,6 +109,61 @@ export interface StoredBriefing {
   generated_at: string;
 }
 
+/** The question statuses of docs/PRD.md §12; this build writes only `open`, `cancelled` and `obsolete`. */
+export const INBOX_STATUSES = [
+  "open",
+  "answer_queued",
+  "delivered",
+  "acknowledged",
+  "resolved",
+  "cancelled",
+  "obsolete",
+] as const;
+
+export type InboxStatus = (typeof INBOX_STATUSES)[number];
+
+/** The named fields of a `user_question` payload; each is null when absent or of the wrong type. */
+export interface QuestionFields {
+  /** The payload's `question_id`: the asking agent's own id for the question. */
+  origin_question_id: string | null;
+  summary: string | null;
+  type: string | null;
+  priority: string | null;
+  withdrawn: boolean;
+}
+
+export interface InboxItem {
+  /**
+   * `q-<source_event_id>`. VOICE.md shows the same id unless that event is not yet processed or has
+   * fallen outside the briefing's 200-event window.
+   */
+  question_id: string;
+  project_id: string;
+  origin_session_id: string | null;
+  origin_question_id: string | null;
+  type: string | null;
+  /** `""` while no event has supplied one. */
+  summary: string;
+  priority: string | null;
+  status: InboxStatus;
+  /**
+   * The bridge's `event_id` of the identity's earliest stored `user_question`, which may predate the inbox;
+   * not the producer's `source_event_id` string.
+   */
+  source_event_id: number;
+  created_at: string;
+  updated_at: string;
+  dismissed_at: string | null;
+  resolution_message_id: string | null;
+}
+
+export interface InboxNotification {
+  notification_id: number;
+  question_id: string;
+  project_id: string;
+  created_at: string;
+}
+
 export interface TurnState {
   session_id: string;
   type: (typeof TURN_EVENT_TYPES)[number];
@@ -137,9 +192,10 @@ export interface Store {
   /**
    * Stores the event and advances its source's watermark in one transaction. An identical event
    * under a stored `(source, source_event_id)` is a duplicate; a differing one, or a taken
-   * sequence number, throws `event_conflict` and writes nothing.
+   * sequence number, throws `event_conflict` and writes nothing. `question` is applied to the inbox in
+   * the same transaction, only when the event is newly stored.
    */
-  ingestEvent(event: NewEvent): { event_id: number; duplicate: boolean };
+  ingestEvent(event: NewEvent, question?: QuestionFields): { event_id: number; duplicate: boolean };
   /** One row per source that has stored events, ordered by source. */
   listWatermarks(projectId: string): WatermarkRow[];
   /** The processed event (at or below its source's watermark) observed last, ties broken by event_id. */
@@ -156,6 +212,15 @@ export interface Store {
   getBriefing(projectId: string): StoredBriefing | undefined;
   /** Inserts or replaces the project's briefing record. */
   saveBriefing(briefing: StoredBriefing): void;
+  /** Newest first by `created_at`, ties broken by `source_event_id`. */
+  listInbox(filter: { project_id?: string; status?: InboxStatus }): InboxItem[];
+  /**
+   * Cancels an `open` item and stamps `dismissed_at`, in one transaction. Any other status is left
+   * as it is, with `dismissed: false`. Undefined when no item has the id.
+   */
+  dismissInboxQuestion(questionId: string): { item: InboxItem; dismissed: boolean } | undefined;
+  /** In emission order. */
+  listInboxNotifications(): InboxNotification[];
   close(): void;
 }
 
@@ -242,13 +307,46 @@ const BRIEFINGS_TABLE = `
   );
 `;
 
+/**
+ * The status CHECK already lists every §12 status, so later tickets need no table rebuild. The unique
+ * index is the question identity; a NULL `origin_question_id` never matches, so each such event stands
+ * alone, and `''` cannot be a real session id because ingest refuses an empty one. Notifications are
+ * append-only with no foreign keys, like `pin_audit`.
+ */
+const INBOX_TABLES = `
+  CREATE TABLE IF NOT EXISTS inbox_items (
+    question_id           TEXT PRIMARY KEY,
+    project_id            TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+    origin_session_id     TEXT,
+    origin_question_id    TEXT,
+    type                  TEXT,
+    summary               TEXT NOT NULL,
+    priority              TEXT,
+    status                TEXT NOT NULL CHECK (status IN (${INBOX_STATUSES.map((status) => `'${status}'`).join(", ")})),
+    source_event_id       INTEGER NOT NULL,
+    created_at            TEXT NOT NULL,
+    updated_at            TEXT NOT NULL,
+    dismissed_at          TEXT,
+    resolution_message_id TEXT
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS inbox_items_origin
+    ON inbox_items (project_id, COALESCE(origin_session_id, ''), origin_question_id);
+  CREATE TABLE IF NOT EXISTS inbox_notifications (
+    notification_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    question_id     TEXT NOT NULL,
+    project_id      TEXT NOT NULL,
+    created_at      TEXT NOT NULL
+  );
+`;
+
 /** Tables each known version still lacks; every step only adds tables and leaves stored rows alone. */
 const MIGRATIONS: Record<number, string> = {
-  0: PROJECTS_TABLE + SESSIONS_TABLE + PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES + BRIEFINGS_TABLE,
-  1: SESSIONS_TABLE + PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES + BRIEFINGS_TABLE,
-  2: PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES + BRIEFINGS_TABLE,
-  3: EVENT_TABLES + BRIEFINGS_TABLE,
-  4: BRIEFINGS_TABLE,
+  0: PROJECTS_TABLE + SESSIONS_TABLE + PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES + BRIEFINGS_TABLE + INBOX_TABLES,
+  1: SESSIONS_TABLE + PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES + BRIEFINGS_TABLE + INBOX_TABLES,
+  2: PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES + BRIEFINGS_TABLE + INBOX_TABLES,
+  3: EVENT_TABLES + BRIEFINGS_TABLE + INBOX_TABLES,
+  4: BRIEFINGS_TABLE + INBOX_TABLES,
+  5: INBOX_TABLES,
 };
 
 function inTransaction<T>(db: DatabaseSync, work: () => T): T {
@@ -390,6 +488,93 @@ export function openStore(dataDir: string): Store {
       content_hash = excluded.content_hash, text = excluded.text, generated_at = excluded.generated_at
   `);
 
+  const inboxByOrigin = db.prepare(`
+    SELECT question_id, status, updated_at FROM inbox_items
+    WHERE project_id = ? AND origin_session_id IS ? AND origin_question_id = ?
+  `);
+  const insertInboxItem = db.prepare(`
+    INSERT INTO inbox_items (question_id, project_id, origin_session_id, origin_question_id, type, summary, priority,
+                             status, source_event_id, created_at, updated_at)
+    VALUES (:question_id, :project_id, :origin_session_id, :origin_question_id, :type, :summary, :priority,
+            :status, :source_event_id, :observed_at, :observed_at)
+  `);
+  const updateInboxItem = db.prepare(`
+    UPDATE inbox_items SET
+      summary = COALESCE(:summary, summary),
+      type = COALESCE(:type, type),
+      priority = COALESCE(:priority, priority),
+      updated_at = :observed_at
+    WHERE question_id = :question_id
+  `);
+  const withdrawInboxItem = db.prepare(
+    "UPDATE inbox_items SET status = 'obsolete' WHERE question_id = ? AND status = 'open'",
+  );
+  const earliestQuestionEvent = db.prepare(`
+    SELECT MIN(event_id) AS event_id FROM events
+    WHERE project_id = ? AND session_id IS ? AND type = 'user_question'
+      AND json_type(payload, '$.question_id') = 'text' AND json_extract(payload, '$.question_id') = ?
+  `);
+  const insertNotification = db.prepare(
+    "INSERT INTO inbox_notifications (question_id, project_id, created_at) VALUES (?, ?, ?)",
+  );
+  const inboxItems = db.prepare(`
+    SELECT * FROM inbox_items
+    WHERE (:project_id IS NULL OR project_id = :project_id) AND (:status IS NULL OR status = :status)
+    ORDER BY created_at DESC, source_event_id DESC
+  `);
+  const inboxItemById = db.prepare("SELECT * FROM inbox_items WHERE question_id = ?");
+  const cancelInboxItem = db.prepare(
+    "UPDATE inbox_items SET status = 'cancelled', dismissed_at = ? WHERE question_id = ? AND status = 'open'",
+  );
+  const notifications = db.prepare("SELECT * FROM inbox_notifications ORDER BY notification_id");
+
+  /** A question with no origin id is identified by its event alone, so it always creates an item. */
+  const applyQuestion = (eventId: number, event: NewEvent, question: QuestionFields) => {
+    const known =
+      question.origin_question_id === null
+        ? undefined
+        : (inboxByOrigin.get(event.project_id, event.session_id, question.origin_question_id) as
+            | { question_id: string; status: InboxStatus; updated_at: string }
+            | undefined);
+    if (known) {
+      // A late event cannot overwrite newer fields, but its withdrawal still counts: open → obsolete only moves one way.
+      if (event.observed_at >= known.updated_at) {
+        updateInboxItem.run({
+          question_id: known.question_id,
+          summary: question.summary,
+          type: question.type,
+          priority: question.priority,
+          observed_at: event.observed_at,
+        });
+      }
+      if (question.withdrawn) withdrawInboxItem.run(known.question_id);
+      return;
+    }
+    if (question.withdrawn && question.origin_question_id === null) return;
+    // A question asked before the inbox existed keeps the id the briefing already gave it.
+    const sourceEventId =
+      question.origin_question_id === null
+        ? eventId
+        : ((earliestQuestionEvent.get(event.project_id, event.session_id, question.origin_question_id) as {
+            event_id: number;
+          }).event_id);
+    const questionId = `q-${sourceEventId}`;
+    // A withdrawal seen first leaves an obsolete placeholder, so the late original cannot open and notify.
+    insertInboxItem.run({
+      question_id: questionId,
+      project_id: event.project_id,
+      origin_session_id: event.session_id,
+      origin_question_id: question.origin_question_id,
+      type: question.type,
+      summary: question.summary ?? "",
+      priority: question.priority,
+      status: question.withdrawn ? "obsolete" : "open",
+      source_event_id: sourceEventId,
+      observed_at: event.observed_at,
+    });
+    if (!question.withdrawn) insertNotification.run(questionId, event.project_id, new Date().toISOString());
+  };
+
   const getById = (projectId: string) => byId.get(projectId) as Project | undefined;
   const getByPath = (canonicalPath: string) => byPath.get(canonicalPath) as Project | undefined;
 
@@ -470,7 +655,7 @@ export function openStore(dataDir: string): Store {
         return pin;
       });
     },
-    ingestEvent(event) {
+    ingestEvent(event, question) {
       return inTransaction(db, () => {
         const stored = eventBySourceId.get(event.source, event.source_event_id) as
           | { event_id: number; project_id: string; source_sequence: number }
@@ -498,7 +683,9 @@ export function openStore(dataDir: string): Store {
         let { watermark } = watermarkOf.get(event.project_id, event.source) as { watermark: number };
         while (eventBySequence.get(event.project_id, event.source, watermark + 1)) watermark++;
         upsertWatermark.run(event.project_id, event.source, watermark);
-        return { event_id: Number(lastInsertRowid), duplicate: false };
+        const eventId = Number(lastInsertRowid);
+        if (question) applyQuestion(eventId, event, question);
+        return { event_id: eventId, duplicate: false };
       });
     },
     listWatermarks(projectId) {
@@ -523,6 +710,20 @@ export function openStore(dataDir: string): Store {
     },
     saveBriefing(briefing) {
       upsertBriefing.run({ ...briefing });
+    },
+    listInbox(filter) {
+      const rows = inboxItems.all({ project_id: filter.project_id ?? null, status: filter.status ?? null });
+      return rows.map((row) => ({ ...row })) as unknown as InboxItem[];
+    },
+    dismissInboxQuestion(questionId) {
+      return inTransaction(db, () => {
+        const { changes } = cancelInboxItem.run(new Date().toISOString(), questionId);
+        const row = inboxItemById.get(questionId) as InboxItem | undefined;
+        return row && { item: { ...row }, dismissed: changes > 0 };
+      });
+    },
+    listInboxNotifications() {
+      return notifications.all().map((row) => ({ ...row })) as unknown as InboxNotification[];
     },
     close() {
       db.close();
