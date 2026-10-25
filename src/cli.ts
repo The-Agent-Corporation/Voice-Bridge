@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import { createInterface } from "node:readline";
 import { daemonInfoPath, LISTEN_ADDRESS, type DaemonInfo } from "./app.js";
+import { Conversation } from "./chat.js";
 import { resolveDataDir } from "./dataDir.js";
 import type { PrimaryResult } from "./primary.js";
 import { runProbe } from "./probe.js";
@@ -23,7 +25,8 @@ const USAGE = `usage:
   voice-bridge status <project_id> [--why]
   voice-bridge inbox [--project <project_id>] [--status <status>]
   voice-bridge probe
-  voice-bridge session start <project_id> --provider <provider>`;
+  voice-bridge session start <project_id> --provider <provider>
+  voice-bridge chat`;
 
 class CliError extends Error {
   constructor(readonly code: string, message: string) {
@@ -119,6 +122,31 @@ function inboxRequest(args: string[]): Record<string, string> | undefined {
   return body;
 }
 
+function describeError(error: unknown): string {
+  const code = (error as { code?: unknown }).code;
+  const message = error instanceof Error ? error.message : String(error);
+  return `voice-bridge: ${typeof code === "string" ? `${code}: ` : ""}${message}`;
+}
+
+/**
+ * One line in, one reply out, in order. A failed tool call is reported and the conversation goes
+ * on, but the session then exits 1, so a scripted run against a dead daemon does not pass as success.
+ */
+async function runChat(): Promise<number> {
+  const conversation = new Conversation(callTool);
+  let failed = false;
+  for await (const line of createInterface({ input: process.stdin, crlfDelay: Infinity })) {
+    if (!line.trim()) continue;
+    try {
+      console.log(await conversation.reply(line));
+    } catch (error) {
+      failed = true;
+      console.error(describeError(error));
+    }
+  }
+  return failed ? 1 : 0;
+}
+
 async function run(args: string[]): Promise<number> {
   const [command, arg, ...rest] = args;
   if (command === "register" && arg && rest.length === 0) {
@@ -194,6 +222,7 @@ async function run(args: string[]): Promise<number> {
   if (command === "session" && arg === "start" && rest.length === 3 && rest[0] && rest[1] === "--provider" && rest[2]) {
     return runSessionHost({ projectId: rest[0], provider: rest[2], env: process.env, dataDir: resolveDataDir(process.env) });
   }
+  if (command === "chat" && arg === undefined) return runChat();
   console.error(USAGE);
   return 2;
 }
@@ -201,9 +230,7 @@ async function run(args: string[]): Promise<number> {
 run(process.argv.slice(2)).then(
   (code) => process.exit(code),
   (error: unknown) => {
-    const code = (error as { code?: unknown }).code;
-    const message = error instanceof Error ? error.message : String(error);
-    console.error(`voice-bridge: ${typeof code === "string" ? `${code}: ` : ""}${message}`);
+    console.error(describeError(error));
     process.exit(1);
   },
 );
