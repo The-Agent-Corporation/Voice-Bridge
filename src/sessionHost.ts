@@ -118,8 +118,9 @@ export async function runSessionHost({ projectId, provider, env, dataDir, out = 
       started_at: startedAt,
     });
 
-    const dispatcher = createDispatcher({ store, sessionId, target: session });
-    const kick = () => dispatcher.kick().catch((error: unknown) => endWith({ reason: "host_error", error: String(error) }));
+    const hostError = (error: unknown) => endWith({ reason: "host_error", error: String(error) });
+    const dispatcher = createDispatcher({ store, sessionId, target: session, onFatal: hostError });
+    const kick = () => void dispatcher.kick();
     session.onTurnStarted(dispatcher.turnStarted);
     session.onTurnCompleted(dispatcher.turnCompleted);
     session.onServerRequest(dispatcher.serverRequest);
@@ -129,9 +130,13 @@ export async function runSessionHost({ projectId, provider, env, dataDir, out = 
     // The interval only notices messages the daemon stored; every state change comes from a provider event.
     const kicker = setInterval(kick, KICK_MS);
     const heartbeat = setInterval(() => {
-      if (!store.heartbeatLease(worktreeId, process.pid, now(), expiry())) endWith({ reason: "lease_lost" });
+      try {
+        if (!store.heartbeatLease(worktreeId, process.pid, now(), expiry())) endWith({ reason: "lease_lost" });
+      } catch (error) {
+        hostError(error);
+      }
     }, HEARTBEAT_MS);
-    void kick();
+    kick();
 
     const end = await ended;
     clearInterval(kicker);

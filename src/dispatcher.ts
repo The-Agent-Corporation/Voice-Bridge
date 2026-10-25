@@ -1,6 +1,6 @@
 import type { ObservedState } from "./adapters/types.js";
 import type { Clock } from "./messages.js";
-import type { MessageChange, MessageReason, MessageState, Store } from "./store.js";
+import { SENDABLE_REASONS, type MessageChange, type MessageState, type Store } from "./store.js";
 
 /** Thrown by a target whose provider connection is gone; the outcome of the send is unknown. */
 export class TargetClosed extends Error {}
@@ -11,7 +11,10 @@ export interface NextTurnTarget {
 }
 
 export interface Dispatcher {
-  /** Delivers the session's next queued message if the session is idle with nothing in flight; resolves once that pass is done. */
+  /**
+   * Delivers the session's next queued message if the session is idle with nothing in flight; resolves
+   * once that pass is done. It never rejects: a failure stops the dispatcher and goes to `onFatal`.
+   */
   kick(): Promise<void>;
   turnStarted(turnId: string): void;
   turnCompleted(turnId: string, status: string, error: string | null): void;
@@ -31,9 +34,6 @@ interface InFlight {
   early: { turnId: string; event: TurnEvent }[];
 }
 
-/** The reasons a dispatcher sends a queued message for; any other blocks the queue rather than being skipped. */
-const SENDABLE: ReadonlySet<MessageReason> = new Set(["awaiting_delivery", "awaiting_earlier_messages"]);
-
 /**
  * Delivers one bridge-controlled session's queued messages in sequence order, one turn at a time.
  * Every state comes from a provider event; nothing here reads a timer. A message is committed
@@ -46,12 +46,15 @@ export function createDispatcher({
   target,
   clock = () => new Date(),
   log = (line: string) => console.error(line),
+  onFatal,
 }: {
   store: Store;
   sessionId: string;
   target: NextTurnTarget;
   clock?: Clock;
   log?: (line: string) => void;
+  /** Called once with the first store or target failure the dispatcher cannot record; the caller ends the session. */
+  onFatal: (error: unknown) => void;
 }): Dispatcher {
   let state: ObservedState = "connected_idle";
   let inFlight: InFlight | null = null;
@@ -60,6 +63,11 @@ export function createDispatcher({
   let rerun = false;
   const blockedLogged = new Set<string>();
 
+  const fail = (error: unknown) => {
+    if (stopped) return;
+    stopped = true;
+    onFatal(error);
+  };
   const now = () => clock().toISOString();
   const record = (messageId: string, from: MessageState, to: MessageChange) => store.transitionMessage(messageId, from, to, now());
   const setState = (next: ObservedState) => {
@@ -88,6 +96,14 @@ export function createDispatcher({
     void kick();
   };
 
+  const routeEvent = (turnId: string, event: TurnEvent) => {
+    try {
+      route(turnId, event);
+    } catch (error) {
+      fail(error);
+    }
+  };
+
   const route = (turnId: string, event: TurnEvent) => {
     if (stopped) return;
     if (inFlight !== null && inFlight.provider_ref === turnId) return apply(inFlight, turnId, event);
@@ -103,7 +119,7 @@ export function createDispatcher({
       store.expireMessages(now());
       const next = store.nextQueuedMessage(sessionId);
       if (!next) return;
-      if (!SENDABLE.has(next.reason)) {
+      if (!SENDABLE_REASONS.has(next.reason)) {
         if (!blockedLogged.has(next.message_id)) {
           blockedLogged.add(next.message_id);
           log(`voice-bridge: message ${next.message_id} is queued as ${next.reason}; later messages wait behind it`);
@@ -149,6 +165,8 @@ export function createDispatcher({
           rerun = false;
           await pass();
         } while (rerun);
+      } catch (error) {
+        fail(error);
       } finally {
         running = null;
       }
@@ -158,12 +176,16 @@ export function createDispatcher({
 
   return {
     kick,
-    turnStarted: (turnId) => route(turnId, { kind: "started" }),
-    turnCompleted: (turnId, status, error) => route(turnId, { kind: "completed", status, error }),
+    turnStarted: (turnId) => routeEvent(turnId, { kind: "started" }),
+    turnCompleted: (turnId, status, error) => routeEvent(turnId, { kind: "completed", status, error }),
     serverRequest(method) {
       if (stopped) return;
       log(`voice-bridge: ${sessionId} asked ${method}; the bridge does not answer provider requests`);
-      if (inFlight !== null) setState("waiting_user");
+      try {
+        if (inFlight !== null) setState("waiting_user");
+      } catch (error) {
+        fail(error);
+      }
     },
     stop() {
       stopped = true;

@@ -14,6 +14,7 @@ describe("dispatcher", () => {
   let sent: string[];
   let replies: (() => Promise<{ provider_ref: string }>)[];
   let logged: string[];
+  let fatal: unknown[];
 
   /** Answers each send with the next queued reply, or with turn `u<n>`. */
   const target: NextTurnTarget = {
@@ -22,7 +23,7 @@ describe("dispatcher", () => {
       return replies.shift()?.() ?? Promise.resolve({ provider_ref: `u${sent.length}` });
     },
   };
-  const dispatcher = () => createDispatcher({ store, sessionId: SESSION, target, clock, log: (line) => logged.push(line) });
+  const dispatcher = () => createDispatcher({ store, sessionId: SESSION, target, clock, log: (line) => logged.push(line), onFatal: (error) => fatal.push(error) });
   const queue = (key: string, overrides: Partial<NewMessage> = {}) =>
     store.createMessage({
       message_id: `m-${key}`,
@@ -49,6 +50,7 @@ describe("dispatcher", () => {
     sent = [];
     replies = [];
     logged = [];
+    fatal = [];
   });
 
   afterEach(() => store.close());
@@ -162,6 +164,37 @@ describe("dispatcher", () => {
     d.turnCompleted("u-other", "completed", null);
     assert.equal(stateOf("a"), "delivered/adapter_receipt");
     assert.ok(logged.some((line) => line.includes("u-other")));
+  });
+
+  test("a store failure on a provider event stops the dispatcher and reaches onFatal instead of throwing", async () => {
+    queue("a");
+    queue("b");
+    const d = dispatcher();
+    await d.kick();
+    const broken = new Error("SQLITE_BUSY: database is locked");
+    store.transitionMessage = () => {
+      throw broken;
+    };
+    d.turnStarted("u1");
+    d.turnCompleted("u1", "completed", null);
+    await d.kick();
+    assert.deepEqual(fatal, [broken]);
+    assert.deepEqual(sent, ["a"]);
+  });
+
+  test("a store failure in the pass a completed turn starts reaches onFatal, not an unhandled rejection", async () => {
+    queue("a");
+    queue("b");
+    const d = dispatcher();
+    await d.kick();
+    const broken = new Error("SQLITE_BUSY: database is locked");
+    store.expireMessages = () => {
+      throw broken;
+    };
+    d.turnCompleted("u1", "completed", null);
+    await d.kick();
+    assert.deepEqual(fatal, [broken]);
+    assert.deepEqual(sent, ["a"]);
   });
 
   test("after stop nothing is picked or recorded", async () => {

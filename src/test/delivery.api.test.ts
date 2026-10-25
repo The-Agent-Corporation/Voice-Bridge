@@ -195,6 +195,62 @@ describe("delivery to a bridge-controlled session", () => {
     assert.equal(await stop(next), 0);
   });
 
+  const dropLease = (projectId: string) => {
+    const db = new DatabaseSync(path.join(env.VOICE_BRIDGE_DATA_DIR!, STORE_FILE));
+    try {
+      db.exec("PRAGMA busy_timeout = 5000");
+      db.prepare("DELETE FROM workspace_leases WHERE project_id = ?").run(projectId);
+    } finally {
+      db.close();
+    }
+  };
+
+  test("a host whose lease is taken away ends at its next heartbeat and starts no further turn", async () => {
+    const id = await project();
+    const h = await host(id);
+    const a = await send(id, "lost A");
+    await until(a.message_id, "started");
+    const b = await send(id, "lost B");
+    dropLease(id);
+    assert.equal(await h.exited, 1);
+    assert.match(h.stderr(), /lost its workspace lease/);
+
+    const lost = await read(a.message_id);
+    assert.deepEqual([lost.state, lost.reason], ["failed", "owner_disconnected"]);
+    const kept = await read(b.message_id);
+    assert.deepEqual([kept.state, kept.reason], ["queued", "owner_disconnected"]);
+    assert.deepEqual(turnStarts().filter((text) => text.startsWith("lost")), ["lost A"]);
+    assert.throws(() => process.kill(h.provider_pid, 0), { code: "ESRCH" });
+    assert.notEqual((await tool("get_primary_session", { project_id: id })).connected_session_id, h.session_id);
+  });
+
+  test("a start whose lease is taken while the provider starts fails with lease_lost and leaves nothing running", async () => {
+    const id = await project();
+    const stubs = tempDir("voice-bridge-stubs-");
+    const fake = path.join(tempDir("voice-bridge-stubs-"), "codex");
+    writeFakeCodex(path.dirname(fake), log);
+    const dbPath = path.join(env.VOICE_BRIDGE_DATA_DIR!, STORE_FILE);
+    writeFileSync(
+      path.join(stubs, "codex"),
+      `#!${process.execPath}
+const db = new (require("node:sqlite").DatabaseSync)(${JSON.stringify(dbPath)});
+db.exec("PRAGMA busy_timeout = 5000");
+db.prepare("DELETE FROM workspace_leases WHERE project_id = ?").run(${JSON.stringify(id)});
+db.close();
+require("node:fs").writeFileSync(${JSON.stringify(path.join(stubs, "pid"))}, String(process.pid));
+require(${JSON.stringify(fake)});
+`,
+    );
+    chmodSync(path.join(stubs, "codex"), 0o755);
+    const before = turnStarts().length;
+    const taken = await sessionStart({ ...env, PATH: `${stubs}${path.delimiter}${process.env.PATH}` }, id);
+    assert.equal(taken.code, 1);
+    assert.match(taken.stderr, /lease_lost: .*taken while codex started/);
+    assert.throws(() => process.kill(Number(readFileSync(path.join(stubs, "pid"), "utf8")), 0), { code: "ESRCH" });
+    assert.equal(turnStarts().length, before);
+    assert.equal(leases(id), 0);
+  });
+
   test("a start that cannot get a thread fails with nothing left running and the lease released", async () => {
     const id = await project();
     const refused = await sessionStart(env, id, "claude-code");
