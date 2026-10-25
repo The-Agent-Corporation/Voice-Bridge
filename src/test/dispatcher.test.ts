@@ -33,6 +33,7 @@ describe("dispatcher", () => {
       body: key,
       approve_queue: false,
       idempotency_key: key,
+      question_id: null,
       decision: { deliverable: true },
       created_at: "2026-10-24T12:00:00.000Z",
       expires_at: "2026-10-25T12:00:00.000Z",

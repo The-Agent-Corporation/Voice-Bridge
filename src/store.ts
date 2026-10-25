@@ -4,7 +4,7 @@ import type { DiscoveredSession, ObservedState, Provider } from "./adapters/type
 import { BridgeError } from "./errors.js";
 
 export const STORE_FILE = "bridge.sqlite";
-const SCHEMA_VERSION = 8;
+const SCHEMA_VERSION = 9;
 const SQLITE_CONSTRAINT_UNIQUE = 2067;
 
 export interface Project {
@@ -103,7 +103,10 @@ export interface NewEvent {
   source_event_id: string;
   source_sequence: number;
   type: EventType;
-  /** JSON text, kept as untrusted data; only the briefing renderer and, for `user_question`, the inbox read its named fields. */
+  /**
+   * JSON text, kept as untrusted data; only the briefing renderer and, for `user_question` and `agent_ack`,
+   * the inbox read its named fields.
+   */
   payload: string;
   /** ISO 8601, as `Date.prototype.toISOString` writes it. */
   observed_at: string;
@@ -139,7 +142,7 @@ export interface StoredBriefing {
   generated_at: string;
 }
 
-/** The question statuses of docs/PRD.md §12; this build writes only `open`, `cancelled` and `obsolete`. */
+/** The question statuses of docs/PRD.md §12, all of which this build writes. */
 export const INBOX_STATUSES = [
   "open",
   "answer_queued",
@@ -214,9 +217,11 @@ export const MESSAGE_STATES = [
 
 export type MessageState = (typeof MESSAGE_STATES)[number];
 
+/** The modes `send_to_primary` takes and the `messages` CHECK lists. */
 export const MESSAGE_MODES = ["next_turn", "steer"] as const;
 
-export type MessageMode = (typeof MESSAGE_MODES)[number];
+/** An answer to an inbox question is stored as `next_turn` plus a `message_answers` row and reported as `answer_question`. */
+export type MessageMode = (typeof MESSAGE_MODES)[number] | "answer_question";
 
 /** The machine reason recorded with each state; `detail` carries the human sentence. */
 export type MessageReason =
@@ -235,7 +240,8 @@ export type MessageReason =
   | "turn_failed"
   | "owner_disconnected"
   | "cancelled_by_user"
-  | "expired_unsent";
+  | "expired_unsent"
+  | "agent_ack";
 
 /** The reasons a dispatcher sends a queued message for; a message queued for any other reason keeps it. */
 export const SENDABLE_REASONS: ReadonlySet<MessageReason> = new Set(["awaiting_delivery", "awaiting_earlier_messages"]);
@@ -256,11 +262,13 @@ export interface MessageTransition {
 export interface StoredMessage {
   message_id: string;
   project_id: string;
-  /** The primary the route named when the message was sent; null when it named none. */
+  /** The session the route named when the message was sent; null when it named none. */
   session_id: string | null;
   /** 1, 2, 3, … per project, in send order. */
   sequence: number;
   mode: MessageMode;
+  /** The inbox question an `answer_question` message answers; null for every other mode. */
+  question_id: string | null;
   body: string;
   approve_queue: boolean;
   idempotency_key: string;
@@ -280,6 +288,8 @@ export interface NewMessage {
   project_id: string;
   session_id: string | null;
   mode: MessageMode;
+  /** Set exactly when `mode` is `answer_question`. */
+  question_id: string | null;
   body: string;
   approve_queue: boolean;
   idempotency_key: string;
@@ -295,7 +305,7 @@ export interface NewMessage {
 }
 
 /** The fields a retry under the same idempotency key must repeat. */
-export type MessageIdentity = Pick<NewMessage, "project_id" | "body" | "mode" | "approve_queue" | "idempotency_key">;
+export type MessageIdentity = Pick<NewMessage, "project_id" | "body" | "mode" | "question_id" | "approve_queue" | "idempotency_key">;
 
 /** Returns `stored` when `request` repeats it; a different request under its key throws `idempotency_conflict`. */
 export function matchDuplicateMessage(stored: StoredMessage, request: MessageIdentity): StoredMessage {
@@ -303,6 +313,7 @@ export function matchDuplicateMessage(stored: StoredMessage, request: MessageIde
     stored.project_id !== request.project_id ||
     stored.body !== request.body ||
     stored.mode !== request.mode ||
+    stored.question_id !== request.question_id ||
     stored.approve_queue !== request.approve_queue
   ) {
     throw new BridgeError(
@@ -311,6 +322,22 @@ export function matchDuplicateMessage(stored: StoredMessage, request: MessageIde
     );
   }
   return stored;
+}
+
+/** An answer to an inbox item that is not `open`; the tool and the store refuse it with the same error. */
+export function questionNotOpen(questionId: string, status: string): BridgeError {
+  return new BridgeError("inbox_question_not_open", `inbox question ${questionId} is ${status}, so it cannot be answered`);
+}
+
+/**
+ * An answer to an approval; the tool and the store refuse it with the same error, since sending it as a
+ * next turn would fabricate the approval.
+ */
+export function approvalUnsupported(questionId: string): BridgeError {
+  return new BridgeError(
+    "unsupported_capability",
+    `answering approval ${questionId} needs the asking session's answerPendingQuestion capability, which no session in this build has; nothing was sent`,
+  );
 }
 
 export interface TurnState {
@@ -344,10 +371,15 @@ export interface Store {
   /**
    * Stores the event and advances its source's watermark in one transaction. An identical event
    * under a stored `(source, source_event_id)` is a duplicate; a differing one, or a taken
-   * sequence number, throws `event_conflict` and writes nothing. `question` is applied to the inbox in
-   * the same transaction, only when the event is newly stored.
+   * sequence number, throws `event_conflict` and writes nothing. `question`, and an `agent_ack`'s
+   * `acknowledgedQuestionId`, are applied to the inbox in the same transaction, only when the event is newly stored.
+   * An acknowledgement counts only from the item's asking session in its project.
    */
-  ingestEvent(event: NewEvent, question?: QuestionFields): { event_id: number; duplicate: boolean };
+  ingestEvent(
+    event: NewEvent,
+    question?: QuestionFields,
+    acknowledgedQuestionId?: string | null,
+  ): { event_id: number; duplicate: boolean };
   /** One row per source that has stored events, ordered by source. */
   listWatermarks(projectId: string): WatermarkRow[];
   /** The processed event (at or below its source's watermark) observed last, ties broken by event_id. */
@@ -371,6 +403,7 @@ export interface Store {
    * as it is, with `dismissed: false`. Undefined when no item has the id.
    */
   dismissInboxQuestion(questionId: string): { item: InboxItem; dismissed: boolean } | undefined;
+  getInboxItem(questionId: string): InboxItem | undefined;
   /** In emission order. */
   listInboxNotifications(): InboxNotification[];
   findMessageByKey(idempotencyKey: string): StoredMessage | undefined;
@@ -378,12 +411,16 @@ export interface Store {
   /**
    * Stores the message with the next sequence of its project, its `accepted` transition and its decided
    * state, in one transaction. A stored message under the same key is returned as a duplicate when its
-   * project, body, mode and approve_queue match; otherwise this throws `idempotency_conflict` and writes nothing.
+   * project, body, mode, question and approve_queue match; otherwise this throws `idempotency_conflict` and
+   * writes nothing. An answer needs its inbox item `open`, else it throws `inbox_question_not_open` and writes
+   * nothing; once stored as `delivering` or `queued` it moves the item to `answer_queued`.
    */
   createMessage(message: NewMessage): { message: StoredMessage; duplicate: boolean };
   /**
    * Moves the message from `from` to `to` and records the transition, in one transaction. A message in
-   * any other state is left as it is, with `changed: false`. Undefined when no message has the id.
+   * any other state is left as it is, with `changed: false`. Undefined when no message has the id. An answer's
+   * inbox item follows it in the same transaction: delivery moves it on, and a failed, expired or cancelled
+   * answer reopens it unless its asking session already acknowledged it.
    */
   transitionMessage(
     messageId: string,
@@ -541,6 +578,18 @@ const INBOX_TABLES = `
 `;
 
 /**
+ * Names the question each answer message answers. A table of its own because the `mode` CHECK of a stored
+ * `messages` table predates `answer_question`, and widening it would rebuild that table and rewrite its rows.
+ * No foreign keys, like `message_transitions`.
+ */
+const MESSAGE_ANSWERS_TABLE = `
+  CREATE TABLE IF NOT EXISTS message_answers (
+    message_id  TEXT PRIMARY KEY,
+    question_id TEXT NOT NULL
+  );
+`;
+
+/**
  * The state CHECK lists every state, so later tickets need no table rebuild. The sequence orders a
  * project's messages, which keeps each of its sessions' messages in order. Transitions are append-only
  * with no foreign keys, like `pin_audit`.
@@ -571,7 +620,7 @@ const MESSAGE_TABLES = `
     reason        TEXT NOT NULL,
     at            TEXT NOT NULL
   );
-`;
+` + MESSAGE_ANSWERS_TABLE;
 
 /**
  * No foreign key to sessions: replaceSessions rewrites that table. The lease's primary key is the
@@ -614,7 +663,8 @@ const MIGRATIONS: Record<number, string> = {
   4: BRIEFINGS_TABLE + INBOX_TABLES + MESSAGE_TABLES + CONTROL_TABLES,
   5: INBOX_TABLES + MESSAGE_TABLES + CONTROL_TABLES,
   6: MESSAGE_TABLES + CONTROL_TABLES,
-  7: CONTROL_TABLES,
+  7: MESSAGE_ANSWERS_TABLE + CONTROL_TABLES,
+  8: MESSAGE_ANSWERS_TABLE,
 };
 
 /**
@@ -829,12 +879,14 @@ export function openStore(dataDir: string): Store {
   `);
   const inboxItemById = db.prepare("SELECT * FROM inbox_items WHERE question_id = ?");
   const cancelInboxItem = db.prepare(
-    "UPDATE inbox_items SET status = 'cancelled', dismissed_at = ? WHERE question_id = ? AND status = 'open'",
+    `UPDATE inbox_items SET status = 'cancelled', dismissed_at = ?
+     WHERE question_id = ? AND status IN ('open', 'answer_queued', 'delivered', 'acknowledged')`,
   );
   const notifications = db.prepare("SELECT * FROM inbox_notifications ORDER BY notification_id");
 
-  const messageById = db.prepare("SELECT * FROM messages WHERE message_id = ?");
-  const messageByKey = db.prepare("SELECT * FROM messages WHERE idempotency_key = ?");
+  const MESSAGE_ROWS = "SELECT m.*, a.question_id FROM messages m LEFT JOIN message_answers a ON a.message_id = m.message_id";
+  const messageById = db.prepare(`${MESSAGE_ROWS} WHERE m.message_id = ?`);
+  const messageByKey = db.prepare(`${MESSAGE_ROWS} WHERE m.idempotency_key = ?`);
   const transitionsOf = db.prepare(
     "SELECT state, reason, at FROM message_transitions WHERE message_id = ? ORDER BY transition_id",
   );
@@ -863,6 +915,20 @@ export function openStore(dataDir: string): Store {
     UPDATE messages SET state = :state, reason = :reason, detail = :detail,
                         provider_ref = COALESCE(:provider_ref, provider_ref), updated_at = :at
     WHERE message_id = :message_id AND state = :from
+  `);
+  const insertAnswer = db.prepare("INSERT INTO message_answers (message_id, question_id) VALUES (?, ?)");
+  const answerOf = db.prepare("SELECT question_id FROM message_answers WHERE message_id = ?");
+  const queueAnswer = db.prepare(
+    "UPDATE inbox_items SET status = 'answer_queued', resolution_message_id = ? WHERE question_id = ? AND status = 'open'",
+  );
+  // Keyed by the answer as well as the question, so an answer only ever moves its own item.
+  const moveAnswered = db.prepare(`
+    UPDATE inbox_items SET status = :to
+    WHERE question_id = :question_id AND resolution_message_id = :message_id AND status = :from
+  `);
+  const reopenAnswered = db.prepare(`
+    UPDATE inbox_items SET status = 'open', resolution_message_id = NULL
+    WHERE question_id = ? AND resolution_message_id = ? AND status = 'answer_queued'
   `);
   const expiredMessages = db.prepare(
     "SELECT message_id FROM messages WHERE state = 'queued' AND expires_at <= ? ORDER BY project_id, sequence",
@@ -918,6 +984,8 @@ export function openStore(dataDir: string): Store {
   const storedMessage = (row: Record<string, unknown> | undefined): StoredMessage | undefined =>
     row && {
       ...(row as unknown as Omit<StoredMessage, "approve_queue" | "transitions">),
+      mode: row.question_id ? "answer_question" : (row.mode as MessageMode),
+      question_id: (row.question_id as string | null) ?? null,
       approve_queue: row.approve_queue === 1,
       transitions: transitionsOf.all(row.message_id as string).map((t) => ({ ...t })) as unknown as MessageTransition[],
     };
@@ -929,6 +997,35 @@ export function openStore(dataDir: string): Store {
     reason: "expired_unsent",
     detail: "the message was not delivered before it expired",
   };
+  const ACKNOWLEDGED = (sessionId: string): MessageChange => ({
+    state: "acknowledged",
+    reason: "agent_ack",
+    detail: `acknowledged by ${sessionId}`,
+  });
+  const moveItem = (questionId: string, messageId: string, from: InboxStatus, to: InboxStatus): boolean =>
+    moveAnswered.run({ question_id: questionId, message_id: messageId, from, to }).changes > 0;
+
+  /**
+   * Moves an answer's inbox item after its message moved to `state`. An item already `acknowledged` by its
+   * asking session resolves on any outcome, since that acknowledgement is the evidence `resolved` needs.
+   */
+  const applyAnswerOutcome = (messageId: string, state: MessageState, at: string) => {
+    const answer = answerOf.get(messageId) as { question_id: string } | undefined;
+    if (!answer) return;
+    const questionId = answer.question_id;
+    if (state === "delivered") {
+      if (moveItem(questionId, messageId, "answer_queued", "delivered")) return;
+      if (moveItem(questionId, messageId, "acknowledged", "resolved")) {
+        const origin = (inboxItemById.get(questionId) as unknown as InboxItem).origin_session_id ?? "the asking session";
+        applyTransition(messageId, "delivered", ACKNOWLEDGED(origin), at);
+      }
+    } else if (state === "failed" || state === "expired" || state === "cancelled") {
+      if (!reopenAnswered.run(questionId, messageId).changes && state === "failed") {
+        moveItem(questionId, messageId, "acknowledged", "resolved");
+      }
+    }
+  };
+
   /** Updates the message only if it is still in `from`, and records the transition when it did. */
   const applyTransition = (messageId: string, from: MessageState, to: MessageChange, at: string): boolean => {
     const { changes } = updateMessageState.run({
@@ -940,8 +1037,34 @@ export function openStore(dataDir: string): Store {
       provider_ref: to.provider_ref ?? null,
       at,
     });
-    if (changes > 0) insertTransition.run(messageId, to.state, to.reason, at);
-    return changes > 0;
+    if (changes === 0) return false;
+    insertTransition.run(messageId, to.state, to.reason, at);
+    applyAnswerOutcome(messageId, to.state, at);
+    return true;
+  };
+
+  /**
+   * An acknowledgement before the adapter's receipt is recorded as `acknowledged` and resolves the item when
+   * the receipt arrives; one while the answer is still queued has nothing to acknowledge.
+   */
+  const applyAck = (event: NewEvent, questionId: string) => {
+    const item = inboxItemById.get(questionId) as InboxItem | undefined;
+    if (
+      !item ||
+      event.session_id === null ||
+      item.project_id !== event.project_id ||
+      item.origin_session_id !== event.session_id ||
+      item.resolution_message_id === null
+    ) {
+      return;
+    }
+    const messageId = item.resolution_message_id;
+    if (item.status === "delivered") {
+      moveItem(questionId, messageId, "delivered", "resolved");
+      applyTransition(messageId, "delivered", ACKNOWLEDGED(event.session_id), new Date().toISOString());
+    } else if (item.status === "answer_queued" && getMessage(messageId)?.state === "delivering") {
+      moveItem(questionId, messageId, "answer_queued", "acknowledged");
+    }
   };
 
   const endSession = (sessionId: string, detail: string, at: string) => {
@@ -1044,7 +1167,7 @@ export function openStore(dataDir: string): Store {
         return pin;
       });
     },
-    ingestEvent(event, question) {
+    ingestEvent(event, question, acknowledgedQuestionId) {
       return inTransaction(db, () => {
         const stored = eventBySourceId.get(event.source, event.source_event_id) as
           | { event_id: number; project_id: string; source_sequence: number }
@@ -1074,6 +1197,7 @@ export function openStore(dataDir: string): Store {
         upsertWatermark.run(event.project_id, event.source, watermark);
         const eventId = Number(lastInsertRowid);
         if (question) applyQuestion(eventId, event, question);
+        if (typeof acknowledgedQuestionId === "string") applyAck(event, acknowledgedQuestionId);
         return { event_id: eventId, duplicate: false };
       });
     },
@@ -1111,6 +1235,10 @@ export function openStore(dataDir: string): Store {
         return row && { item: { ...row }, dismissed: changes > 0 };
       });
     },
+    getInboxItem(questionId) {
+      const row = inboxItemById.get(questionId) as InboxItem | undefined;
+      return row && { ...row };
+    },
     listInboxNotifications() {
       return notifications.all().map((row) => ({ ...row })) as unknown as InboxNotification[];
     },
@@ -1118,8 +1246,16 @@ export function openStore(dataDir: string): Store {
     getMessage,
     createMessage(message) {
       return inTransaction(db, () => {
+        if ((message.mode === "answer_question") !== (message.question_id !== null)) {
+          throw new Error(`message ${message.message_id}: question_id must be set exactly for mode answer_question`);
+        }
         const stored = findMessageByKey(message.idempotency_key);
         if (stored) return { message: matchDuplicateMessage(stored, message), duplicate: true };
+        if (message.question_id !== null) {
+          const item = inboxItemById.get(message.question_id) as InboxItem | undefined;
+          if (item?.status !== "open") throw questionNotOpen(message.question_id, item?.status ?? "missing");
+          if (item.type === "approval") throw approvalUnsupported(message.question_id);
+        }
         const { decision } = message;
         // Routed to a controlled session that ended since: it is kept as that session's other waiting messages are.
         const { state, reason, detail }: MessageChange = !decision.deliverable
@@ -1135,7 +1271,7 @@ export function openStore(dataDir: string): Store {
           project_id: message.project_id,
           session_id: message.session_id,
           sequence,
-          mode: message.mode,
+          mode: message.mode === "answer_question" ? "next_turn" : message.mode,
           body: message.body,
           approve_queue: message.approve_queue ? 1 : 0,
           idempotency_key: message.idempotency_key,
@@ -1147,6 +1283,10 @@ export function openStore(dataDir: string): Store {
         });
         insertTransition.run(message.message_id, "accepted", "authenticated", message.created_at);
         insertTransition.run(message.message_id, state, reason, message.created_at);
+        if (message.question_id !== null) {
+          insertAnswer.run(message.message_id, message.question_id);
+          if (state === "delivering" || state === "queued") queueAnswer.run(message.message_id, message.question_id);
+        }
         return { message: getMessage(message.message_id)!, duplicate: false };
       });
     },

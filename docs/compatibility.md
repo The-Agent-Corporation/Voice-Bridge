@@ -47,7 +47,7 @@ The app-server is labelled `[experimental]` in `codex app-server --help` for thi
 | `needs_credentials` | Proving the cell needs a credentialed model turn or the user's own session store. The probe never uses either. | The session stays read-only; nothing is delivered to it. |
 | `no_check` | The probe has no check for this surface that leaves provider state untouched. | The surface is treated as `unreachable` for messages (PRD §8). |
 | `needs_foreign_session` | Attaching needs a session the probe did not start. | Never attach to a session the bridge did not start. Deliver only to threads of an app-server the bridge started. |
-| `needs_pending_question` | Answering needs a provider question waiting for an answer, which a credential-less turn never raises. | Inbox answers are not routed until a later spike proves `item/tool/requestUserInput` round-trips on a thread the bridge owns. |
+| `needs_pending_question` | Answering needs a provider question waiting for an answer, which a credential-less turn never raises. | Inbox answers to a `question` go as a next turn (README, The inbox); an `approval` is refused with `unsupported_capability` until a later spike proves `item/tool/requestUserInput` round-trips on a thread the bridge owns. |
 | `resume_is_not_attach` | `codex resume` and `claude --resume` reopen a saved session. They do not attach to a live one. | Resumed sessions are `saved`, never `connected` (MISSION invariant 2). |
 | `check_failed` | The check ran and did not prove the cell (for steer: the turn had already ended). | Treated as unverified: no steering. A second instruction to a busy session is queued instead. |
 

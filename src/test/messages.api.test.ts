@@ -164,11 +164,44 @@ describe("message tools", () => {
     assert.deepEqual([cancel.body.state, cancel.body.cancelled], ["expired", false]);
   });
 
+  test("an answer goes to the asking session, and the question stays open when that session is not controllable", async () => {
+    const asked = await tool("ingest_event", {
+      project_id: "repo-a",
+      session_id: "claude-code:claude-a-1",
+      source: "answers-test",
+      source_event_id: "ask-1",
+      source_sequence: 1,
+      type: "user_question",
+      payload: { summary: "Ship it?" },
+      observed_at: "2026-10-24T12:00:00.000Z",
+    });
+    assert.equal(asked.status, 200, JSON.stringify(asked.body));
+    const questionId = `q-${asked.body.event_id}`;
+
+    const answered = await tool("answer_inbox_question", { question_id: questionId, answer: "yes", idempotency_key: `k${++keys}` });
+    assert.equal(answered.status, 200, JSON.stringify(answered.body));
+    assert.equal(answered.body.state, "failed");
+    assert.equal(answered.body.reason, "not_controllable");
+    assert.equal(answered.body.session_id, "claude-code:claude-a-1");
+    assert.equal(answered.body.mode, "answer_question");
+    assert.equal(answered.body.question_id, questionId);
+    const inbox = await tool("list_inbox", { project_id: "repo-a" });
+    assert.deepEqual(
+      inbox.body.items.filter((i: { question_id: string }) => i.question_id === questionId).map((i: { status: string }) => i.status),
+      ["open"],
+    );
+
+    const unknown = await tool("answer_inbox_question", { question_id: "q-nope", answer: "yes", idempotency_key: `k${++keys}` });
+    assert.equal(unknown.status, 404);
+    assert.equal(unknown.body.error.code, "inbox_question_not_found");
+  });
+
   test("a malformed request is a 400 and stores nothing; unknown projects and messages are 404s", async () => {
     const before = messageRows();
     const valid = { project_id: "repo-a", text: "x", mode: "next_turn", idempotency_key: "bad" };
     for (const body of [
       { ...valid, mode: "now" },
+      { ...valid, mode: "answer_question" },
       { ...valid, approve_queue: "yes" },
       { ...valid, idempotency_key: undefined },
       { ...valid, text: "" },

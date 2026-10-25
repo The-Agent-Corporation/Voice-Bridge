@@ -178,6 +178,7 @@ describe("bridge API", () => {
 
 test("the tool API offers no way to start, resume or fork a session", () => {
   assert.deepEqual(Object.keys(TOOLS).sort(), [
+    "answer_inbox_question",
     "cancel_message",
     "dismiss_inbox_question",
     "get_message",

@@ -4,7 +4,7 @@ import { refreshBriefing } from "./briefingFile.js";
 import { BridgeError, requireString } from "./errors.js";
 import { ingestEvent } from "./events.js";
 import { dismissInboxQuestion, listInbox } from "./inbox.js";
-import { cancelMessage, getMessage, sendToPrimary } from "./messages.js";
+import { answerInboxQuestion, cancelMessage, getMessage, sendToPrimary } from "./messages.js";
 import { getPrimarySession, pinPrimary, unpinPrimary } from "./primary.js";
 import { listProjects, openProject, registerProject } from "./registry.js";
 import { listSessions } from "./sessions.js";
@@ -51,6 +51,7 @@ export const TOOLS: Record<string, Tool> = {
   get_project_status: ({ store }, body) => getProjectStatus(store, requireString(body, "project_id")),
   list_inbox: ({ store }, body) => listInbox(store, body),
   dismiss_inbox_question: ({ store }, body) => dismissInboxQuestion(store, body),
+  answer_inbox_question: ({ store, providerHomes }, body) => answerInboxQuestion(store, body, providerHomes),
   send_to_primary: ({ store, providerHomes }, body) => sendToPrimary(store, body, providerHomes),
   get_message: ({ store }, body) => getMessage(store, body),
   cancel_message: ({ store }, body) => cancelMessage(store, body),

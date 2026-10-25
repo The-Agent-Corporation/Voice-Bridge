@@ -1,13 +1,17 @@
 import { randomUUID } from "node:crypto";
 import type { ProviderHomes } from "./adapters/homes.js";
 import { BridgeError, requireString } from "./errors.js";
-import { getPrimarySession, type PrimaryRoute } from "./primary.js";
+import { getPrimarySession, resolveOrigin, type PrimaryRoute } from "./primary.js";
+import { discoverProjectSessions } from "./sessions.js";
 import {
+  approvalUnsupported,
   matchDuplicateMessage,
   MESSAGE_MODES,
   type MessageIdentity,
+  type InboxItem,
   type MessageMode,
   type NewMessage,
+  questionNotOpen,
   type Store,
   type StoredMessage,
   type StoredSession,
@@ -23,6 +27,8 @@ export interface SendRequest {
   project_id: string;
   text: string;
   mode: MessageMode;
+  /** The inbox question an `answer_question` request answers. */
+  question_id?: string;
   idempotency_key: string;
   approve_queue: boolean;
 }
@@ -39,12 +45,13 @@ function messageIdentity(request: SendRequest): MessageIdentity {
     project_id: request.project_id,
     body: request.text,
     mode: request.mode,
+    question_id: request.question_id ?? null,
     approve_queue: request.approve_queue,
     idempotency_key: request.idempotency_key,
   };
 }
 
-function isMode(value: unknown): value is MessageMode {
+function isMode(value: unknown): value is (typeof MESSAGE_MODES)[number] {
   return (MESSAGE_MODES as readonly unknown[]).includes(value);
 }
 
@@ -105,6 +112,56 @@ export function submitMessage(
     expires_at: new Date(now.getTime() + MESSAGE_TTL_MS).toISOString(),
   });
   return { ...receipt(message), duplicate };
+}
+
+/** The text handed to the asking session, so it can tell which question was answered. */
+function answerText(item: InboxItem, answer: string): string {
+  const theirs = item.origin_question_id ? ` (your id ${item.origin_question_id})` : "";
+  return `Answer to your question ${item.question_id}${theirs}: ${answer}`;
+}
+
+/**
+ * Sends an answer to the session that asked the question, never to the project's primary, over freshly
+ * discovered sessions. A retry under a stored key returns that message before the question's status is
+ * checked. An approval is refused and nothing is stored: no session here can answer a pending approval,
+ * and sending it as a next turn would fabricate one.
+ */
+export async function answerInboxQuestion(
+  store: Store,
+  body: Record<string, unknown>,
+  homes: ProviderHomes,
+): Promise<MessageReceipt & { duplicate: boolean }> {
+  const questionId = requireString(body, "question_id");
+  const answer = requireString(body, "answer");
+  const idempotencyKey = requireString(body, "idempotency_key");
+  const approveQueue = body.approve_queue ?? false;
+  if (typeof approveQueue !== "boolean") throw new BridgeError("invalid_request", "approve_queue must be a boolean when present");
+  store.expireMessages(systemClock().toISOString());
+  const item = store.getInboxItem(questionId);
+  if (!item) throw new BridgeError("inbox_question_not_found", `no inbox question with id ${questionId}`);
+  const request: SendRequest = {
+    project_id: item.project_id,
+    text: answerText(item, answer),
+    mode: "answer_question",
+    question_id: item.question_id,
+    idempotency_key: idempotencyKey,
+    approve_queue: approveQueue,
+  };
+  const stored = store.findMessageByKey(idempotencyKey);
+  if (stored) return { ...receipt(matchDuplicateMessage(stored, messageIdentity(request))), duplicate: true };
+
+  if (item.status !== "open") throw questionNotOpen(questionId, item.status);
+  if (item.type === "approval") throw approvalUnsupported(questionId);
+  const origin = item.origin_session_id;
+  if (origin === null) {
+    throw new BridgeError("no_origin_session", `question ${questionId} has no asking session to answer; dismiss it instead`);
+  }
+  const project = store.getById(item.project_id);
+  if (!project) throw new BridgeError("project_not_found", `no project registered with id ${item.project_id}`);
+  await discoverProjectSessions(store, project, homes);
+  const sessions = store.listSessions(project.project_id);
+  const session = sessions.find((s) => s.session_id === origin);
+  return submitMessage(store, request, resolveOrigin(sessions, origin), session);
 }
 
 /**
