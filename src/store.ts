@@ -47,6 +47,7 @@ export interface WorkspaceLease {
   enforceability: "bridge_controlled";
   acquired_at: string;
   heartbeat_at: string;
+  expires_at: string;
 }
 
 export interface PrimaryPin {
@@ -398,7 +399,7 @@ export interface Store {
    * its session ended and is replaced, and is returned as `displaced`.
    */
   acquireLease(
-    lease: Pick<WorkspaceLease, "worktree_id" | "project_id" | "holder_pid"> & { at: string },
+    lease: Pick<WorkspaceLease, "worktree_id" | "project_id" | "holder_pid" | "expires_at"> & { at: string },
     isLive: (held: WorkspaceLease) => boolean,
   ): { lease: WorkspaceLease; displaced: WorkspaceLease | undefined };
   /** Deletes the lease only while `holderPid` has it. */
@@ -406,7 +407,7 @@ export interface Store {
   /** Records the provider's group on the holder's lease; false when the holder no longer has it. */
   setLeaseProvider(worktreeId: string, holderPid: number, providerPgid: number): boolean;
   /** Renews the holder's heartbeat; false when the holder no longer has the lease. */
-  heartbeatLease(worktreeId: string, holderPid: number, at: string): boolean;
+  heartbeatLease(worktreeId: string, holderPid: number, at: string, expiresAt: string): boolean;
   /** Inserts the session and names it the owner of its holder's lease, in one transaction. */
   connectControlledSession(session: Omit<ControlledSession, "ended_at">): void;
   setControlledState(sessionId: string, state: ObservedState, at: string): void;
@@ -596,7 +597,8 @@ const CONTROL_TABLES = `
     provider_pgid    INTEGER,
     enforceability   TEXT NOT NULL CHECK (enforceability IN ('bridge_controlled')),
     acquired_at      TEXT NOT NULL,
-    heartbeat_at     TEXT NOT NULL
+    heartbeat_at     TEXT NOT NULL,
+    expires_at       TEXT NOT NULL
   );
 `;
 
@@ -705,13 +707,15 @@ export function openStore(dataDir: string): Store {
   const leaseOf = db.prepare("SELECT * FROM workspace_leases WHERE worktree_id = ?");
   const insertLease = db.prepare(`
     INSERT INTO workspace_leases (worktree_id, project_id, owner_session_id, holder_pid, provider_pgid, enforceability,
-                                  acquired_at, heartbeat_at)
-    VALUES (:worktree_id, :project_id, NULL, :holder_pid, NULL, 'bridge_controlled', :at, :at)
+                                  acquired_at, heartbeat_at, expires_at)
+    VALUES (:worktree_id, :project_id, NULL, :holder_pid, NULL, 'bridge_controlled', :at, :at, :expires_at)
   `);
   const deleteLease = db.prepare("DELETE FROM workspace_leases WHERE worktree_id = ? AND holder_pid = ?");
   const setLeaseProvider = db.prepare("UPDATE workspace_leases SET provider_pgid = ? WHERE worktree_id = ? AND holder_pid = ?");
   const setLeaseOwner = db.prepare("UPDATE workspace_leases SET owner_session_id = ? WHERE worktree_id = ? AND holder_pid = ?");
-  const heartbeat = db.prepare("UPDATE workspace_leases SET heartbeat_at = ? WHERE worktree_id = ? AND holder_pid = ?");
+  const heartbeat = db.prepare(
+    "UPDATE workspace_leases SET heartbeat_at = ?, expires_at = ? WHERE worktree_id = ? AND holder_pid = ?",
+  );
 
   const pinOf = db.prepare("SELECT project_id, session_id, pinned_at FROM primary_pins WHERE project_id = ?");
   const upsertPin = db.prepare(`
@@ -1191,8 +1195,8 @@ export function openStore(dataDir: string): Store {
     setLeaseProvider(worktreeId, holderPid, providerPgid) {
       return setLeaseProvider.run(providerPgid, worktreeId, holderPid).changes > 0;
     },
-    heartbeatLease(worktreeId, holderPid, at) {
-      return heartbeat.run(at, worktreeId, holderPid).changes > 0;
+    heartbeatLease(worktreeId, holderPid, at, expiresAt) {
+      return heartbeat.run(at, expiresAt, worktreeId, holderPid).changes > 0;
     },
     connectControlledSession(session) {
       inTransaction(db, () => {

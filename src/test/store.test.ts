@@ -568,7 +568,7 @@ const LEASE_AT = "2026-10-24T12:00:00.000Z";
 
 function takeLease(store: Store, holderPid: number, isLive: (held: WorkspaceLease) => boolean = () => false) {
   return store.acquireLease(
-    { worktree_id: "/x/p", project_id: "p", holder_pid: holderPid, at: LEASE_AT },
+    { worktree_id: "/x/p", project_id: "p", holder_pid: holderPid, at: LEASE_AT, expires_at: "2026-10-24T12:00:30.000Z" },
     isLive,
   );
 }
@@ -687,9 +687,9 @@ test("only the holder can heartbeat its lease or name its provider", () => {
   const { store } = seededStore();
   try {
     takeLease(store, 100);
-    assert.equal(store.heartbeatLease("/x/p", 200, LEASE_AT), false);
+    assert.equal(store.heartbeatLease("/x/p", 200, LEASE_AT, LEASE_AT), false);
     assert.equal(store.setLeaseProvider("/x/p", 200, 7), false);
-    assert.equal(store.heartbeatLease("/x/p", 100, "2026-10-24T12:00:05.000Z"), true);
+    assert.equal(store.heartbeatLease("/x/p", 100, "2026-10-24T12:00:05.000Z", "2026-10-24T12:00:35.000Z"), true);
     assert.equal(store.setLeaseProvider("/x/p", 100, 7), true);
     const lease = store.getLease("/x/p");
     assert.deepEqual([lease?.heartbeat_at, lease?.provider_pgid], ["2026-10-24T12:00:05.000Z", 7]);
