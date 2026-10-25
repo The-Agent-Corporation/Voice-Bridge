@@ -2,13 +2,16 @@ import { oneLine, redactSecrets, stringField } from "./briefing.js";
 import { BridgeError, requireString } from "./errors.js";
 import { INBOX_STATUSES, type InboxItem, type InboxStatus, type QuestionFields, type Store } from "./store.js";
 
+function payloadFields(payload: unknown): Record<string, unknown> {
+  return typeof payload === "object" && payload !== null && !Array.isArray(payload) ? (payload as Record<string, unknown>) : {};
+}
+
 /**
  * Reads a `user_question` payload as leniently as the briefing does: a missing or mistyped field is
  * absent, never a reason to refuse the event.
  */
 export function questionFields(payload: unknown): QuestionFields {
-  const fields =
-    typeof payload === "object" && payload !== null && !Array.isArray(payload) ? (payload as Record<string, unknown>) : {};
+  const fields = payloadFields(payload);
   return {
     origin_question_id: stringField(fields, "question_id"),
     summary: stringField(fields, "summary"),
@@ -16,6 +19,11 @@ export function questionFields(payload: unknown): QuestionFields {
     priority: stringField(fields, "priority"),
     withdrawn: fields.withdrawn === true,
   };
+}
+
+/** The bridge's `q-N` id an `agent_ack` payload names in `question_id`, or null when it names none. */
+export function acknowledgedQuestionId(payload: unknown): string | null {
+  return stringField(payloadFields(payload), "question_id");
 }
 
 function isInboxStatus(value: unknown): value is InboxStatus {

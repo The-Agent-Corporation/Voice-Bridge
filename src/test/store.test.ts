@@ -24,6 +24,7 @@ const ALL_TABLES = [
   "events",
   "inbox_items",
   "inbox_notifications",
+  "message_answers",
   "message_transitions",
   "messages",
   "pin_audit",
@@ -38,7 +39,7 @@ test("a store with an unknown schema version refuses to open and is left untouch
   const dataDir = tempDir();
   const file = path.join(dataDir, STORE_FILE);
   const seed = new DatabaseSync(file);
-  seed.exec("PRAGMA user_version = 9;");
+  seed.exec("PRAGMA user_version = 10;");
   seed.close();
 
   assert.throws(() => openStore(dataDir), { code: "store_version_unsupported" });
@@ -46,7 +47,7 @@ test("a store with an unknown schema version refuses to open and is left untouch
   const db = new DatabaseSync(file);
   try {
     assert.deepEqual(db.prepare("SELECT name FROM sqlite_master").all(), []);
-    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 9);
+    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 10);
   } finally {
     db.close();
   }
@@ -81,7 +82,7 @@ test("a version 1 store gains the sessions, pin, event, briefing and inbox table
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 8);
+    assert.equal(userVersion(db), 9);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
@@ -141,7 +142,7 @@ test("a version 2 store gains the pin, event, briefing and inbox tables and keep
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 8);
+    assert.equal(userVersion(db), 9);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
@@ -204,7 +205,7 @@ test("a version 3 store gains the event, briefing and inbox tables and keeps its
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 8);
+    assert.equal(userVersion(db), 9);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
@@ -237,7 +238,7 @@ test("a version 4 store gains the briefings and inbox tables and keeps its event
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 8);
+    assert.equal(userVersion(db), 9);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
@@ -270,7 +271,7 @@ test("a version 5 store gains the inbox tables and keeps its events and briefing
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 8);
+    assert.equal(userVersion(db), 9);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
@@ -291,7 +292,7 @@ test("a version 6 store gains the message tables and keeps its inbox", () => {
   });
   seeded.close();
   const seed = new DatabaseSync(file);
-  seed.exec("DROP TABLE message_transitions; DROP TABLE messages; PRAGMA user_version = 6;");
+  seed.exec("DROP TABLE message_answers; DROP TABLE message_transitions; DROP TABLE messages; PRAGMA user_version = 6;");
   seed.close();
 
   for (let open = 0; open < 2; open++) {
@@ -306,14 +307,14 @@ test("a version 6 store gains the message tables and keeps its inbox", () => {
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 8);
+    assert.equal(userVersion(db), 9);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
   }
 });
 
-test("a version 7 store gains the controlled session and lease tables and keeps its messages", () => {
+test("a version 7 store gains the message_answers, controlled session and lease tables and keeps its messages", () => {
   const dataDir = tempDir();
   const file = path.join(dataDir, STORE_FILE);
   const seeded = openStore(dataDir);
@@ -321,7 +322,7 @@ test("a version 7 store gains the controlled session and lease tables and keeps 
   seeded.createMessage(newMessage("k", { project_id: "kept" }));
   seeded.close();
   const seed = new DatabaseSync(file);
-  seed.exec("DROP TABLE workspace_leases; DROP TABLE controlled_sessions; PRAGMA user_version = 7;");
+  seed.exec("DROP TABLE message_answers; DROP TABLE workspace_leases; DROP TABLE controlled_sessions; PRAGMA user_version = 7;");
   seed.close();
 
   for (let open = 0; open < 2; open++) {
@@ -329,6 +330,9 @@ test("a version 7 store gains the controlled session and lease tables and keeps 
     try {
       assert.equal(store.findMessageByKey("k")?.state, "queued");
       assert.equal(store.getLease("/x/kept"), undefined);
+      const message = store.findMessageByKey("k");
+      assert.equal(message?.mode, "next_turn");
+      assert.equal(message?.question_id, null);
     } finally {
       store.close();
     }
@@ -336,7 +340,7 @@ test("a version 7 store gains the controlled session and lease tables and keeps 
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 8);
+    assert.equal(userVersion(db), 9);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
@@ -490,6 +494,7 @@ function newMessage(key: string, overrides: Partial<NewMessage> = {}): NewMessag
     project_id: "p",
     session_id: "codex:s1",
     mode: "next_turn",
+    question_id: null,
     body: "run the tests",
     approve_queue: true,
     idempotency_key: key,

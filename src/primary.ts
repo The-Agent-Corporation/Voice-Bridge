@@ -4,7 +4,8 @@ import { BridgeError } from "./errors.js";
 import { discoverProjectSessions } from "./sessions.js";
 import type { Project, Store, StoredSession } from "./store.js";
 
-export type PrimaryRouteName = "pinned" | "sole_connected" | "recent_saved_read_only" | "ambiguous" | "none";
+/** `origin` routes an inbox answer to the session that asked; `get_primary_session` never returns it. */
+export type PrimaryRouteName = "pinned" | "sole_connected" | "recent_saved_read_only" | "ambiguous" | "none" | "origin";
 
 /** docs/PRD.md §7.3. Invariant: `mutating_allowed` implies `available`. */
 export interface PrimaryRoute {
@@ -33,6 +34,10 @@ export interface PrimaryResult extends PrimaryRoute {
 const CONNECTED_STATES: ReadonlySet<ObservedState> = new Set(["connected_idle", "connected_running", "waiting_user"]);
 
 const isConnected = (session: StoredSession) => CONNECTED_STATES.has(session.observed_state);
+
+/** Another session in the chosen one's worktree is connected or of unknown state, so it may also write. */
+const competes = (sessions: readonly StoredSession[], chosen: StoredSession) =>
+  sessions.some((s) => s !== chosen && s.worktree_id === chosen.worktree_id && (isConnected(s) || s.observed_state === "unknown"));
 
 /** Most recent activity first, unknown activity last, then by session_id, whatever the input order. */
 function byRecency(a: StoredSession, b: StoredSession): number {
@@ -76,9 +81,7 @@ export function resolvePrimary(
       });
     }
     const available = isConnected(pinned);
-    const competing = sessions.some(
-      (s) => s !== pinned && s.worktree_id === pinned.worktree_id && (isConnected(s) || s.observed_state === "unknown"),
-    );
+    const competing = competes(sessions, pinned);
     const reason = !available
       ? `pinned session ${pin} is ${pinned.observed_state}; the pin is kept`
       : competing
@@ -121,6 +124,30 @@ export function resolvePrimary(
     available: false,
     reason: `no resumable session in ${worktreeId}`,
   });
+}
+
+/**
+ * Routes to the session that asked an inbox question, judged as a pin is: it must be among the discovered
+ * sessions, connected, and alone in its worktree. The route names it even when refused, so an answer is
+ * only ever addressed to the asking session.
+ */
+export function resolveOrigin(sessions: readonly StoredSession[], originSessionId: string): PrimaryRoute {
+  const route = (available: boolean, mutatingAllowed: boolean, reason: string): PrimaryRoute => ({
+    primary_session_id: originSessionId,
+    connected_session_id: null,
+    workspace_owner_session_id: null,
+    route: "origin",
+    mutating_allowed: mutatingAllowed,
+    available,
+    reason,
+  });
+  const origin = sessions.find((s) => s.session_id === originSessionId);
+  if (!origin) return route(false, false, `asking session ${originSessionId} is not among the project's discovered sessions`);
+  if (!isConnected(origin)) return route(false, false, `asking session ${originSessionId} is ${origin.observed_state}`);
+  if (competes(sessions, origin)) {
+    return route(true, false, `asking session ${originSessionId} is connected, but another session in its worktree may also write`);
+  }
+  return route(true, true, `asking session ${originSessionId} is connected`);
 }
 
 /** Resolves over what the store holds now, without rediscovering. */
