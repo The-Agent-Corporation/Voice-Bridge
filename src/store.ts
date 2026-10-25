@@ -283,7 +283,8 @@ export interface NewMessage {
   /**
    * The routing decision. `deliverable` stores `queued`, with `awaiting_delivery`, or with
    * `awaiting_earlier_messages` when its session already has a queued or delivering message, which
-   * goes first; the session host's dispatcher delivers it. Any other decision is stored as given.
+   * goes first; the session host's dispatcher delivers it. A session that has ended gets it with
+   * `owner_disconnected`. Any other decision is stored as given.
    */
   decision: { deliverable: true } | { deliverable: false; state: MessageState; reason: MessageReason; detail: string };
   created_at: string;
@@ -699,6 +700,7 @@ export function openStore(dataDir: string): Store {
   const updateControlledState = db.prepare(
     "UPDATE controlled_sessions SET observed_state = ?, last_activity_at = ? WHERE session_id = ? AND ended_at IS NULL",
   );
+  const endedControlled = db.prepare("SELECT 1 FROM controlled_sessions WHERE session_id = ? AND ended_at IS NOT NULL");
   const endControlled = db.prepare(
     "UPDATE controlled_sessions SET observed_state = 'unreachable', ended_at = ? WHERE session_id = ? AND ended_at IS NULL",
   );
@@ -1118,9 +1120,12 @@ export function openStore(dataDir: string): Store {
         const stored = findMessageByKey(message.idempotency_key);
         if (stored) return { message: matchDuplicateMessage(stored, message), duplicate: true };
         const { decision } = message;
+        // Routed to a controlled session that ended since: it is kept as that session's other waiting messages are.
         const { state, reason, detail }: MessageChange = !decision.deliverable
           ? decision
-          : pendingForSession.get(message.session_id)
+          : endedControlled.get(message.session_id)
+            ? { state: "queued", reason: "owner_disconnected", detail: `${message.session_id} ended before the message was stored; it will not be sent to another session` }
+            : pendingForSession.get(message.session_id)
             ? { state: "queued", reason: "awaiting_earlier_messages", detail: "an earlier message to this session is still pending" }
             : { state: "queued", reason: "awaiting_delivery", detail: "waiting for the session to be idle" };
         const { sequence } = nextSequence.get(message.project_id) as { sequence: number };

@@ -669,6 +669,20 @@ test("ending a session keeps waiting messages queued, fails handed-over ones, an
   }
 });
 
+test("a deliverable message routed to a controlled session that has since ended is kept queued as owner_disconnected", () => {
+  const { store } = seededStore();
+  try {
+    takeLease(store, 100);
+    store.connectControlledSession(controlled("codex:t1", 100));
+    store.endControlledSession("codex:t1", "the provider process exited", LEASE_AT);
+    store.createMessage(newMessage("late", { session_id: "codex:t1", decision: { deliverable: true } }));
+    assert.equal(stateOf(store, "m-late"), "queued/owner_disconnected");
+    assert.equal(store.nextQueuedMessage("codex:t1")?.reason, "owner_disconnected");
+  } finally {
+    store.close();
+  }
+});
+
 test("only the holder can heartbeat its lease or name its provider", () => {
   const { store } = seededStore();
   try {
