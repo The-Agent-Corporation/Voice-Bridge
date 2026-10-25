@@ -23,7 +23,7 @@ export interface BridgeServerOptions {
 
 type Tool = (options: BridgeServerOptions, body: Record<string, unknown>) => unknown;
 
-const TOOLS: Record<string, Tool> = {
+export const TOOLS: Record<string, Tool> = {
   register_project: ({ store, providerHomes }, body) => registerProject(store, requireString(body, "path"), providerHomes),
   list_projects: ({ store }) => ({ projects: listProjects(store) }),
   open_project: ({ store }, body) => openProject(store, requireString(body, "project_id")),

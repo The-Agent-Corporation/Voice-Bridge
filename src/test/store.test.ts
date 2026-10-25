@@ -612,9 +612,9 @@ test("a stale lease is replaced, and its session is ended with its waiting messa
     takeLease(store, 100);
     store.connectControlledSession(controlled("codex:t1", 100));
     store.createMessage(newMessage("w", { session_id: "codex:t1", decision: { deliverable: true } }));
-    const { lease, displaced } = takeLease(store, 200, (held) => held.holder_pid !== 100);
-    assert.equal(displaced?.owner_session_id, "codex:t1");
-    assert.deepEqual([lease.holder_pid, lease.owner_session_id, lease.provider_pgid], [200, null, null]);
+    takeLease(store, 200, (held) => held.holder_pid !== 100);
+    const lease = store.getLease("/x/p");
+    assert.deepEqual([lease?.holder_pid, lease?.owner_session_id, lease?.provider_pgid], [200, null, null]);
     assert.equal(stateOf(store, "m-w"), "queued/owner_disconnected");
     assert.deepEqual(store.listLiveControlledSessions("p"), []);
   } finally {

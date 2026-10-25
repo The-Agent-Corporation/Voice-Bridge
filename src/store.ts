@@ -237,6 +237,9 @@ export type MessageReason =
   | "cancelled_by_user"
   | "expired_unsent";
 
+/** The reasons a dispatcher sends a queued message for; a message queued for any other reason keeps it. */
+export const SENDABLE_REASONS: ReadonlySet<MessageReason> = new Set(["awaiting_delivery", "awaiting_earlier_messages"]);
+
 export interface MessageChange {
   state: MessageState;
   reason: MessageReason;
@@ -396,12 +399,12 @@ export interface Store {
   /**
    * Takes the worktree's lease for `holder_pid`, in one immediate transaction, so two starts serialize.
    * A held lease that `isLive` judges live throws `workspace_owned` and writes nothing; a stale one has
-   * its session ended and is replaced, and is returned as `displaced`.
+   * its session ended and is replaced.
    */
   acquireLease(
     lease: Pick<WorkspaceLease, "worktree_id" | "project_id" | "holder_pid" | "expires_at"> & { at: string },
     isLive: (held: WorkspaceLease) => boolean,
-  ): { lease: WorkspaceLease; displaced: WorkspaceLease | undefined };
+  ): void;
   /** Deletes the lease only while `holderPid` has it. */
   releaseLease(worktreeId: string, holderPid: number): void;
   /** Records the provider's group on the holder's lease; false when the holder no longer has it. */
@@ -941,13 +944,11 @@ export function openStore(dataDir: string): Store {
     return changes > 0;
   };
 
-  /** The waiting reasons a dispatcher sends; a message queued for any other reason keeps it. */
-  const WAITING_TO_SEND: ReadonlySet<string> = new Set<MessageReason>(["awaiting_delivery", "awaiting_earlier_messages"]);
   const endSession = (sessionId: string, detail: string, at: string) => {
     endControlled.run(at, sessionId);
-    const messages = sessionMessages.all(sessionId) as { message_id: string; state: MessageState; reason: string }[];
+    const messages = sessionMessages.all(sessionId) as { message_id: string; state: MessageState; reason: MessageReason }[];
     for (const { message_id, state, reason } of messages) {
-      if (state === "queued" && !WAITING_TO_SEND.has(reason)) continue;
+      if (state === "queued" && !SENDABLE_REASONS.has(reason)) continue;
       const outcome =
         state === "queued"
           ? `${detail}; not delivered, and it will not be sent to another session`
@@ -1178,7 +1179,7 @@ export function openStore(dataDir: string): Store {
             `${wanted.worktree_id} is held by bridge session host pid ${held.holder_pid}` +
               `${held.provider_pgid === null ? "" : `, provider process group ${held.provider_pgid}`}` +
               `${held.owner_session_id === null ? "" : `, session ${held.owner_session_id}`}` +
-              `, last heartbeat ${held.heartbeat_at}`,
+              `, last heartbeat ${held.heartbeat_at}, expiry ${held.expires_at}`,
           );
         }
         if (held) {
@@ -1186,7 +1187,6 @@ export function openStore(dataDir: string): Store {
           deleteLease.run(held.worktree_id, held.holder_pid);
         }
         insertLease.run({ ...wanted });
-        return { lease: lease(leaseOf.get(wanted.worktree_id))!, displaced: held };
       });
     },
     releaseLease(worktreeId, holderPid) {
