@@ -1,13 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { ProviderHomes } from "./adapters/homes.js";
-import type { AgentAdapter } from "./adapters/types.js";
 import { BridgeError, requireString } from "./errors.js";
 import { getPrimarySession, type PrimaryRoute } from "./primary.js";
-import { adapterFor } from "./sessions.js";
 import {
   matchDuplicateMessage,
   MESSAGE_MODES,
-  type MessageChange,
   type MessageIdentity,
   type MessageMode,
   type NewMessage,
@@ -87,20 +84,17 @@ export function planSend(route: PrimaryRoute, mode: MessageMode, approveQueue: b
 }
 
 /**
- * Stores the message, then delivers it only when it heads its project's queue for a session that can
- * take a next turn. Such a message is committed as `delivering` before the adapter is called, so a
- * cancel, an expiry or a retry under its key during the call cannot touch it, and a crash during the
- * call leaves it `delivering`, never resent. Nothing here starts a process.
+ * Stores the message; a deliverable one is stored `queued`, and the dispatcher of the session host
+ * holding that session (src/dispatcher.ts) delivers it. Nothing here starts a process or talks to one.
  */
-export async function submitMessage(
+export function submitMessage(
   store: Store,
   request: SendRequest,
   route: PrimaryRoute,
   primary: StoredSession | undefined,
-  adapter: AgentAdapter | undefined,
   clock: Clock = systemClock,
-): Promise<MessageReceipt & { duplicate: boolean }> {
-  const canSendNextTurn = primary?.capabilities.next_turn === true && typeof adapter?.sendNextTurn === "function";
+): MessageReceipt & { duplicate: boolean } {
+  const canSendNextTurn = primary?.capabilities.next_turn === true;
   const now = clock();
   const { message, duplicate } = store.createMessage({
     ...messageIdentity(request),
@@ -110,22 +104,7 @@ export async function submitMessage(
     created_at: now.toISOString(),
     expires_at: new Date(now.getTime() + MESSAGE_TTL_MS).toISOString(),
   });
-  if (duplicate || message.state !== "delivering" || !primary || !adapter?.sendNextTurn) {
-    return { ...receipt(message), duplicate };
-  }
-
-  let to: MessageChange;
-  try {
-    const { provider_ref } = await adapter.sendNextTurn(primary.native_session_id, request.text, request.idempotency_key);
-    to = { state: "delivered", reason: "adapter_receipt", detail: `delivered to ${primary.session_id}`, provider_ref };
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    console.error(`voice-bridge: message ${message.message_id} not delivered to ${primary.session_id}: ${detail}`);
-    to = { state: "failed", reason: "delivery_failed", detail };
-  }
-  const outcome = store.transitionMessage(message.message_id, "delivering", to, clock().toISOString());
-  if (!outcome) throw new BridgeError("message_not_found", `message ${message.message_id} was removed during delivery`);
-  return { ...receipt(outcome.message), duplicate: false };
+  return { ...receipt(message), duplicate };
 }
 
 /**
@@ -144,7 +123,7 @@ export async function sendToPrimary(
 
   const route = await getPrimarySession(store, request.project_id, homes);
   const primary = store.listSessions(request.project_id).find((s) => s.session_id === route.primary_session_id);
-  return submitMessage(store, request, route, primary, primary && adapterFor(primary.provider, homes));
+  return submitMessage(store, request, route, primary);
 }
 
 export function getMessage(store: Store, body: Record<string, unknown>, clock: Clock = systemClock): MessageReceipt {

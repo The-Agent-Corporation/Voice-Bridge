@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { after, afterEach, beforeEach, describe, test } from "node:test";
-import type { AgentAdapter, SessionCapabilities } from "../adapters/types.js";
-import { cancelMessage, getMessage, MESSAGE_TTL_MS, planSend, submitMessage, type SendRequest } from "../messages.js";
+import type { SessionCapabilities } from "../adapters/types.js";
+import { getMessage, MESSAGE_TTL_MS, planSend, submitMessage, type SendRequest } from "../messages.js";
 import type { PrimaryRoute } from "../primary.js";
 import { openStore, type Store, type StoredSession } from "../store.js";
 import { removeTempDirs, tempDir } from "./helpers.js";
@@ -64,7 +64,6 @@ describe("planSend", () => {
 
 describe("submitMessage", () => {
   let store: Store;
-  let calls: [string, string, string][];
 
   const capabilities = (nextTurn: boolean): SessionCapabilities => ({
     live_attach: false,
@@ -82,15 +81,6 @@ describe("submitMessage", () => {
     last_activity_at: null,
     capabilities: capabilities(nextTurn),
   });
-  const adapter = (send: () => Promise<{ provider_ref: string }>): AgentAdapter => ({
-    provider: "codex",
-    discoverSessions: async () => ({ sessions: [], skipped_records: 0 }),
-    async sendNextTurn(nativeSessionId, text, key) {
-      calls.push([nativeSessionId, text, key]);
-      return send();
-    },
-  });
-  const accepting = () => adapter(async () => ({ provider_ref: "turn-1" }));
   const request = (key: string, approveQueue = false): SendRequest => ({
     project_id: "p",
     text: "run the tests",
@@ -102,76 +92,47 @@ describe("submitMessage", () => {
   beforeEach(() => {
     store = openStore(tempDir());
     store.upsert({ project_id: "p", display_name: "P", canonical_path: "/x/p" });
-    calls = [];
   });
 
   afterEach(() => store.close());
 
-  test("a sole connected session that can take a next turn is delivered to once", async () => {
-    const receipt = await submitMessage(store, request("k"), CONNECTED, session(true), accepting(), clock);
-    assert.deepEqual(calls, [["s1", "run the tests", "k"]]);
-    assert.equal(receipt.state, "delivered");
-    assert.equal(receipt.reason, "adapter_receipt");
-    assert.equal(receipt.provider_ref, "turn-1");
-    assert.deepEqual(receipt.transitions.map((t) => t.state), ["accepted", "queued", "delivering", "delivered"]);
+  test("a sole connected session that can take a next turn gets the message queued for its dispatcher", () => {
+    const receipt = submitMessage(store, request("k"), CONNECTED, session(true), clock);
+    assert.equal(receipt.state, "queued");
+    assert.equal(receipt.reason, "awaiting_delivery");
+    assert.equal(receipt.session_id, "codex:s1");
+    assert.deepEqual(receipt.transitions.map((t) => t.state), ["accepted", "queued"]);
   });
 
-  test("a cancel or expiry during the adapter call cannot hide its outcome", async () => {
-    let release!: () => void;
-    const held = adapter(() => new Promise((resolve) => (release = () => resolve({ provider_ref: "turn-1" }))));
-    const sending = submitMessage(store, request("k"), CONNECTED, session(true), held, clock);
-    const { message_id } = store.findMessageByKey("k")!;
-    const cancel = cancelMessage(store, { message_id }, clock);
-    assert.equal(cancel.cancelled, false);
-    assert.equal(cancel.state, "delivering");
-    assert.equal(getMessage(store, { message_id }, () => new Date(NOW.getTime() + MESSAGE_TTL_MS + 1)).state, "delivering");
-    release();
-    const receipt = await sending;
-    assert.equal(receipt.state, "delivered");
-    assert.equal(receipt.provider_ref, "turn-1");
-  });
-
-  test("a retry under the same key during the adapter call is a duplicate and is not sent again", async () => {
-    const pending: (() => void)[] = [];
-    const held = adapter(() => new Promise((resolve) => pending.push(() => resolve({ provider_ref: "turn-1" }))));
-    const first = submitMessage(store, request("k"), CONNECTED, session(true), held, clock);
-    const retrying = submitMessage(store, request("k"), CONNECTED, session(true), held, clock);
-    assert.equal(calls.length, 1);
-    for (const release of pending) release();
-    const [delivered, retry] = await Promise.all([first, retrying]);
+  test("a retry under the same key is a duplicate of the stored message", () => {
+    const first = submitMessage(store, request("k"), CONNECTED, session(true), clock);
+    const retry = submitMessage(store, request("k"), CONNECTED, session(true), clock);
     assert.equal(retry.duplicate, true);
-    assert.equal(retry.state, "delivering");
-    assert.equal(retry.message_id, delivered.message_id);
-    assert.equal(delivered.state, "delivered");
+    assert.equal(retry.message_id, first.message_id);
   });
 
-  test("a session without the next_turn capability is never called", async () => {
-    const receipt = await submitMessage(store, request("k"), CONNECTED, session(false), accepting(), clock);
-    assert.deepEqual(calls, []);
-    assert.equal(receipt.state, "failed");
-    assert.equal(receipt.reason, "unsupported_capability");
-  });
-
-  test("a message behind an earlier queued one waits and is not delivered", async () => {
-    await submitMessage(store, request("first", true), SAVED, session(false), accepting(), clock);
-    const receipt = await submitMessage(store, request("second"), CONNECTED, session(true), accepting(), clock);
-    assert.deepEqual(calls, []);
+  test("a second deliverable message to the same session waits behind the first", () => {
+    submitMessage(store, request("first"), CONNECTED, session(true), clock);
+    const receipt = submitMessage(store, request("second"), CONNECTED, session(true), clock);
     assert.equal(receipt.state, "queued");
     assert.equal(receipt.reason, "awaiting_earlier_messages");
   });
 
-  test("a rejected delivery fails the message with the adapter's reason", async () => {
-    const failing = adapter(async () => {
-      throw new Error("session went away");
-    });
-    const receipt = await submitMessage(store, request("k"), CONNECTED, session(true), failing, clock);
+  test("a session without the next_turn capability is refused", () => {
+    const receipt = submitMessage(store, request("k"), CONNECTED, session(false), clock);
     assert.equal(receipt.state, "failed");
-    assert.equal(receipt.reason, "delivery_failed");
-    assert.equal(receipt.detail, "session went away");
+    assert.equal(receipt.reason, "unsupported_capability");
   });
 
-  test("a queued message reads as expired once its 24 hours have passed", async () => {
-    const { message_id, expires_at } = await submitMessage(store, request("k", true), SAVED, session(false), undefined, clock);
+  test("a message behind an earlier queued one to the same session waits", () => {
+    submitMessage(store, request("first", true), SAVED, session(false), clock);
+    const receipt = submitMessage(store, request("second"), CONNECTED, session(true), clock);
+    assert.equal(receipt.state, "queued");
+    assert.equal(receipt.reason, "awaiting_earlier_messages");
+  });
+
+  test("a queued message reads as expired once its 24 hours have passed", () => {
+    const { message_id, expires_at } = submitMessage(store, request("k", true), SAVED, session(false), clock);
     assert.equal(expires_at, new Date(NOW.getTime() + MESSAGE_TTL_MS).toISOString());
     assert.equal(getMessage(store, { message_id }, () => new Date(NOW.getTime() + MESSAGE_TTL_MS - 1)).state, "queued");
     const expired = getMessage(store, { message_id }, () => new Date(NOW.getTime() + MESSAGE_TTL_MS + 1));

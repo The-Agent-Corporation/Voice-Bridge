@@ -32,15 +32,19 @@ const REAP_POLL_MS = 25;
 const STDIO_CLOSE_WAIT_MS = 1_000;
 const EXIT_WAIT_MS = 5_000;
 
-function groupAlive(pgid: number): boolean {
+/** Signal 0 only probes. EPERM means the target exists but we may not signal it: alive, and not ours to call gone. */
+function signalReaches(target: number): boolean {
   try {
-    process.kill(-pgid, 0);
+    process.kill(target, 0);
     return true;
   } catch (error) {
-    // EPERM means a member exists that we may not signal: alive, and not ours to call gone.
     return (error as NodeJS.ErrnoException).code !== "ESRCH";
   }
 }
+
+export const groupAlive = (pgid: number): boolean => signalReaches(-pgid);
+
+export const pidAlive = (pid: number): boolean => signalReaches(pid);
 
 /**
  * SIGKILLs the process group `pgid` and polls until no member is left. Waiting on the
@@ -165,6 +169,10 @@ export function runToExit(
 
 /** A long-lived provider process spoken to line by line over stdio. */
 export interface Session {
+  /** The provider process, which leads its own group; null when it never started. */
+  readonly pid: number | null;
+  /** Resolves once the provider process has exited, even if a grandchild keeps stdout open. */
+  readonly exited: Promise<void>;
   onLine(listener: (line: string) => void): void;
   /** Fires once stdout has ended, or the process could not start. */
   onClosed(listener: () => void): void;
@@ -178,6 +186,8 @@ export function startSession(command: string[], options: LaunchOptions, children
   const lines = createInterface({ input: launched.child.stdout! });
   const closed = new Promise<void>((resolve) => lines.once("close", () => resolve()));
   return {
+    pid: launched.child.pid ?? null,
+    exited: launched.exited,
     onLine: (listener) => lines.on("line", listener),
     onClosed: (listener) => void closed.then(listener),
     write: (message) => {

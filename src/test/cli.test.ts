@@ -152,6 +152,9 @@ describe("voice-bridge CLI", () => {
     for (const args of [["primary"], ["primary", "desktop-agent", "--pin"], ["primary", "desktop-agent", "--unpin", "x"], ["primary", "desktop-agent", "--bogus"]]) {
       assert.equal((await cli(...args)).status, 2, args.join(" "));
     }
+    for (const args of [["session"], ["session", "start", "x"], ["session", "start", "x", "--provider"], ["session", "stop", "x"], ["session", "start", "x", "--provider", "codex", "extra"]]) {
+      assert.equal((await cli(...args)).status, 2, args.join(" "));
+    }
     for (const args of [["inbox", "--project"], ["inbox", "--status"], ["inbox", "--bogus"], ["inbox", "--project", "a", "--project", "b"], ["inbox", "extra"]]) {
       assert.equal((await cli(...args)).status, 2, args.join(" "));
     }

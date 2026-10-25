@@ -6,6 +6,7 @@ import type { AgentAdapter, DiscoveredSession, Provider, Worktree } from "./adap
 import { readVoiceConfig } from "./config.js";
 import { BridgeError } from "./errors.js";
 import { runGit } from "./git.js";
+import { reconcileControlledSessions } from "./lease.js";
 import { sessionId, type Project, type Store, type StoredSession } from "./store.js";
 
 const ADAPTERS: Record<Provider, (home: string) => AgentAdapter> = {
@@ -93,9 +94,11 @@ function uniqueSessions(sessions: DiscoveredSession[]): DiscoveredSession[] {
 
 /**
  * Reads the allowed providers' saved records and replaces the project's stored sessions
- * with the ones that belong to it. Nothing is stored unless every provider was read.
+ * with the ones that belong to it. Nothing is stored unless every provider was read. First it
+ * ends any controlled session whose host is gone, so no route goes to it.
  */
 export async function discoverProjectSessions(store: Store, project: Project, homes: ProviderHomes): Promise<DiscoveryCounts> {
+  reconcileControlledSessions(store, project.project_id, new Date().toISOString());
   const config = readVoiceConfig(project.canonical_path);
   const worktrees = projectWorktrees(store, project);
   const results = await Promise.all(

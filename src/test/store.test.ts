@@ -10,7 +10,9 @@ import {
   type EventType,
   type NewEvent,
   type NewMessage,
+  type ControlledSession,
   type Store,
+  type WorkspaceLease,
 } from "../store.js";
 import { removeTempDirs, tempDir } from "./helpers.js";
 
@@ -18,6 +20,7 @@ after(removeTempDirs);
 
 const ALL_TABLES = [
   "briefings",
+  "controlled_sessions",
   "events",
   "inbox_items",
   "inbox_notifications",
@@ -28,13 +31,14 @@ const ALL_TABLES = [
   "projects",
   "sessions",
   "source_watermarks",
+  "workspace_leases",
 ];
 
 test("a store with an unknown schema version refuses to open and is left untouched", () => {
   const dataDir = tempDir();
   const file = path.join(dataDir, STORE_FILE);
   const seed = new DatabaseSync(file);
-  seed.exec("PRAGMA user_version = 8;");
+  seed.exec("PRAGMA user_version = 9;");
   seed.close();
 
   assert.throws(() => openStore(dataDir), { code: "store_version_unsupported" });
@@ -42,7 +46,7 @@ test("a store with an unknown schema version refuses to open and is left untouch
   const db = new DatabaseSync(file);
   try {
     assert.deepEqual(db.prepare("SELECT name FROM sqlite_master").all(), []);
-    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 8);
+    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 9);
   } finally {
     db.close();
   }
@@ -77,7 +81,7 @@ test("a version 1 store gains the sessions, pin, event, briefing and inbox table
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 7);
+    assert.equal(userVersion(db), 8);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
@@ -137,7 +141,7 @@ test("a version 2 store gains the pin, event, briefing and inbox tables and keep
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 7);
+    assert.equal(userVersion(db), 8);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
@@ -200,7 +204,7 @@ test("a version 3 store gains the event, briefing and inbox tables and keeps its
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 7);
+    assert.equal(userVersion(db), 8);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
@@ -233,7 +237,7 @@ test("a version 4 store gains the briefings and inbox tables and keeps its event
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 7);
+    assert.equal(userVersion(db), 8);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
@@ -266,7 +270,7 @@ test("a version 5 store gains the inbox tables and keeps its events and briefing
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 7);
+    assert.equal(userVersion(db), 8);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
@@ -302,7 +306,37 @@ test("a version 6 store gains the message tables and keeps its inbox", () => {
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 7);
+    assert.equal(userVersion(db), 8);
+    assert.deepEqual(tableNames(db), ALL_TABLES);
+  } finally {
+    db.close();
+  }
+});
+
+test("a version 7 store gains the controlled session and lease tables and keeps its messages", () => {
+  const dataDir = tempDir();
+  const file = path.join(dataDir, STORE_FILE);
+  const seeded = openStore(dataDir);
+  seeded.upsert({ project_id: "kept", display_name: "Kept", canonical_path: "/x/kept" });
+  seeded.createMessage(newMessage("k", { project_id: "kept" }));
+  seeded.close();
+  const seed = new DatabaseSync(file);
+  seed.exec("DROP TABLE workspace_leases; DROP TABLE controlled_sessions; PRAGMA user_version = 7;");
+  seed.close();
+
+  for (let open = 0; open < 2; open++) {
+    const store = openStore(dataDir);
+    try {
+      assert.equal(store.findMessageByKey("k")?.state, "queued");
+      assert.equal(store.getLease("/x/kept"), undefined);
+    } finally {
+      store.close();
+    }
+  }
+
+  const db = new DatabaseSync(file);
+  try {
+    assert.equal(userVersion(db), 8);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
@@ -509,17 +543,142 @@ test("message sequences count from 1 in each project", () => {
   }
 });
 
-test("a deliverable message is claimed for delivery, and later ones wait behind it", () => {
+test("a deliverable message is queued awaiting delivery, and later ones to the same session wait behind it", () => {
   const { store } = seededStore();
   try {
     const first = store.createMessage(newMessage("a", { decision: { deliverable: true } })).message;
     assert.deepEqual(
       first.transitions.map((t) => `${t.state}/${t.reason}`),
-      ["accepted/authenticated", "queued/awaiting_delivery", "delivering/handed_to_adapter"],
+      ["accepted/authenticated", "queued/awaiting_delivery"],
     );
     assert.equal(store.createMessage(newMessage("b", { decision: { deliverable: true } })).message.reason, "awaiting_earlier_messages");
+    assert.equal(
+      store.createMessage(newMessage("c", { session_id: "codex:s2", decision: { deliverable: true } })).message.reason,
+      "awaiting_delivery",
+    );
+    assert.equal(store.nextQueuedMessage("codex:s1")?.message_id, "m-a");
     store.expireMessages("2030-01-01T00:00:00.000Z");
-    assert.equal(store.getMessage("m-a")?.state, "delivering");
+    assert.equal(store.getMessage("m-a")?.state, "expired");
+  } finally {
+    store.close();
+  }
+});
+
+const LEASE_AT = "2026-10-24T12:00:00.000Z";
+
+function takeLease(store: Store, holderPid: number, isLive: (held: WorkspaceLease) => boolean = () => false) {
+  return store.acquireLease(
+    { worktree_id: "/x/p", project_id: "p", holder_pid: holderPid, at: LEASE_AT, expires_at: "2026-10-24T12:00:30.000Z" },
+    isLive,
+  );
+}
+
+function controlled(sessionId: string, holderPid: number): Omit<ControlledSession, "ended_at"> {
+  return {
+    session_id: sessionId,
+    project_id: "p",
+    provider: "codex",
+    native_session_id: sessionId.slice("codex:".length),
+    worktree_id: "/x/p",
+    observed_state: "connected_idle",
+    last_activity_at: "2026-10-24T12:00:01.000Z",
+    capabilities: { ...NO_CAPABILITIES, next_turn: true, subscribe_events: true },
+    holder_pid: holderPid,
+    provider_pgid: holderPid + 1,
+    started_at: "2026-10-24T12:00:01.000Z",
+  };
+}
+
+const stateOf = (store: Store, messageId: string) => {
+  const message = store.getMessage(messageId);
+  return `${message?.state}/${message?.reason}`;
+};
+
+test("a live lease refuses a second holder with workspace_owned and writes nothing", () => {
+  const { store } = seededStore();
+  try {
+    takeLease(store, 100);
+    const before = store.getLease("/x/p");
+    assert.throws(() => takeLease(store, 200, () => true), { code: "workspace_owned", message: /pid 100/ });
+    assert.deepEqual(store.getLease("/x/p"), before);
+  } finally {
+    store.close();
+  }
+});
+
+test("a stale lease is replaced, and its session is ended with its waiting messages kept queued", () => {
+  const { store } = seededStore();
+  try {
+    takeLease(store, 100);
+    store.connectControlledSession(controlled("codex:t1", 100));
+    store.createMessage(newMessage("w", { session_id: "codex:t1", decision: { deliverable: true } }));
+    const { lease, displaced } = takeLease(store, 200, (held) => held.holder_pid !== 100);
+    assert.equal(displaced?.owner_session_id, "codex:t1");
+    assert.deepEqual([lease.holder_pid, lease.owner_session_id, lease.provider_pgid], [200, null, null]);
+    assert.equal(stateOf(store, "m-w"), "queued/owner_disconnected");
+    assert.deepEqual(store.listLiveControlledSessions("p"), []);
+  } finally {
+    store.close();
+  }
+});
+
+test("a live controlled session replaces the discovered row with its id, and an ended one drops out", () => {
+  const { store } = seededStore();
+  try {
+    takeLease(store, 100);
+    store.connectControlledSession(controlled("codex:s1", 100));
+    const live = store.listSessions("p").find((s) => s.session_id === "codex:s1");
+    assert.equal(live?.observed_state, "connected_idle");
+    assert.equal(live?.capabilities.next_turn, true);
+    assert.equal(store.listSessions("p").filter((s) => s.session_id === "codex:s1").length, 1);
+    assert.equal(store.getLease("/x/p")?.owner_session_id, "codex:s1");
+    assert.equal(resolveStoredPrimary(store, store.getById("p")!).workspace_owner_session_id, "codex:s1");
+
+    store.endControlledSession("codex:s1", "test ended it", LEASE_AT);
+    assert.equal(store.listSessions("p").find((s) => s.session_id === "codex:s1")?.observed_state, "unreachable");
+    assert.equal(store.listSessions("p").find((s) => s.session_id === "codex:s1")?.capabilities.next_turn, false);
+  } finally {
+    store.close();
+  }
+});
+
+test("ending a session keeps waiting messages queued, fails handed-over ones, and releases only its holder's lease", () => {
+  const { store } = seededStore();
+  try {
+    takeLease(store, 100);
+    store.connectControlledSession(controlled("codex:t1", 100));
+    const deliverable = (key: string) => store.createMessage(newMessage(key, { session_id: "codex:t1", decision: { deliverable: true } }));
+    for (const key of ["delivering", "started", "waiting"]) deliverable(key);
+    store.createMessage(newMessage("approved", { session_id: "codex:t1" }));
+    const to = (state: "delivering" | "delivered" | "started") => ({ state, reason: "handed_to_adapter", detail: "x" }) as const;
+    store.transitionMessage("m-delivering", "queued", to("delivering"), LEASE_AT);
+    store.transitionMessage("m-started", "queued", to("started"), LEASE_AT);
+
+    store.endControlledSession("codex:t1", "the provider process exited", LEASE_AT, { worktree_id: "/x/p", holder_pid: 999 });
+    assert.equal(stateOf(store, "m-delivering"), "failed/owner_disconnected");
+    assert.equal(stateOf(store, "m-started"), "failed/owner_disconnected");
+    assert.equal(stateOf(store, "m-waiting"), "queued/owner_disconnected");
+    assert.equal(stateOf(store, "m-approved"), "queued/awaiting_controllable_session");
+    assert.match(store.getMessage("m-delivering")!.detail, /may have started/);
+    assert.equal(store.getLease("/x/p")?.holder_pid, 100);
+
+    store.endControlledSession("codex:t1", "again", LEASE_AT, { worktree_id: "/x/p", holder_pid: 100 });
+    assert.equal(store.getLease("/x/p"), undefined);
+  } finally {
+    store.close();
+  }
+});
+
+test("only the holder can heartbeat its lease or name its provider", () => {
+  const { store } = seededStore();
+  try {
+    takeLease(store, 100);
+    assert.equal(store.heartbeatLease("/x/p", 200, LEASE_AT, LEASE_AT), false);
+    assert.equal(store.setLeaseProvider("/x/p", 200, 7), false);
+    assert.equal(store.heartbeatLease("/x/p", 100, "2026-10-24T12:00:05.000Z", "2026-10-24T12:00:35.000Z"), true);
+    assert.equal(store.setLeaseProvider("/x/p", 100, 7), true);
+    const lease = store.getLease("/x/p");
+    assert.deepEqual([lease?.heartbeat_at, lease?.provider_pgid], ["2026-10-24T12:00:05.000Z", 7]);
   } finally {
     store.close();
   }

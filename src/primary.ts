@@ -11,8 +11,11 @@ export interface PrimaryRoute {
   primary_session_id: string | null;
   /** The one connected session in the selected worktree, when there is exactly one. */
   connected_session_id: string | null;
-  /** Always null until workspace leases (docs/PRD.md §10) exist; discovery evidence never proves ownership. */
-  workspace_owner_session_id: null;
+  /**
+   * The bridge-controlled session holding the worktree's lease (docs/PRD.md §10), or null. Only a lease
+   * sets it; discovery evidence never proves ownership.
+   */
+  workspace_owner_session_id: string | null;
   route: PrimaryRouteName;
   mutating_allowed: boolean;
   /** The primary can receive a message now. */
@@ -46,14 +49,19 @@ function byRecency(a: StoredSession, b: StoredSession): number {
  * session; otherwise the selected worktree decides, and ambiguity is checked before any
  * timestamp is used, so a timestamp only ever chooses among sessions that are safe to choose.
  */
-export function resolvePrimary(sessions: readonly StoredSession[], pin: string | null, worktreeId: string): PrimaryRoute {
+export function resolvePrimary(
+  sessions: readonly StoredSession[],
+  pin: string | null,
+  worktreeId: string,
+  ownerSessionId: string | null = null,
+): PrimaryRoute {
   const inWorktree = sessions.filter((s) => s.worktree_id === worktreeId);
   const connected = inWorktree.filter(isConnected);
   const connectedSessionId = connected.length === 1 ? connected[0]!.session_id : null;
   const route = (fields: Omit<PrimaryRoute, "connected_session_id" | "workspace_owner_session_id">): PrimaryRoute => ({
     ...fields,
     connected_session_id: connectedSessionId,
-    workspace_owner_session_id: null,
+    workspace_owner_session_id: ownerSessionId,
   });
 
   if (pin !== null) {
@@ -118,7 +126,8 @@ export function resolvePrimary(sessions: readonly StoredSession[], pin: string |
 /** Resolves over what the store holds now, without rediscovering. */
 export function resolveStoredPrimary(store: Store, project: Project): PrimaryRoute {
   const pin = store.getPin(project.project_id)?.session_id ?? null;
-  return resolvePrimary(store.listSessions(project.project_id), pin, project.canonical_path);
+  const owner = store.getLease(project.canonical_path)?.owner_session_id ?? null;
+  return resolvePrimary(store.listSessions(project.project_id), pin, project.canonical_path, owner);
 }
 
 interface Discovered {
