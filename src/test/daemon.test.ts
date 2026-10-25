@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
+import { once } from "node:events";
 import { readFileSync, statSync } from "node:fs";
+import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { after, test } from "node:test";
 import { PACKAGE_ROOT } from "../buildId.js";
 import { runGit } from "../git.js";
+import { STORE_FILE } from "../store.js";
 import { tokenPath } from "../token.js";
 import { call, fixtureHomes, makeRepo, removeTempDirs, spawnDaemon, tempDir, writeClaudeSession } from "./helpers.js";
 
@@ -128,5 +132,58 @@ test("events and watermarks survive a restart", async () => {
     });
   } finally {
     await second.stop();
+  }
+});
+
+test("queued messages survive SIGKILL in order without duplicates", async () => {
+  const env = daemonEnv();
+  const dataDir = env.VOICE_BRIDGE_DATA_DIR!;
+  const repo = makeRepo();
+  writeClaudeSession(env.VOICE_BRIDGE_CLAUDE_HOME!, repo, "claude-1");
+  const message = (n: number) => ({
+    project_id: "desktop-agent",
+    text: `step ${n}`,
+    mode: "next_turn",
+    idempotency_key: `k${n}`,
+    approve_queue: true,
+  });
+
+  const first = await spawnDaemon(env);
+  const token = readFileSync(tokenPath(dataDir), "utf8");
+  const ids: string[] = [];
+  try {
+    assert.equal((await call(first.port, token, "register_project", { path: repo })).status, 200);
+    for (const n of [1, 2, 3]) {
+      const { body } = await call(first.port, token, "send_to_primary", message(n));
+      assert.equal(body.state, "queued", JSON.stringify(body));
+      ids.push(body.message_id);
+    }
+  } finally {
+    if (first.child.exitCode === null) {
+      const exited = once(first.child, "exit");
+      first.child.kill("SIGKILL");
+      await exited;
+    }
+  }
+
+  const second = await spawnDaemon(env);
+  try {
+    const read = [];
+    for (const message_id of ids) read.push((await call(second.port, token, "get_message", { message_id })).body);
+    assert.deepEqual(
+      read.map(({ state, sequence, idempotency_key }) => ({ state, sequence, idempotency_key })),
+      [1, 2, 3].map((n) => ({ state: "queued", sequence: n, idempotency_key: `k${n}` })),
+    );
+    const retry = (await call(second.port, token, "send_to_primary", message(2))).body;
+    assert.deepEqual([retry.message_id, retry.duplicate], [ids[1], true]);
+  } finally {
+    await second.stop();
+  }
+
+  const db = new DatabaseSync(path.join(dataDir, STORE_FILE), { readOnly: true });
+  try {
+    assert.equal((db.prepare("SELECT COUNT(*) AS n FROM messages").get() as { n: number }).n, 3);
+  } finally {
+    db.close();
   }
 });

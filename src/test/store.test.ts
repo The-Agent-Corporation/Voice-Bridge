@@ -3,7 +3,15 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { after, test } from "node:test";
 import { resolveStoredPrimary } from "../primary.js";
-import { BRIEFING_EVENTS_PER_TYPE, openStore, STORE_FILE, type EventType, type NewEvent, type Store } from "../store.js";
+import {
+  BRIEFING_EVENTS_PER_TYPE,
+  openStore,
+  STORE_FILE,
+  type EventType,
+  type NewEvent,
+  type NewMessage,
+  type Store,
+} from "../store.js";
 import { removeTempDirs, tempDir } from "./helpers.js";
 
 after(removeTempDirs);
@@ -13,7 +21,10 @@ const ALL_TABLES = [
   "events",
   "inbox_items",
   "inbox_notifications",
-  "pin_audit", "primary_pins",
+  "message_transitions",
+  "messages",
+  "pin_audit",
+  "primary_pins",
   "projects",
   "sessions",
   "source_watermarks",
@@ -23,7 +34,7 @@ test("a store with an unknown schema version refuses to open and is left untouch
   const dataDir = tempDir();
   const file = path.join(dataDir, STORE_FILE);
   const seed = new DatabaseSync(file);
-  seed.exec("PRAGMA user_version = 7;");
+  seed.exec("PRAGMA user_version = 8;");
   seed.close();
 
   assert.throws(() => openStore(dataDir), { code: "store_version_unsupported" });
@@ -31,7 +42,7 @@ test("a store with an unknown schema version refuses to open and is left untouch
   const db = new DatabaseSync(file);
   try {
     assert.deepEqual(db.prepare("SELECT name FROM sqlite_master").all(), []);
-    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 7);
+    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 8);
   } finally {
     db.close();
   }
@@ -66,7 +77,7 @@ test("a version 1 store gains the sessions, pin, event, briefing and inbox table
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 6);
+    assert.equal(userVersion(db), 7);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
@@ -126,7 +137,7 @@ test("a version 2 store gains the pin, event, briefing and inbox tables and keep
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 6);
+    assert.equal(userVersion(db), 7);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
@@ -189,7 +200,7 @@ test("a version 3 store gains the event, briefing and inbox tables and keeps its
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 6);
+    assert.equal(userVersion(db), 7);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
@@ -222,7 +233,7 @@ test("a version 4 store gains the briefings and inbox tables and keeps its event
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 6);
+    assert.equal(userVersion(db), 7);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
@@ -255,7 +266,43 @@ test("a version 5 store gains the inbox tables and keeps its events and briefing
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 6);
+    assert.equal(userVersion(db), 7);
+    assert.deepEqual(tableNames(db), ALL_TABLES);
+  } finally {
+    db.close();
+  }
+});
+
+test("a version 6 store gains the message tables and keeps its inbox", () => {
+  const dataDir = tempDir();
+  const file = path.join(dataDir, STORE_FILE);
+  const seeded = openStore(dataDir);
+  seeded.upsert({ project_id: "kept", display_name: "Kept", canonical_path: "/x/kept" });
+  seeded.ingestEvent(storedEvent("kept", 1, "user_question"), {
+    origin_question_id: null,
+    summary: "Ship it?",
+    type: null,
+    priority: null,
+    withdrawn: false,
+  });
+  seeded.close();
+  const seed = new DatabaseSync(file);
+  seed.exec("DROP TABLE message_transitions; DROP TABLE messages; PRAGMA user_version = 6;");
+  seed.close();
+
+  for (let open = 0; open < 2; open++) {
+    const store = openStore(dataDir);
+    try {
+      assert.deepEqual(store.listInbox({}).map((item) => item.summary), ["Ship it?"]);
+      assert.equal(store.findMessageByKey("k"), undefined);
+    } finally {
+      store.close();
+    }
+  }
+
+  const db = new DatabaseSync(file);
+  try {
+    assert.equal(userVersion(db), 7);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
@@ -400,5 +447,118 @@ test("re-pinning replaces the pin and audits each pin", () => {
     );
   } finally {
     db.close();
+  }
+});
+
+function newMessage(key: string, overrides: Partial<NewMessage> = {}): NewMessage {
+  return {
+    message_id: `m-${key}`,
+    project_id: "p",
+    session_id: "codex:s1",
+    mode: "next_turn",
+    body: "run the tests",
+    approve_queue: true,
+    idempotency_key: key,
+    decision: { deliverable: false, state: "queued", reason: "awaiting_controllable_session", detail: "saved" },
+    created_at: "2026-10-24T12:00:00.000Z",
+    expires_at: "2026-10-25T12:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function messageRows(dataDir: string): number {
+  const db = new DatabaseSync(path.join(dataDir, STORE_FILE), { readOnly: true });
+  try {
+    return (db.prepare("SELECT COUNT(*) AS n FROM messages").get() as { n: number }).n;
+  } finally {
+    db.close();
+  }
+}
+
+test("a repeated idempotency key returns the stored message, and a different request under it writes nothing", () => {
+  const { store, dataDir } = seededStore();
+  try {
+    const first = store.createMessage(newMessage("k"));
+    assert.equal(first.duplicate, false);
+    assert.deepEqual(
+      first.message.transitions.map((t) => [t.state, t.reason]),
+      [
+        ["accepted", "authenticated"],
+        ["queued", "awaiting_controllable_session"],
+      ],
+    );
+    const again = store.createMessage(newMessage("k", { message_id: "m-other" }));
+    assert.equal(again.duplicate, true);
+    assert.equal(again.message.message_id, "m-k");
+    assert.throws(() => store.createMessage(newMessage("k", { body: "something else" })), { code: "idempotency_conflict" });
+    assert.equal(messageRows(dataDir), 1);
+  } finally {
+    store.close();
+  }
+});
+
+test("message sequences count from 1 in each project", () => {
+  const { store } = seededStore();
+  try {
+    store.upsert({ project_id: "q", display_name: "Q", canonical_path: "/x/q" });
+    const sequences = ["a", "b", "c"].map((key) => store.createMessage(newMessage(key)).message.sequence);
+    assert.deepEqual(sequences, [1, 2, 3]);
+    assert.equal(store.createMessage(newMessage("d", { project_id: "q" })).message.sequence, 1);
+  } finally {
+    store.close();
+  }
+});
+
+test("a deliverable message is claimed for delivery, and later ones wait behind it", () => {
+  const { store } = seededStore();
+  try {
+    const first = store.createMessage(newMessage("a", { decision: { deliverable: true } })).message;
+    assert.deepEqual(
+      first.transitions.map((t) => `${t.state}/${t.reason}`),
+      ["accepted/authenticated", "queued/awaiting_delivery", "delivering/handed_to_adapter"],
+    );
+    assert.equal(store.createMessage(newMessage("b", { decision: { deliverable: true } })).message.reason, "awaiting_earlier_messages");
+    store.expireMessages("2030-01-01T00:00:00.000Z");
+    assert.equal(store.getMessage("m-a")?.state, "delivering");
+  } finally {
+    store.close();
+  }
+});
+
+test("a transition from the wrong state changes nothing and records no transition", () => {
+  const { store } = seededStore();
+  try {
+    store.createMessage(newMessage("k"));
+    const to = { state: "delivered", reason: "adapter_receipt", detail: "x" } as const;
+    const result = store.transitionMessage("m-k", "failed", to, "2026-10-24T13:00:00.000Z");
+    assert.equal(result?.changed, false);
+    assert.equal(result?.message.state, "queued");
+    assert.equal(result?.message.transitions.length, 2);
+    assert.equal(store.transitionMessage("m-none", "queued", to, "2026-10-24T13:00:00.000Z"), undefined);
+  } finally {
+    store.close();
+  }
+});
+
+test("only queued messages past their expiry expire", () => {
+  const { store } = seededStore();
+  try {
+    store.createMessage(newMessage("due"));
+    store.createMessage(newMessage("later", { expires_at: "2026-10-26T12:00:00.000Z" }));
+    store.createMessage(
+      newMessage("failed", { decision: { deliverable: false, state: "failed", reason: "not_controllable", detail: "saved" } }),
+    );
+    store.expireMessages("2026-10-25T12:00:00.000Z");
+    assert.equal(store.getMessage("m-due")?.state, "expired");
+    assert.equal(store.getMessage("m-due")?.reason, "expired_unsent");
+    assert.deepEqual(store.getMessage("m-due")?.transitions.at(-1), {
+      state: "expired",
+      reason: "expired_unsent",
+      at: "2026-10-25T12:00:00.000Z",
+    });
+    assert.equal(store.getMessage("m-later")?.state, "queued");
+    assert.equal(store.getMessage("m-failed")?.state, "failed");
+  } finally {
+    store.close();
   }
 });

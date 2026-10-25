@@ -4,7 +4,7 @@ import type { DiscoveredSession, Provider } from "./adapters/types.js";
 import { BridgeError } from "./errors.js";
 
 export const STORE_FILE = "bridge.sqlite";
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 const SQLITE_CONSTRAINT_UNIQUE = 2067;
 
 export interface Project {
@@ -164,6 +164,117 @@ export interface InboxNotification {
   created_at: string;
 }
 
+/**
+ * The message states of docs/PRD.md Appendix A but `draft`, which the bridge never stores, plus
+ * `delivering`: handed to the adapter, outcome not yet known, so neither cancel nor expiry may touch it.
+ * This build writes `accepted`, `queued`, `delivering`, `delivered`, `failed`, `expired` and `cancelled`.
+ */
+export const MESSAGE_STATES = [
+  "accepted",
+  "queued",
+  "delivering",
+  "delivered",
+  "acknowledged",
+  "started",
+  "completed",
+  "failed",
+  "expired",
+  "cancelled",
+] as const;
+
+export type MessageState = (typeof MESSAGE_STATES)[number];
+
+export const MESSAGE_MODES = ["next_turn", "steer"] as const;
+
+export type MessageMode = (typeof MESSAGE_MODES)[number];
+
+/** The machine reason recorded with each state; `detail` carries the human sentence. */
+export type MessageReason =
+  | "authenticated"
+  | "ambiguous_owner"
+  | "not_controllable"
+  | "unsupported_capability"
+  | "delivery_failed"
+  | "awaiting_controllable_session"
+  | "awaiting_earlier_messages"
+  | "awaiting_delivery"
+  | "handed_to_adapter"
+  | "adapter_receipt"
+  | "cancelled_by_user"
+  | "expired_unsent";
+
+export interface MessageChange {
+  state: MessageState;
+  reason: MessageReason;
+  detail: string;
+  provider_ref?: string;
+}
+
+export interface MessageTransition {
+  state: MessageState;
+  reason: MessageReason;
+  at: string;
+}
+
+export interface StoredMessage {
+  message_id: string;
+  project_id: string;
+  /** The primary the route named when the message was sent; null when it named none. */
+  session_id: string | null;
+  /** 1, 2, 3, … per project, in send order. */
+  sequence: number;
+  mode: MessageMode;
+  body: string;
+  approve_queue: boolean;
+  idempotency_key: string;
+  state: MessageState;
+  reason: MessageReason;
+  detail: string;
+  provider_ref: string | null;
+  created_at: string;
+  updated_at: string;
+  expires_at: string;
+  /** Oldest first, starting with `accepted`. */
+  transitions: MessageTransition[];
+}
+
+export interface NewMessage {
+  message_id: string;
+  project_id: string;
+  session_id: string | null;
+  mode: MessageMode;
+  body: string;
+  approve_queue: boolean;
+  idempotency_key: string;
+  /**
+   * The routing decision. `deliverable` stores `delivering`, through `queued` with `awaiting_delivery`,
+   * or `queued` with `awaiting_earlier_messages` when the project already has a queued or delivering
+   * message, which must go first; any other decision is stored as given.
+   */
+  decision: { deliverable: true } | { deliverable: false; state: MessageState; reason: MessageReason; detail: string };
+  created_at: string;
+  expires_at: string;
+}
+
+/** The fields a retry under the same idempotency key must repeat. */
+export type MessageIdentity = Pick<NewMessage, "project_id" | "body" | "mode" | "approve_queue" | "idempotency_key">;
+
+/** Returns `stored` when `request` repeats it; a different request under its key throws `idempotency_conflict`. */
+export function matchDuplicateMessage(stored: StoredMessage, request: MessageIdentity): StoredMessage {
+  if (
+    stored.project_id !== request.project_id ||
+    stored.body !== request.body ||
+    stored.mode !== request.mode ||
+    stored.approve_queue !== request.approve_queue
+  ) {
+    throw new BridgeError(
+      "idempotency_conflict",
+      `idempotency_key ${request.idempotency_key} already names message ${stored.message_id}, sent with other fields`,
+    );
+  }
+  return stored;
+}
+
 export interface TurnState {
   session_id: string;
   type: (typeof TURN_EVENT_TYPES)[number];
@@ -221,6 +332,26 @@ export interface Store {
   dismissInboxQuestion(questionId: string): { item: InboxItem; dismissed: boolean } | undefined;
   /** In emission order. */
   listInboxNotifications(): InboxNotification[];
+  findMessageByKey(idempotencyKey: string): StoredMessage | undefined;
+  getMessage(messageId: string): StoredMessage | undefined;
+  /**
+   * Stores the message with the next sequence of its project, its `accepted` transition and its decided
+   * state, in one transaction. A stored message under the same key is returned as a duplicate when its
+   * project, body, mode and approve_queue match; otherwise this throws `idempotency_conflict` and writes nothing.
+   */
+  createMessage(message: NewMessage): { message: StoredMessage; duplicate: boolean };
+  /**
+   * Moves the message from `from` to `to` and records the transition, in one transaction. A message in
+   * any other state is left as it is, with `changed: false`. Undefined when no message has the id.
+   */
+  transitionMessage(
+    messageId: string,
+    from: MessageState,
+    to: MessageChange,
+    at: string,
+  ): { message: StoredMessage; changed: boolean } | undefined;
+  /** Moves every queued message whose `expires_at` is at or before `now` to `expired`, in one transaction. */
+  expireMessages(now: string): void;
   close(): void;
 }
 
@@ -339,14 +470,48 @@ const INBOX_TABLES = `
   );
 `;
 
+/**
+ * The state CHECK lists every state, so later tickets need no table rebuild. The sequence orders a
+ * project's messages, which keeps each of its sessions' messages in order. Transitions are append-only
+ * with no foreign keys, like `pin_audit`.
+ */
+const MESSAGE_TABLES = `
+  CREATE TABLE IF NOT EXISTS messages (
+    message_id      TEXT PRIMARY KEY,
+    project_id      TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+    session_id      TEXT,
+    sequence        INTEGER NOT NULL CHECK (sequence >= 1),
+    mode            TEXT NOT NULL CHECK (mode IN (${MESSAGE_MODES.map((mode) => `'${mode}'`).join(", ")})),
+    body            TEXT NOT NULL,
+    approve_queue   INTEGER NOT NULL CHECK (approve_queue IN (0, 1)),
+    idempotency_key TEXT NOT NULL UNIQUE,
+    state           TEXT NOT NULL CHECK (state IN (${MESSAGE_STATES.map((state) => `'${state}'`).join(", ")})),
+    reason          TEXT NOT NULL,
+    detail          TEXT NOT NULL,
+    provider_ref    TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    expires_at      TEXT NOT NULL,
+    UNIQUE (project_id, sequence)
+  );
+  CREATE TABLE IF NOT EXISTS message_transitions (
+    transition_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id    TEXT NOT NULL,
+    state         TEXT NOT NULL,
+    reason        TEXT NOT NULL,
+    at            TEXT NOT NULL
+  );
+`;
+
 /** Tables each known version still lacks; every step only adds tables and leaves stored rows alone. */
 const MIGRATIONS: Record<number, string> = {
-  0: PROJECTS_TABLE + SESSIONS_TABLE + PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES + BRIEFINGS_TABLE + INBOX_TABLES,
-  1: SESSIONS_TABLE + PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES + BRIEFINGS_TABLE + INBOX_TABLES,
-  2: PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES + BRIEFINGS_TABLE + INBOX_TABLES,
-  3: EVENT_TABLES + BRIEFINGS_TABLE + INBOX_TABLES,
-  4: BRIEFINGS_TABLE + INBOX_TABLES,
-  5: INBOX_TABLES,
+  0: PROJECTS_TABLE + SESSIONS_TABLE + PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES + BRIEFINGS_TABLE + INBOX_TABLES + MESSAGE_TABLES,
+  1: SESSIONS_TABLE + PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES + BRIEFINGS_TABLE + INBOX_TABLES + MESSAGE_TABLES,
+  2: PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES + BRIEFINGS_TABLE + INBOX_TABLES + MESSAGE_TABLES,
+  3: EVENT_TABLES + BRIEFINGS_TABLE + INBOX_TABLES + MESSAGE_TABLES,
+  4: BRIEFINGS_TABLE + INBOX_TABLES + MESSAGE_TABLES,
+  5: INBOX_TABLES + MESSAGE_TABLES,
+  6: MESSAGE_TABLES,
 };
 
 function inTransaction<T>(db: DatabaseSync, work: () => T): T {
@@ -528,6 +693,35 @@ export function openStore(dataDir: string): Store {
   );
   const notifications = db.prepare("SELECT * FROM inbox_notifications ORDER BY notification_id");
 
+  const messageById = db.prepare("SELECT * FROM messages WHERE message_id = ?");
+  const messageByKey = db.prepare("SELECT * FROM messages WHERE idempotency_key = ?");
+  const transitionsOf = db.prepare(
+    "SELECT state, reason, at FROM message_transitions WHERE message_id = ? ORDER BY transition_id",
+  );
+  const nextSequence = db.prepare(
+    "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM messages WHERE project_id = ?",
+  );
+  const pendingInProject = db.prepare(
+    "SELECT 1 FROM messages WHERE project_id = ? AND state IN ('queued', 'delivering') LIMIT 1",
+  );
+  const insertMessage = db.prepare(`
+    INSERT INTO messages (message_id, project_id, session_id, sequence, mode, body, approve_queue, idempotency_key,
+                          state, reason, detail, created_at, updated_at, expires_at)
+    VALUES (:message_id, :project_id, :session_id, :sequence, :mode, :body, :approve_queue, :idempotency_key,
+            :state, :reason, :detail, :created_at, :created_at, :expires_at)
+  `);
+  const insertTransition = db.prepare(
+    "INSERT INTO message_transitions (message_id, state, reason, at) VALUES (?, ?, ?, ?)",
+  );
+  const updateMessageState = db.prepare(`
+    UPDATE messages SET state = :state, reason = :reason, detail = :detail,
+                        provider_ref = COALESCE(:provider_ref, provider_ref), updated_at = :at
+    WHERE message_id = :message_id AND state = :from
+  `);
+  const expiredMessages = db.prepare(
+    "SELECT message_id FROM messages WHERE state = 'queued' AND expires_at <= ? ORDER BY project_id, sequence",
+  );
+
   /** A question with no origin id is identified by its event alone, so it always creates an item. */
   const applyQuestion = (eventId: number, event: NewEvent, question: QuestionFields) => {
     const known =
@@ -573,6 +767,35 @@ export function openStore(dataDir: string): Store {
       observed_at: event.observed_at,
     });
     if (!question.withdrawn) insertNotification.run(questionId, event.project_id, new Date().toISOString());
+  };
+
+  const storedMessage = (row: Record<string, unknown> | undefined): StoredMessage | undefined =>
+    row && {
+      ...(row as unknown as Omit<StoredMessage, "approve_queue" | "transitions">),
+      approve_queue: row.approve_queue === 1,
+      transitions: transitionsOf.all(row.message_id as string).map((t) => ({ ...t })) as unknown as MessageTransition[],
+    };
+  const getMessage = (messageId: string) => storedMessage(messageById.get(messageId));
+  const findMessageByKey = (key: string) => storedMessage(messageByKey.get(key));
+
+  const EXPIRED: MessageChange = {
+    state: "expired",
+    reason: "expired_unsent",
+    detail: "the message was not delivered before it expired",
+  };
+  /** Updates the message only if it is still in `from`, and records the transition when it did. */
+  const applyTransition = (messageId: string, from: MessageState, to: MessageChange, at: string): boolean => {
+    const { changes } = updateMessageState.run({
+      message_id: messageId,
+      from,
+      state: to.state,
+      reason: to.reason,
+      detail: to.detail,
+      provider_ref: to.provider_ref ?? null,
+      at,
+    });
+    if (changes > 0) insertTransition.run(messageId, to.state, to.reason, at);
+    return changes > 0;
   };
 
   const getById = (projectId: string) => byId.get(projectId) as Project | undefined;
@@ -724,6 +947,55 @@ export function openStore(dataDir: string): Store {
     },
     listInboxNotifications() {
       return notifications.all().map((row) => ({ ...row })) as unknown as InboxNotification[];
+    },
+    findMessageByKey,
+    getMessage,
+    createMessage(message) {
+      return inTransaction(db, () => {
+        const stored = findMessageByKey(message.idempotency_key);
+        if (stored) return { message: matchDuplicateMessage(stored, message), duplicate: true };
+        const { decision } = message;
+        const headOfQueue = decision.deliverable && !pendingInProject.get(message.project_id);
+        const { state, reason, detail }: MessageChange = !decision.deliverable
+          ? decision
+          : headOfQueue
+            ? { state: "delivering", reason: "handed_to_adapter", detail: "handing the message to the primary session" }
+            : { state: "queued", reason: "awaiting_earlier_messages", detail: "an earlier message in this project is still pending" };
+        const { sequence } = nextSequence.get(message.project_id) as { sequence: number };
+        insertMessage.run({
+          message_id: message.message_id,
+          project_id: message.project_id,
+          session_id: message.session_id,
+          sequence,
+          mode: message.mode,
+          body: message.body,
+          approve_queue: message.approve_queue ? 1 : 0,
+          idempotency_key: message.idempotency_key,
+          state,
+          reason,
+          detail,
+          created_at: message.created_at,
+          expires_at: message.expires_at,
+        });
+        insertTransition.run(message.message_id, "accepted", "authenticated", message.created_at);
+        if (headOfQueue) insertTransition.run(message.message_id, "queued", "awaiting_delivery", message.created_at);
+        insertTransition.run(message.message_id, state, reason, message.created_at);
+        return { message: getMessage(message.message_id)!, duplicate: false };
+      });
+    },
+    transitionMessage(messageId, from, to, at) {
+      return inTransaction(db, () => {
+        const changed = applyTransition(messageId, from, to, at);
+        const message = getMessage(messageId);
+        return message && { message, changed };
+      });
+    },
+    expireMessages(now) {
+      inTransaction(db, () => {
+        for (const { message_id } of expiredMessages.all(now) as { message_id: string }[]) {
+          applyTransition(message_id, "queued", EXPIRED, now);
+        }
+      });
     },
     close() {
       db.close();

@@ -13,6 +13,10 @@ const ADAPTERS: Record<Provider, (home: string) => AgentAdapter> = {
   "claude-code": createClaudeCodeAdapter,
 };
 
+export function adapterFor(provider: Provider, homes: ProviderHomes): AgentAdapter {
+  return ADAPTERS[provider](providerHomeDir(provider, homes[provider]));
+}
+
 export interface DiscoveryCounts {
   sessions: number;
   skipped_records: number;
@@ -95,7 +99,7 @@ export async function discoverProjectSessions(store: Store, project: Project, ho
   const config = readVoiceConfig(project.canonical_path);
   const worktrees = projectWorktrees(store, project);
   const results = await Promise.all(
-    config.allowed_providers.map((provider) => ADAPTERS[provider](providerHomeDir(provider, homes[provider])).discoverSessions(worktrees)),
+    config.allowed_providers.map((provider) => adapterFor(provider, homes).discoverSessions(worktrees)),
   );
   const sessions = uniqueSessions(results.flatMap((result) => result.sessions));
   store.replaceSessions(project.project_id, sessions);
