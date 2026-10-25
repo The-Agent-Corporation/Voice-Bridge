@@ -27,8 +27,10 @@ const ALL_TABLES = [
   "message_answers",
   "message_transitions",
   "messages",
+  "pending_events",
   "pin_audit",
   "primary_pins",
+  "project_heads",
   "projects",
   "sessions",
   "source_watermarks",
@@ -39,7 +41,7 @@ test("a store with an unknown schema version refuses to open and is left untouch
   const dataDir = tempDir();
   const file = path.join(dataDir, STORE_FILE);
   const seed = new DatabaseSync(file);
-  seed.exec("PRAGMA user_version = 10;");
+  seed.exec("PRAGMA user_version = 11;");
   seed.close();
 
   assert.throws(() => openStore(dataDir), { code: "store_version_unsupported" });
@@ -47,7 +49,7 @@ test("a store with an unknown schema version refuses to open and is left untouch
   const db = new DatabaseSync(file);
   try {
     assert.deepEqual(db.prepare("SELECT name FROM sqlite_master").all(), []);
-    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 10);
+    assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 11);
   } finally {
     db.close();
   }
@@ -82,7 +84,7 @@ test("a version 1 store gains the sessions, pin, event, briefing and inbox table
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 9);
+    assert.equal(userVersion(db), 10);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
@@ -142,7 +144,7 @@ test("a version 2 store gains the pin, event, briefing and inbox tables and keep
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 9);
+    assert.equal(userVersion(db), 10);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
@@ -205,7 +207,7 @@ test("a version 3 store gains the event, briefing and inbox tables and keeps its
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 9);
+    assert.equal(userVersion(db), 10);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
@@ -218,6 +220,7 @@ test("a version 4 store gains the briefings and inbox tables and keeps its event
   const seeded = openStore(dataDir);
   seeded.upsert({ project_id: "kept", display_name: "Kept", canonical_path: "/x/kept" });
   seeded.ingestEvent(storedEvent("kept", 1));
+  seeded.markEventsProcessed("kept");
   seeded.close();
   const seed = new DatabaseSync(file);
   seed.exec("DROP TABLE briefings; PRAGMA user_version = 4;");
@@ -238,7 +241,7 @@ test("a version 4 store gains the briefings and inbox tables and keeps its event
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 9);
+    assert.equal(userVersion(db), 10);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
@@ -251,6 +254,7 @@ test("a version 5 store gains the inbox tables and keeps its events and briefing
   const seeded = openStore(dataDir);
   seeded.upsert({ project_id: "kept", display_name: "Kept", canonical_path: "/x/kept" });
   seeded.ingestEvent(storedEvent("kept", 1));
+  seeded.markEventsProcessed("kept");
   const briefing = { project_id: "kept", content_hash: "abc", text: "# Kept", generated_at: "2026-10-24T12:00:00.000Z" };
   seeded.saveBriefing(briefing);
   seeded.close();
@@ -271,7 +275,7 @@ test("a version 5 store gains the inbox tables and keeps its events and briefing
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 9);
+    assert.equal(userVersion(db), 10);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
@@ -307,7 +311,7 @@ test("a version 6 store gains the message tables and keeps its inbox", () => {
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 9);
+    assert.equal(userVersion(db), 10);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
@@ -340,10 +344,57 @@ test("a version 7 store gains the message_answers, controlled session and lease 
 
   const db = new DatabaseSync(file);
   try {
-    assert.equal(userVersion(db), 9);
+    assert.equal(userVersion(db), 10);
     assert.deepEqual(tableNames(db), ALL_TABLES);
   } finally {
     db.close();
+  }
+});
+
+test("a version 9 store gains the pending event and HEAD tables and keeps its events processed", () => {
+  const dataDir = tempDir();
+  const file = path.join(dataDir, STORE_FILE);
+  const seeded = openStore(dataDir);
+  seeded.upsert({ project_id: "kept", display_name: "Kept", canonical_path: "/x/kept" });
+  seeded.ingestEvent(storedEvent("kept", 1));
+  seeded.close();
+  const seed = new DatabaseSync(file);
+  seed.exec("DROP TABLE pending_events; DROP TABLE project_heads; PRAGMA user_version = 9;");
+  seed.close();
+
+  for (let open = 0; open < 2; open++) {
+    const store = openStore(dataDir);
+    try {
+      assert.equal(store.highestProcessedEventId("kept"), 1);
+      assert.equal(store.countPendingEvents("kept"), 0);
+      assert.equal(store.getHead("kept"), undefined);
+    } finally {
+      store.close();
+    }
+  }
+
+  const db = new DatabaseSync(file);
+  try {
+    assert.equal(userVersion(db), 10);
+    assert.deepEqual(tableNames(db), ALL_TABLES);
+  } finally {
+    db.close();
+  }
+});
+
+test("a HEAD observation is replaced only by one observed at the same time or later", () => {
+  const store = openStore(tempDir());
+  try {
+    store.upsert({ project_id: "p", display_name: "P", canonical_path: "/x/p" });
+    const newer = { project_id: "p", head: "b".repeat(40), error: null, observed_at: "2026-10-25T12:00:02.000Z" };
+    store.recordHead(newer);
+    store.recordHead({ project_id: "p", head: "a".repeat(40), error: null, observed_at: "2026-10-25T12:00:01.000Z" });
+    assert.deepEqual(store.getHead("p"), newer);
+    const failed = { project_id: "p", head: null, error: "fatal: not a git repository", observed_at: "2026-10-25T12:00:03.000Z" };
+    store.recordHead(failed);
+    assert.deepEqual(store.getHead("p"), failed);
+  } finally {
+    store.close();
   }
 });
 
@@ -369,6 +420,11 @@ test("briefing events are processed ones only, newest first and capped per type"
     for (let sequence = 1; sequence <= total; sequence++) store.ingestEvent(storedEvent("p", sequence));
     store.ingestEvent(storedEvent("p", total + 1, "blocker"));
     store.ingestEvent(storedEvent("p", total + 3, "blocker"));
+    assert.deepEqual(store.recentBriefingEvents("p"), []);
+    assert.equal(store.highestProcessedEventId("p"), null);
+    assert.equal(store.countPendingEvents("p"), total + 2);
+    assert.equal(store.markEventsProcessed("p"), total + 2);
+    assert.equal(store.countPendingEvents("p"), 0);
 
     const events = store.recentBriefingEvents("p");
     const progress = events.filter((event) => event.type === "progress");

@@ -1,5 +1,5 @@
 import { PROVIDERS } from "./adapters/types.js";
-import { getProjectStatus, type ProjectStatus } from "./status.js";
+import { getProjectStatus, latestRecordedCommit, type ProjectStatus } from "./status.js";
 import { BRIEFING_EVENTS_PER_TYPE, type BriefingEventRow, type Store } from "./store.js";
 
 /** The briefing's `## ` headings, in file order (docs/PRD.md §6.1). */
@@ -38,7 +38,6 @@ export const BUDGET_LEVELS: readonly BudgetLevel[] = [
 
 const DISPLAY_NAME_CHARS = 80;
 const OMITTED = "(omitted to fit the briefing budget)";
-const COMMIT_PATTERN = /^[0-9a-f]{7,64}$/;
 /** Shorter identifiers are left alone so a short test id cannot mangle ordinary words. */
 const MIN_SCRUBBED_ID_LENGTH = 8;
 
@@ -187,9 +186,6 @@ function collectFacts(state: BriefingState): Facts {
 
   const agentEvent = parsed.find((event) => event.type.startsWith("session_") || event.type.startsWith("turn_"));
   const agentProvider = agentEvent?.session_id ? providerOf(agentEvent.session_id) : undefined;
-  const commit = ofType("git_commit")
-    .map((event) => stringField(event.fields, "commit"))
-    .find((value): value is string => value !== null && COMMIT_PATTERN.test(value));
 
   return {
     scrub,
@@ -206,7 +202,7 @@ function collectFacts(state: BriefingState): Facts {
     questions: pendingQuestions(questionEvents, ofType("user_decision"), clean),
     questionsAtCap: questionEvents.length >= BRIEFING_EVENTS_PER_TYPE,
     agent: agentProvider ?? "not identified",
-    commit: commit ?? null,
+    commit: latestRecordedCommit(state.events),
   };
 }
 

@@ -5,7 +5,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import { PACKAGE_ROOT } from "../buildId.js";
-import { runGit } from "../git.js";
+import { readHead, runGit } from "../git.js";
+import type { HeadReader } from "../reconcile.js";
 
 export const DAEMON_ENTRY = path.join(PACKAGE_ROOT, "dist", "daemon.js");
 export const CLI_ENTRY = path.join(PACKAGE_ROOT, "dist", "cli.js");
@@ -46,6 +47,31 @@ export function makeRepo(config: unknown = PRD_SAMPLE, { git = true } = {}): str
   if (init && !init.ok) throw new Error(`git init failed in ${dir}: ${init.detail}`);
   writeVoiceConfig(dir, config);
   return dir;
+}
+
+/** Makes an empty commit in `repo`, with no hook posting an event; returns its hash. */
+export function commit(repo: string): string {
+  const made = runGit(["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-q", "-m", "x"], repo);
+  if (!made.ok) throw new Error(`git commit failed in ${repo}: ${made.detail}`);
+  const head = runGit(["rev-parse", "HEAD"], repo);
+  if (!head.ok) throw new Error(`git rev-parse failed in ${repo}: ${head.detail}`);
+  return head.stdout;
+}
+
+/** A real HEAD reader that waits for `release()` before reading. */
+export function heldReader(): { readHead: HeadReader; release(): void; started(): number } {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  let started = 0;
+  return {
+    readHead: async (cwd) => {
+      started++;
+      await gate;
+      return readHead(cwd);
+    },
+    release,
+    started: () => started,
+  };
 }
 
 /** Empty provider homes, so a daemon under test never reads the developer's real sessions. */

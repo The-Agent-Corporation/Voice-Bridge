@@ -7,6 +7,7 @@ import { after, before, describe, mock, test } from "node:test";
 import { resolveProviderHomes } from "../adapters/homes.js";
 import { startBridge, type RunningBridge } from "../app.js";
 import { SECTION_HEADINGS } from "../briefing.js";
+import { Reconciler } from "../reconcile.js";
 import { createBridgeServer } from "../server.js";
 import { openStore } from "../store.js";
 import { readClientToken } from "../token.js";
@@ -211,7 +212,13 @@ test("an ingest whose briefing refresh throws still reports the committed event"
   store.saveBriefing = () => {
     throw new Error("disk full");
   };
-  const server = createBridgeServer({ store, token: "t", buildId: null, providerHomes: resolveProviderHomes(fixtureHomes()) });
+  const server = createBridgeServer({
+    store,
+    token: "t",
+    buildId: null,
+    providerHomes: resolveProviderHomes(fixtureHomes()),
+    reconciler: new Reconciler(store),
+  });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address() as AddressInfo;
   const errors = mock.method(console, "error", () => {});

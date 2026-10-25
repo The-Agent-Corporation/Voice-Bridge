@@ -40,7 +40,9 @@ const STATUS_BY_CODE = {
   provider_start_failed: 502,
   provider_not_installed: 503,
   build_id_unavailable: 503,
+  bridge_closing: 503,
   store_version_unsupported: 500,
+  invalid_reconcile_interval: 500,
   insecure_token_file: 500,
   empty_token_file: 500,
 } as const;

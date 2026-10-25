@@ -144,6 +144,7 @@ test("the inbox and the briefing give the same events the same question ids", ()
   ask({ question_id: "gone", summary: "withdraw me" }, { second: 7 });
   ask({ question_id: "gone", withdrawn: true }, { second: 8 });
 
+  store.markEventsProcessed("a");
   const text = renderBriefing(loadBriefingState(store, { project_id: "a", display_name: "a" }), {
     maxTokens: 2000,
     generatedAt: "2026-10-24T12:00:00.000Z",
@@ -200,6 +201,7 @@ test("a question first asked before the inbox existed keeps the briefing's id wh
   }).event_id;
   ask({ question_id: "q", summary: "asked again" }, { second: 3 });
 
+  store.markEventsProcessed("a");
   const text = renderBriefing(loadBriefingState(store, { project_id: "a", display_name: "a" }), {
     maxTokens: 2000,
     generatedAt: "2026-10-24T12:00:00.000Z",
