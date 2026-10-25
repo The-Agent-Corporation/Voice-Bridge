@@ -6,6 +6,7 @@ export type Freshness = "current" | "lagging" | "unverified" | "conflicted";
 export type FreshnessReason =
   | "no_events"
   | "sequence_gap"
+  | "head_unread"
   | "head_moved"
   | "head_unreadable"
   | "unprocessed_events"
@@ -17,8 +18,8 @@ export interface FreshnessInput {
   pendingEvents: number;
   /** The last HEAD read from the repository, if any read has happened. */
   head: HeadObservation | undefined;
-  /** The newest processed `git_commit`'s commit, as `latestRecordedCommit` reads it. */
-  recordedCommit: string | null;
+  /** The last stored processed `git_commit` with a well-formed commit, as `latestRecordedCommit` reads it. */
+  recordedCommit: RecordedCommit | null;
 }
 
 export interface ProjectStatus {
@@ -42,14 +43,23 @@ function commitOf(payload: string): string | null {
   }
 }
 
-/** The commit of the newest `git_commit` among `events` (newest first) that names a well-formed one. */
-export function latestRecordedCommit(events: readonly BriefingEventRow[]): string | null {
+export interface RecordedCommit {
+  commit: string;
+  event_id: number;
+}
+
+/**
+ * The `git_commit` among `events` stored last (highest event_id) that names a well-formed commit.
+ * Stored order, not `observed_at`: a client's clock must not let an old commit outrank a newer record.
+ */
+export function latestRecordedCommit(events: readonly BriefingEventRow[]): RecordedCommit | null {
+  let latest: RecordedCommit | null = null;
   for (const event of events) {
-    if (event.type !== "git_commit") continue;
+    if (event.type !== "git_commit" || (latest !== null && event.event_id < latest.event_id)) continue;
     const commit = commitOf(event.payload);
-    if (commit !== null) return commit;
+    if (commit !== null) latest = { commit, event_id: event.event_id };
   }
-  return null;
+  return latest;
 }
 
 function hasTurnConflict(states: readonly TurnState[]): boolean {
@@ -62,21 +72,26 @@ function hasTurnConflict(states: readonly TurnState[]): boolean {
   return [...bySession.values()].some((types) => types.size > 1);
 }
 
-/** A hook may record a short hash, so a recorded prefix of HEAD counts as the same commit. */
-export function headMoved(head: HeadObservation | undefined, recordedCommit: string | null): boolean {
+/**
+ * A hook may record a short hash, so a recorded prefix of HEAD counts as the same commit. A commit
+ * stored after the read began is newer evidence than the read, so the read cannot contradict it.
+ */
+export function headMoved(head: HeadObservation | undefined, recorded: RecordedCommit | null): boolean {
   if (!head || head.error !== null || head.head === null) return false;
-  return recordedCommit === null || !head.head.startsWith(recordedCommit);
+  if (recorded === null) return true;
+  return recorded.event_id <= head.events_through && !head.head.startsWith(recorded.commit);
 }
 
 /**
- * Every reason that holds is listed. Missing evidence (no events, a gap, a HEAD the store has not
- * recorded or cannot read) makes the project unverified; otherwise unprocessed events make it lagging,
- * ahead of a turn conflict they may resolve.
+ * Every reason that holds is listed. Missing evidence (no events, a gap, a HEAD never read, or one
+ * the store has not recorded or cannot read) makes the project unverified; otherwise unprocessed
+ * events make it lagging, ahead of a turn conflict they may resolve.
  */
 export function computeFreshness(input: FreshnessInput): Pick<ProjectStatus, "freshness" | "freshness_reasons"> {
   const holds: Record<FreshnessReason, boolean> = {
     no_events: input.watermarks.length === 0,
     sequence_gap: input.watermarks.some((row) => row.highest_stored > row.watermark),
+    head_unread: input.head === undefined,
     head_moved: headMoved(input.head, input.recordedCommit),
     head_unreadable: input.head !== undefined && input.head.error !== null,
     unprocessed_events: input.pendingEvents > 0,
@@ -84,7 +99,7 @@ export function computeFreshness(input: FreshnessInput): Pick<ProjectStatus, "fr
   };
   const reasons = (Object.keys(holds) as FreshnessReason[]).filter((reason) => holds[reason]);
   const freshness: Freshness =
-    holds.no_events || holds.sequence_gap || holds.head_moved || holds.head_unreadable
+    holds.no_events || holds.sequence_gap || holds.head_unread || holds.head_moved || holds.head_unreadable
       ? "unverified"
       : holds.unprocessed_events
         ? "lagging"

@@ -53,12 +53,15 @@ function removeOwnDaemonInfo(dataDir: string): void {
   }
 }
 
+/** Node runs a longer `setTimeout` after 1 ms instead. */
+const MAX_TIMER_MS = 2_147_483_647;
+
 function reconcileInterval(env: NodeJS.ProcessEnv): number {
   const value = env.VOICE_BRIDGE_RECONCILE_INTERVAL_MS;
   if (value === undefined) return DEFAULT_RECONCILE_INTERVAL_MS;
   const ms = /^\d+$/.test(value) ? Number(value) : NaN;
-  if (!Number.isSafeInteger(ms) || ms < 1) {
-    throw new BridgeError("invalid_reconcile_interval", `VOICE_BRIDGE_RECONCILE_INTERVAL_MS must be a whole number of milliseconds of at least 1, not ${JSON.stringify(value)}`);
+  if (!(ms >= 1 && ms <= MAX_TIMER_MS)) {
+    throw new BridgeError("invalid_reconcile_interval", `VOICE_BRIDGE_RECONCILE_INTERVAL_MS must be a whole number of milliseconds from 1 to ${MAX_TIMER_MS}, not ${JSON.stringify(value)}`);
   }
   return ms;
 }

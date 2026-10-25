@@ -64,6 +64,7 @@ describe("chat conversation over the bridge tools", () => {
   const register = async (projectId: string, displayName: string, objective?: string) => {
     const repo = makeRepo({ ...PRD_SAMPLE, project_id: projectId, display_name: displayName });
     await callTool("register_project", { path: repo });
+    await callTool("reconcile_project", { project_id: projectId });
     if (objective === undefined) return;
     sequence += 1;
     await callTool("ingest_event", {

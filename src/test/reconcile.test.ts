@@ -47,19 +47,53 @@ test("reconciling the same HEAD twice records one git_commit; a new commit recor
   }
 });
 
+test("a hook commit dated in the future does not outrank the HEAD reconciliation recorded after it", async () => {
+  const { store, repo } = registered();
+  const reconciler = new Reconciler(store);
+  try {
+    const hooked = commit(repo);
+    store.ingestEvent({
+      project_id: PROJECT,
+      session_id: "s1",
+      source: "hook",
+      source_event_id: "hook-1",
+      source_sequence: 1,
+      type: "git_commit",
+      payload: JSON.stringify({ commit: hooked }),
+      observed_at: "2099-01-01T00:00:00.000Z",
+    });
+    const head = commit(repo);
+    assert.notEqual((await reconciler.reconcile(PROJECT)).recorded_event_id, null);
+    const again = await reconciler.reconcile(PROJECT);
+    assert.equal(again.recorded_event_id, null);
+    assert.equal(again.status.freshness, "current");
+    assert.equal(reconcileEvents(store), 1);
+    assert.match(store.getBriefing(PROJECT)?.text ?? "", new RegExp(`^Commit: ${head}$`, "m"));
+  } finally {
+    await reconciler.stop();
+    store.close();
+  }
+});
+
 test("an event stored but not processed before a crash leaves the project lagging until startup reconciliation", async () => {
   const { store: crashed, repo, dataDir } = registered();
-  const hash = commit(repo);
-  crashed.ingestEvent({
-    project_id: PROJECT,
-    session_id: "s1",
-    source: "hook",
-    source_event_id: "hook-1",
-    source_sequence: 1,
-    type: "git_commit",
-    payload: JSON.stringify({ commit: hash }),
-    observed_at: "2026-10-25T12:00:00.000Z",
-  });
+  const hookCommit = (sequence: number, hash: string) =>
+    crashed.ingestEvent({
+      project_id: PROJECT,
+      session_id: "s1",
+      source: "hook",
+      source_event_id: `hook-${sequence}`,
+      source_sequence: sequence,
+      type: "git_commit",
+      payload: JSON.stringify({ commit: hash }),
+      observed_at: "2026-10-25T12:00:00.000Z",
+    });
+  // Before the crash: one commit hooked, processed and read back as HEAD; then a second hooked and stored only.
+  const first = commit(repo);
+  hookCommit(1, first);
+  crashed.markEventsProcessed(PROJECT);
+  crashed.recordHead({ project_id: PROJECT, head: first, error: null, observed_at: "2026-10-25T12:00:01.000Z", events_through: 1 });
+  hookCommit(2, commit(repo));
   crashed.close();
 
   const store = openStore(dataDir);
@@ -124,6 +158,31 @@ test("passes repeat on the interval and stop refuses further passes", async () =
   await assert.rejects(reconciler.reconcile(PROJECT), { code: "bridge_closing" });
   await assert.rejects(reconciler.observe(PROJECT), { code: "bridge_closing" });
   store.close();
+});
+
+test("a round whose project list fails is logged and the next round still runs", async (t) => {
+  const { store, repo } = registered();
+  const logged = t.mock.method(console, "error", () => {});
+  let failures = 2;
+  const flaky: Store = {
+    ...store,
+    list: () => {
+      if (failures-- > 0) throw new Error("database is locked");
+      return store.list();
+    },
+  };
+  const reconciler = new Reconciler(flaky, { intervalMs: 20 });
+  try {
+    await reconciler.start();
+    commit(repo);
+    const deadline = Date.now() + 2_000;
+    while (reconcileEvents(store) === 0 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(reconcileEvents(store), 1);
+    assert.match(String(logged.mock.calls[0]?.arguments[0]), /could not list projects: database is locked/);
+  } finally {
+    await reconciler.stop();
+    store.close();
+  }
 });
 
 test("an unknown project is refused before git runs", async () => {

@@ -7,6 +7,7 @@ import { resolveProviderHomes } from "../adapters/homes.js";
 import { startBridge } from "../app.js";
 import { RECONCILE_SOURCE, Reconciler } from "../reconcile.js";
 import { createBridgeServer } from "../server.js";
+import { getProjectStatus } from "../status.js";
 import { openStore, type Store } from "../store.js";
 import { readClientToken } from "../token.js";
 import { call, commit, fixtureHomes, heldReader, makeRepo, PRD_SAMPLE, removeTempDirs, tempDir } from "./helpers.js";
@@ -31,6 +32,8 @@ function crashedStore(repo: string): { dataDir: string; store: Store } {
   const dataDir = tempDir();
   const store = openStore(dataDir);
   store.upsert({ project_id: PROJECT, display_name: PRD_SAMPLE.display_name, canonical_path: repo });
+  // HEAD as the run before the crash read it: a repository with no commits yet.
+  store.recordHead({ project_id: PROJECT, head: null, error: null, observed_at: "2026-10-25T11:59:00.000Z", events_through: 0 });
   store.ingestEvent({ ...turnCompleted, payload: "{}" });
   return { dataDir, store };
 }
@@ -43,6 +46,9 @@ test("a commit with no event is reported as head_moved and reconcile_project rec
     const repo = makeRepo();
     assert.equal((await tool("register_project", { path: repo })).status, 200);
     assert.equal((await tool("ingest_event", turnCompleted)).status, 200);
+    const unread = (await tool("open_project", { project_id: PROJECT })).body;
+    assert.equal(unread.freshness, "unverified");
+    assert.equal(unread.uncertain, true);
     assert.equal((await tool("get_project_status", { project_id: PROJECT })).body.freshness, "current");
 
     const hash = commit(repo);
@@ -99,6 +105,50 @@ test("open_project on a lagging project answers uncertain at once while a reconc
   }
 });
 
+test("open_project alone starts a background reconcile that processes what a crash left", async () => {
+  const { store } = crashedStore(makeRepo());
+  const held = heldReader();
+  const reconciler = new Reconciler(store, { readHead: held.readHead });
+  const server = createBridgeServer({ store, token: "t", buildId: null, providerHomes: resolveProviderHomes(fixtureHomes()), reconciler });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+  try {
+    assert.equal((await call(port, "t", "open_project", { project_id: PROJECT })).body.freshness, "lagging");
+    const deadline = Date.now() + 2_000;
+    while (held.started() === 0 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(held.started(), 1);
+    held.release();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await reconciler.stop();
+    assert.equal(getProjectStatus(store, PROJECT).freshness, "current");
+  } finally {
+    held.release();
+    if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+    await reconciler.stop();
+    store.close();
+  }
+});
+
+test("a hook commit delivered after the last HEAD read is current at once", async () => {
+  const dataDir = tempDir();
+  const bridge = await startBridge({ dataDir, port: 0, env: fixtureHomes() });
+  const tool = (name: string, body: unknown) => call(bridge.port, readClientToken(dataDir), name, body);
+  try {
+    const repo = makeRepo();
+    assert.equal((await tool("register_project", { path: repo })).status, 200);
+    commit(repo);
+    assert.equal((await tool("reconcile_project", { project_id: PROJECT })).body.status.freshness, "current");
+    const hash = commit(repo);
+    const hooked = { ...turnCompleted, type: "git_commit", payload: { commit: hash } };
+    assert.equal((await tool("ingest_event", hooked)).status, 200);
+    const opened = (await tool("open_project", { project_id: PROJECT })).body;
+    assert.equal(opened.freshness, "current");
+    assert.equal(opened.uncertain, false);
+  } finally {
+    await bridge.close();
+  }
+});
+
 test("startup reconciliation processes the events a crash left unprocessed", async () => {
   const { dataDir, store } = crashedStore(makeRepo());
   store.close();
@@ -112,8 +162,8 @@ test("startup reconciliation processes the events a crash left unprocessed", asy
   }
 });
 
-test("a reconcile interval that is not a whole number of at least 1 ms refuses to start", async () => {
-  for (const value of ["0", "abc", "1.5", "-5", ""]) {
+test("a reconcile interval that is not a whole number from 1 to 2147483647 ms refuses to start", async () => {
+  for (const value of ["0", "abc", "1.5", "-5", "", "2147483648", "9007199254740991"]) {
     await assert.rejects(
       startBridge({ dataDir: tempDir(), port: 0, env: { ...fixtureHomes(), VOICE_BRIDGE_RECONCILE_INTERVAL_MS: value } }),
       { code: "invalid_reconcile_interval" },

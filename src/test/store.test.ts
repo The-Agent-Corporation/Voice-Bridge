@@ -386,11 +386,11 @@ test("a HEAD observation is replaced only by one observed at the same time or la
   const store = openStore(tempDir());
   try {
     store.upsert({ project_id: "p", display_name: "P", canonical_path: "/x/p" });
-    const newer = { project_id: "p", head: "b".repeat(40), error: null, observed_at: "2026-10-25T12:00:02.000Z" };
+    const newer = { project_id: "p", head: "b".repeat(40), error: null, observed_at: "2026-10-25T12:00:02.000Z", events_through: 2 };
     store.recordHead(newer);
-    store.recordHead({ project_id: "p", head: "a".repeat(40), error: null, observed_at: "2026-10-25T12:00:01.000Z" });
+    store.recordHead({ project_id: "p", head: "a".repeat(40), error: null, observed_at: "2026-10-25T12:00:01.000Z", events_through: 1 });
     assert.deepEqual(store.getHead("p"), newer);
-    const failed = { project_id: "p", head: null, error: "fatal: not a git repository", observed_at: "2026-10-25T12:00:03.000Z" };
+    const failed = { project_id: "p", head: null, error: "fatal: not a git repository", observed_at: "2026-10-25T12:00:03.000Z", events_through: 3 };
     store.recordHead(failed);
     assert.deepEqual(store.getHead("p"), failed);
   } finally {

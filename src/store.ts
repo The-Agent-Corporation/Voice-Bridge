@@ -128,6 +128,8 @@ export interface HeadObservation {
   error: string | null;
   /** When the read started, so an older read finishing late never replaces a newer one. */
   observed_at: string;
+  /** The project's highest stored event_id when the read started (0 for none); later events postdate the read. */
+  events_through: number;
 }
 
 export interface ProcessedEvent {
@@ -401,6 +403,8 @@ export interface Store {
   /** Stores the observation unless a newer one (by `observed_at`) is already stored. */
   recordHead(observation: HeadObservation): void;
   getHead(projectId: string): HeadObservation | undefined;
+  /** The highest event_id stored for the project, processed or not; 0 when none is. */
+  highestEventId(projectId: string): number;
   /**
    * The processed event observed last, ties broken by event_id. An event is processed when it is at or
    * below its source's watermark and no longer pending.
@@ -679,7 +683,8 @@ const CONTROL_TABLES = `
 /**
  * A stored event is pending until `markEventsProcessed`, so one stored but never processed (a crash
  * between the two) is still visible on restart. `project_heads` is the last HEAD read from each
- * project's repository; `head` is null for a repository with no commits, `error` set when Git could not read it.
+ * project's repository; `head` is null for a repository with no commits, `error` set when Git could not read it,
+ * and `events_through` the highest event_id stored when the read began.
  */
 const RECONCILE_TABLES = `
   CREATE TABLE IF NOT EXISTS pending_events (
@@ -687,10 +692,11 @@ const RECONCILE_TABLES = `
     project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE
   );
   CREATE TABLE IF NOT EXISTS project_heads (
-    project_id  TEXT PRIMARY KEY REFERENCES projects(project_id) ON DELETE CASCADE,
-    head        TEXT,
-    error       TEXT,
-    observed_at TEXT NOT NULL
+    project_id     TEXT PRIMARY KEY REFERENCES projects(project_id) ON DELETE CASCADE,
+    head           TEXT,
+    error          TEXT,
+    observed_at    TEXT NOT NULL,
+    events_through INTEGER NOT NULL
   );
 `;
 
@@ -856,11 +862,14 @@ export function openStore(dataDir: string): Store {
   const pendingCount = db.prepare("SELECT COUNT(*) AS count FROM pending_events WHERE project_id = ?");
   const deletePending = db.prepare("DELETE FROM pending_events WHERE project_id = ?");
   const upsertHead = db.prepare(`
-    INSERT INTO project_heads (project_id, head, error, observed_at) VALUES (:project_id, :head, :error, :observed_at)
-    ON CONFLICT (project_id) DO UPDATE SET head = excluded.head, error = excluded.error, observed_at = excluded.observed_at
+    INSERT INTO project_heads (project_id, head, error, observed_at, events_through)
+    VALUES (:project_id, :head, :error, :observed_at, :events_through)
+    ON CONFLICT (project_id) DO UPDATE SET
+      head = excluded.head, error = excluded.error, observed_at = excluded.observed_at, events_through = excluded.events_through
     WHERE excluded.observed_at >= project_heads.observed_at
   `);
-  const headOf = db.prepare("SELECT project_id, head, error, observed_at FROM project_heads WHERE project_id = ?");
+  const headOf = db.prepare("SELECT project_id, head, error, observed_at, events_through FROM project_heads WHERE project_id = ?");
+  const highestStored = db.prepare("SELECT COALESCE(MAX(event_id), 0) AS event_id FROM events WHERE project_id = ?");
   const latestProcessed = db.prepare(`
     SELECT e.event_id, e.type, e.observed_at FROM ${PROCESSED_EVENTS}
     ORDER BY e.observed_at DESC, e.event_id DESC LIMIT 1
@@ -1268,6 +1277,9 @@ export function openStore(dataDir: string): Store {
     getHead(projectId) {
       const row = headOf.get(projectId) as HeadObservation | undefined;
       return row && { ...row };
+    },
+    highestEventId(projectId) {
+      return (highestStored.get(projectId) as { event_id: number }).event_id;
     },
     latestProcessedEvent(projectId) {
       const row = latestProcessed.get(projectId) as ProcessedEvent | undefined;

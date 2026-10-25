@@ -202,7 +202,7 @@ function collectFacts(state: BriefingState): Facts {
     questions: pendingQuestions(questionEvents, ofType("user_decision"), clean),
     questionsAtCap: questionEvents.length >= BRIEFING_EVENTS_PER_TYPE,
     agent: agentProvider ?? "not identified",
-    commit: latestRecordedCommit(state.events),
+    commit: latestRecordedCommit(state.events)?.commit ?? null,
   };
 }
 

@@ -95,13 +95,20 @@ export class Reconciler {
 
   #schedule(): void {
     if (this.#stopped) return;
-    this.#timer = setTimeout(() => void this.#reconcileAll().then(() => this.#schedule()), this.#intervalMs);
+    this.#timer = setTimeout(() => void this.#reconcileAll().finally(() => this.#schedule()), this.#intervalMs);
     this.#timer.unref();
   }
 
   async #reconcileAll(): Promise<void> {
     if (this.#stopped) return;
-    for (const { project_id } of this.#store.list()) {
+    let projects: Project[];
+    try {
+      projects = this.#store.list();
+    } catch (error) {
+      console.error(`voice-bridge: reconcile could not list projects: ${errorMessage(error)}`);
+      return;
+    }
+    for (const { project_id } of projects) {
       if (this.#stopped) return;
       try {
         await this.reconcile(project_id);
@@ -121,12 +128,14 @@ export class Reconciler {
   /** Stamped before the read, so a slow read that finishes after a newer one is not stored over it. */
   async #observeHead(project: Project): Promise<HeadObservation> {
     const observedAt = new Date().toISOString();
+    const eventsThrough = this.#store.highestEventId(project.project_id);
     const read = await this.#readHead(project.canonical_path);
     const observation: HeadObservation = {
       project_id: project.project_id,
       head: read.ok ? read.head : null,
       error: read.ok ? null : read.detail,
       observed_at: observedAt,
+      events_through: eventsThrough,
     };
     this.#store.recordHead(observation);
     return observation;
