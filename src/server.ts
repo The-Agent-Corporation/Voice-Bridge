@@ -1,11 +1,11 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { ProviderHomes } from "./adapters/homes.js";
-import { refreshBriefing } from "./briefingFile.js";
-import { BridgeError, requireString } from "./errors.js";
+import { BridgeError, errorMessage, requireString } from "./errors.js";
 import { ingestEvent } from "./events.js";
 import { dismissInboxQuestion, listInbox } from "./inbox.js";
 import { answerInboxQuestion, cancelMessage, getMessage, sendToPrimary } from "./messages.js";
 import { getPrimarySession, pinPrimary, unpinPrimary } from "./primary.js";
+import { processEvents, type Reconciler } from "./reconcile.js";
 import { listProjects, openProject, registerProject } from "./registry.js";
 import { listSessions } from "./sessions.js";
 import { getProjectStatus } from "./status.js";
@@ -19,6 +19,7 @@ export interface BridgeServerOptions {
   token: string;
   buildId: string | null;
   providerHomes: ProviderHomes;
+  reconciler: Reconciler;
 }
 
 type Tool = (options: BridgeServerOptions, body: Record<string, unknown>) => unknown;
@@ -26,7 +27,7 @@ type Tool = (options: BridgeServerOptions, body: Record<string, unknown>) => unk
 export const TOOLS: Record<string, Tool> = {
   register_project: ({ store, providerHomes }, body) => registerProject(store, requireString(body, "path"), providerHomes),
   list_projects: ({ store }) => ({ projects: listProjects(store) }),
-  open_project: ({ store }, body) => openProject(store, requireString(body, "project_id")),
+  open_project: ({ store, reconciler }, body) => openProject(store, requireString(body, "project_id"), reconciler),
   list_sessions: ({ store, providerHomes }, body) => listSessions(store, requireString(body, "project_id"), providerHomes),
   get_primary_session: ({ store, providerHomes }, body) =>
     getPrimarySession(store, requireString(body, "project_id"), providerHomes),
@@ -36,19 +37,25 @@ export const TOOLS: Record<string, Tool> = {
   ingest_event: ({ store }, body) => {
     const result = ingestEvent(store, body);
     // A duplicate refreshes too: the content hash, not the duplicate flag, decides whether the file is rewritten.
-    // The event is already committed, so a failed refresh is logged rather than reported as a failed ingest.
+    // The event is already committed, so a failed refresh is logged rather than reported as a failed ingest;
+    // an event left unprocessed by a crash here is processed by the next reconcile pass.
     const projectId = requireString(body, "project_id");
-    let failure: unknown;
+    let failure: string | null | undefined;
     try {
-      const briefing = refreshBriefing(store, projectId);
+      const briefing = processEvents(store, projectId);
       if (briefing.write === "failed") failure = briefing.error;
     } catch (error) {
-      failure = error instanceof Error ? error.message : error;
+      failure = errorMessage(error);
     }
     if (failure !== undefined) console.error(`voice-bridge: VOICE.md not written for ${projectId}: ${failure}`);
     return result;
   },
-  get_project_status: ({ store }, body) => getProjectStatus(store, requireString(body, "project_id")),
+  get_project_status: async ({ store, reconciler }, body) => {
+    const projectId = requireString(body, "project_id");
+    await reconciler.observe(projectId);
+    return getProjectStatus(store, projectId);
+  },
+  reconcile_project: ({ reconciler }, body) => reconciler.reconcile(requireString(body, "project_id")),
   list_inbox: ({ store }, body) => listInbox(store, body),
   dismiss_inbox_question: ({ store }, body) => dismissInboxQuestion(store, body),
   answer_inbox_question: ({ store, providerHomes }, body) => answerInboxQuestion(store, body, providerHomes),

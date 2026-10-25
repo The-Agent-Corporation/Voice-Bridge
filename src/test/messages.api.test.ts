@@ -6,7 +6,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { after, afterEach, before, beforeEach, describe, mock, test, type Mock } from "node:test";
 import { startBridge, type RunningBridge } from "../app.js";
-import { runGit } from "../git.js";
+import { gitBinary, runGit } from "../git.js";
 import { STORE_FILE } from "../store.js";
 import { readClientToken } from "../token.js";
 import { call, fixtureHomes, makeRepo, PRD_SAMPLE, removeTempDirs, tempDir, writeClaudeSession } from "./helpers.js";
@@ -65,7 +65,7 @@ describe("message tools", () => {
   afterEach(() => {
     for (const name of NEVER_CALLED) assert.equal(spies[name].mock.callCount(), 0, `${name} was called`);
     for (const { arguments: args } of spies.execFileSync.mock.calls) {
-      assert.deepEqual([args[0], (args[1] as string[]).slice(0, 2)], ["git", ["worktree", "list"]]);
+      assert.deepEqual([args[0], (args[1] as string[]).slice(0, 2)], [gitBinary(), ["worktree", "list"]]);
     }
   });
 

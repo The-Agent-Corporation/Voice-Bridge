@@ -40,7 +40,9 @@ const STATUS_BY_CODE = {
   provider_start_failed: 502,
   provider_not_installed: 503,
   build_id_unavailable: 503,
+  bridge_closing: 503,
   store_version_unsupported: 500,
+  invalid_reconcile_interval: 500,
   insecure_token_file: 500,
   empty_token_file: 500,
 } as const;
@@ -65,4 +67,8 @@ export function requireString(body: Record<string, unknown>, field: string): str
     throw new BridgeError("invalid_request", `${field} must be a non-empty string`);
   }
   return value;
+}
+
+export function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

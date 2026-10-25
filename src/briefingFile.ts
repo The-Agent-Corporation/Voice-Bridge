@@ -4,7 +4,7 @@ import path from "node:path";
 import { writeFileAtomic } from "./atomicFile.js";
 import { loadBriefingState, renderBriefing, type BriefingState } from "./briefing.js";
 import { DEFAULT_MAX_BRIEFING_TOKENS, readVoiceConfig, type VoiceConfig } from "./config.js";
-import { BridgeError } from "./errors.js";
+import { BridgeError, errorMessage } from "./errors.js";
 import type { Store } from "./store.js";
 
 /** The generation time the content hash is rendered with, so the wall clock never changes the hash. */
@@ -17,10 +17,6 @@ export interface BriefingRefresh {
   error: string | null;
   /** The status the text was rendered from, so callers report the same freshness the text states. */
   status: BriefingState["status"];
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 function readFileIfPresent(file: string): string | undefined {

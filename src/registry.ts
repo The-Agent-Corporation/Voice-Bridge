@@ -3,8 +3,9 @@ import path from "node:path";
 import type { ProviderHomes } from "./adapters/homes.js";
 import { refreshBriefing, type BriefingRefresh } from "./briefingFile.js";
 import { readVoiceConfig } from "./config.js";
-import { BridgeError } from "./errors.js";
+import { BridgeError, errorMessage } from "./errors.js";
 import { runGit } from "./git.js";
+import type { Reconciler } from "./reconcile.js";
 import { discoverProjectSessions, type DiscoveryCounts } from "./sessions.js";
 import type { ProjectStatus } from "./status.js";
 import type { Store } from "./store.js";
@@ -21,6 +22,8 @@ export interface RegisterResult extends ProjectSummary, DiscoveryCounts {
 
 export interface OpenedProject extends ProjectSummary {
   freshness: ProjectStatus["freshness"];
+  /** True when the facts below may be out of date (`lagging` or `unverified`); a reconcile pass is under way. */
+  uncertain: boolean;
   last_confirmed_activity: ProjectStatus["last_confirmed_activity"];
   /** The same text that is in the project's briefing file. */
   briefing: string;
@@ -90,15 +93,24 @@ export function listProjects(store: Store): ProjectSummary[] {
   }));
 }
 
-export function openProject(store: Store, projectId: string): OpenedProject {
+/**
+ * Answers from the store's last confirmed facts at once and starts a reconcile pass in the background;
+ * it never waits on Git and never starts an agent.
+ */
+export function openProject(store: Store, projectId: string, reconciler: Reconciler): OpenedProject {
   const project = store.getById(projectId);
   if (!project) throw new BridgeError("project_not_found", `no project registered with id ${projectId}`);
   const briefing = refreshBriefing(store, projectId);
+  reconciler.reconcile(projectId).catch((error: unknown) => {
+    console.error(`voice-bridge: reconcile failed for ${projectId}: ${errorMessage(error)}`);
+  });
+  const { freshness } = briefing.status;
   return {
     project_id: project.project_id,
     display_name: project.display_name,
     canonical_path: project.canonical_path,
-    freshness: briefing.status.freshness,
+    freshness,
+    uncertain: freshness === "lagging" || freshness === "unverified",
     last_confirmed_activity: briefing.status.last_confirmed_activity,
     briefing: briefing.text,
     briefing_write: briefing.write,

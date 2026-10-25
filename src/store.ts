@@ -4,7 +4,7 @@ import type { DiscoveredSession, ObservedState, Provider } from "./adapters/type
 import { BridgeError } from "./errors.js";
 
 export const STORE_FILE = "bridge.sqlite";
-const SCHEMA_VERSION = 9;
+const SCHEMA_VERSION = 10;
 const SQLITE_CONSTRAINT_UNIQUE = 2067;
 
 export interface Project {
@@ -117,6 +117,19 @@ export interface WatermarkRow {
   /** Highest N such that sequences 1..N from this source are all stored. */
   watermark: number;
   highest_stored: number;
+}
+
+/** The last HEAD read from a project's repository. */
+export interface HeadObservation {
+  project_id: string;
+  /** Null when the repository has no commits yet. */
+  head: string | null;
+  /** Why Git could not read HEAD; null when it could. */
+  error: string | null;
+  /** When the read started, so an older read finishing late never replaces a newer one. */
+  observed_at: string;
+  /** The project's highest stored event_id when the read started (0 for none); later events postdate the read. */
+  events_through: number;
 }
 
 export interface ProcessedEvent {
@@ -373,7 +386,8 @@ export interface Store {
    * under a stored `(source, source_event_id)` is a duplicate; a differing one, or a taken
    * sequence number, throws `event_conflict` and writes nothing. `question`, and an `agent_ack`'s
    * `acknowledgedQuestionId`, are applied to the inbox in the same transaction, only when the event is newly stored.
-   * An acknowledgement counts only from the item's asking session in its project.
+   * An acknowledgement counts only from the item's asking session in its project. A newly stored event
+   * is pending, and not processed, until `markEventsProcessed`.
    */
   ingestEvent(
     event: NewEvent,
@@ -382,7 +396,19 @@ export interface Store {
   ): { event_id: number; duplicate: boolean };
   /** One row per source that has stored events, ordered by source. */
   listWatermarks(projectId: string): WatermarkRow[];
-  /** The processed event (at or below its source's watermark) observed last, ties broken by event_id. */
+  /** Stored events of the project not yet marked processed. */
+  countPendingEvents(projectId: string): number;
+  /** Marks every pending event of the project processed; returns how many were pending. */
+  markEventsProcessed(projectId: string): number;
+  /** Stores the observation unless a newer one (by `observed_at`) is already stored. */
+  recordHead(observation: HeadObservation): void;
+  getHead(projectId: string): HeadObservation | undefined;
+  /** The highest event_id stored for the project, processed or not; 0 when none is. */
+  highestEventId(projectId: string): number;
+  /**
+   * The processed event observed last, ties broken by event_id. An event is processed when it is at or
+   * below its source's watermark and no longer pending.
+   */
   latestProcessedEvent(projectId: string): ProcessedEvent | undefined;
   /** Per session and source, the type of the processed turn event with the highest sequence. */
   latestTurnStates(projectId: string): TurnState[];
@@ -654,17 +680,38 @@ const CONTROL_TABLES = `
   );
 `;
 
+/**
+ * A stored event is pending until `markEventsProcessed`, so one stored but never processed (a crash
+ * between the two) is still visible on restart. `project_heads` is the last HEAD read from each
+ * project's repository; `head` is null for a repository with no commits, `error` set when Git could not read it,
+ * and `events_through` the highest event_id stored when the read began.
+ */
+const RECONCILE_TABLES = `
+  CREATE TABLE IF NOT EXISTS pending_events (
+    event_id   INTEGER PRIMARY KEY REFERENCES events(event_id) ON DELETE CASCADE,
+    project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE
+  );
+  CREATE TABLE IF NOT EXISTS project_heads (
+    project_id     TEXT PRIMARY KEY REFERENCES projects(project_id) ON DELETE CASCADE,
+    head           TEXT,
+    error          TEXT,
+    observed_at    TEXT NOT NULL,
+    events_through INTEGER NOT NULL
+  );
+`;
+
 /** Tables each known version still lacks; every step only adds tables and leaves stored rows alone. */
 const MIGRATIONS: Record<number, string> = {
-  0: PROJECTS_TABLE + SESSIONS_TABLE + PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES + BRIEFINGS_TABLE + INBOX_TABLES + MESSAGE_TABLES + CONTROL_TABLES,
-  1: SESSIONS_TABLE + PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES + BRIEFINGS_TABLE + INBOX_TABLES + MESSAGE_TABLES + CONTROL_TABLES,
-  2: PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES + BRIEFINGS_TABLE + INBOX_TABLES + MESSAGE_TABLES + CONTROL_TABLES,
-  3: EVENT_TABLES + BRIEFINGS_TABLE + INBOX_TABLES + MESSAGE_TABLES + CONTROL_TABLES,
-  4: BRIEFINGS_TABLE + INBOX_TABLES + MESSAGE_TABLES + CONTROL_TABLES,
-  5: INBOX_TABLES + MESSAGE_TABLES + CONTROL_TABLES,
-  6: MESSAGE_TABLES + CONTROL_TABLES,
-  7: MESSAGE_ANSWERS_TABLE + CONTROL_TABLES,
-  8: MESSAGE_ANSWERS_TABLE,
+  0: PROJECTS_TABLE + SESSIONS_TABLE + PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES + BRIEFINGS_TABLE + INBOX_TABLES + MESSAGE_TABLES + CONTROL_TABLES + RECONCILE_TABLES,
+  1: SESSIONS_TABLE + PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES + BRIEFINGS_TABLE + INBOX_TABLES + MESSAGE_TABLES + CONTROL_TABLES + RECONCILE_TABLES,
+  2: PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES + BRIEFINGS_TABLE + INBOX_TABLES + MESSAGE_TABLES + CONTROL_TABLES + RECONCILE_TABLES,
+  3: EVENT_TABLES + BRIEFINGS_TABLE + INBOX_TABLES + MESSAGE_TABLES + CONTROL_TABLES + RECONCILE_TABLES,
+  4: BRIEFINGS_TABLE + INBOX_TABLES + MESSAGE_TABLES + CONTROL_TABLES + RECONCILE_TABLES,
+  5: INBOX_TABLES + MESSAGE_TABLES + CONTROL_TABLES + RECONCILE_TABLES,
+  6: MESSAGE_TABLES + CONTROL_TABLES + RECONCILE_TABLES,
+  7: MESSAGE_ANSWERS_TABLE + CONTROL_TABLES + RECONCILE_TABLES,
+  8: MESSAGE_ANSWERS_TABLE + RECONCILE_TABLES,
+  9: RECONCILE_TABLES,
 };
 
 /**
@@ -809,7 +856,20 @@ export function openStore(dataDir: string): Store {
   const PROCESSED_EVENTS = `
     events e JOIN source_watermarks w ON w.project_id = e.project_id AND w.source = e.source
     WHERE e.project_id = ? AND e.source_sequence <= w.watermark
+      AND NOT EXISTS (SELECT 1 FROM pending_events p WHERE p.event_id = e.event_id)
   `;
+  const insertPending = db.prepare("INSERT INTO pending_events (event_id, project_id) VALUES (?, ?)");
+  const pendingCount = db.prepare("SELECT COUNT(*) AS count FROM pending_events WHERE project_id = ?");
+  const deletePending = db.prepare("DELETE FROM pending_events WHERE project_id = ?");
+  const upsertHead = db.prepare(`
+    INSERT INTO project_heads (project_id, head, error, observed_at, events_through)
+    VALUES (:project_id, :head, :error, :observed_at, :events_through)
+    ON CONFLICT (project_id) DO UPDATE SET
+      head = excluded.head, error = excluded.error, observed_at = excluded.observed_at, events_through = excluded.events_through
+    WHERE excluded.observed_at >= project_heads.observed_at
+  `);
+  const headOf = db.prepare("SELECT project_id, head, error, observed_at, events_through FROM project_heads WHERE project_id = ?");
+  const highestStored = db.prepare("SELECT COALESCE(MAX(event_id), 0) AS event_id FROM events WHERE project_id = ?");
   const latestProcessed = db.prepare(`
     SELECT e.event_id, e.type, e.observed_at FROM ${PROCESSED_EVENTS}
     ORDER BY e.observed_at DESC, e.event_id DESC LIMIT 1
@@ -1196,6 +1256,7 @@ export function openStore(dataDir: string): Store {
         while (eventBySequence.get(event.project_id, event.source, watermark + 1)) watermark++;
         upsertWatermark.run(event.project_id, event.source, watermark);
         const eventId = Number(lastInsertRowid);
+        insertPending.run(eventId, event.project_id);
         if (question) applyQuestion(eventId, event, question);
         if (typeof acknowledgedQuestionId === "string") applyAck(event, acknowledgedQuestionId);
         return { event_id: eventId, duplicate: false };
@@ -1203,6 +1264,22 @@ export function openStore(dataDir: string): Store {
     },
     listWatermarks(projectId) {
       return watermarksOf.all(projectId) as unknown as WatermarkRow[];
+    },
+    countPendingEvents(projectId) {
+      return (pendingCount.get(projectId) as { count: number }).count;
+    },
+    markEventsProcessed(projectId) {
+      return Number(deletePending.run(projectId).changes);
+    },
+    recordHead(observation) {
+      upsertHead.run({ ...observation });
+    },
+    getHead(projectId) {
+      const row = headOf.get(projectId) as HeadObservation | undefined;
+      return row && { ...row };
+    },
+    highestEventId(projectId) {
+      return (highestStored.get(projectId) as { event_id: number }).event_id;
     },
     latestProcessedEvent(projectId) {
       const row = latestProcessed.get(projectId) as ProcessedEvent | undefined;

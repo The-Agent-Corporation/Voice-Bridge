@@ -7,6 +7,7 @@ import { after, before, describe, mock, test } from "node:test";
 import { resolveProviderHomes } from "../adapters/homes.js";
 import { startBridge, type RunningBridge } from "../app.js";
 import { SECTION_HEADINGS } from "../briefing.js";
+import { Reconciler } from "../reconcile.js";
 import { createBridgeServer } from "../server.js";
 import { openStore } from "../store.js";
 import { readClientToken } from "../token.js";
@@ -23,14 +24,23 @@ describe("VOICE.md generation", () => {
 
   const tool = (name: string, body: unknown) => call(bridge.port, token, name, body);
   const open = async (projectId: string) => (await tool("open_project", { project_id: projectId })).body;
+  /** Resolves once the background pass each `open_project` starts has finished, since passes queue per project. */
+  const settle = async (projectId: string) => {
+    assert.equal((await tool("reconcile_project", { project_id: projectId })).status, 200);
+  };
 
-  /** Registers a fresh repository with `config` over the PRD sample; returns its id and path. */
+  /**
+   * Registers a fresh repository with `config` over the PRD sample and reads its HEAD once, as a running
+   * daemon would have, so the background pass `open_project` starts leaves the briefing's text alone.
+   * Returns the project's id and path.
+   */
   const register = async (config: Record<string, unknown> = {}, prepare: (repo: string) => void = () => {}) => {
     const projectId = `voice-${++projects}`;
     const repo = makeRepo({ ...PRD_SAMPLE, project_id: projectId, ...config });
     prepare(repo);
     const response = await tool("register_project", { path: repo });
     assert.equal(response.status, 200, JSON.stringify(response.body));
+    await settle(projectId);
     return { projectId, repo };
   };
 
@@ -108,6 +118,7 @@ describe("VOICE.md generation", () => {
     const restored = readFileSync(file, "utf8");
     assert.match(restored, /restore me/);
     assert.equal((await open(projectId)).briefing, restored);
+    await settle(projectId);
 
     writeFileSync(file, "hand edited\n");
     const opened = await open(projectId);
@@ -192,6 +203,7 @@ describe("VOICE.md generation", () => {
 
   test("a repository that cannot be written still answers open_project and says the write failed", { skip: process.getuid?.() === 0 }, async () => {
     const { projectId, repo } = await register();
+    rmSync(path.join(repo, "VOICE.md"));
     chmodSync(repo, 0o555);
     try {
       await ingest(projectId, 1, "progress", { summary: "read-only" });
@@ -211,7 +223,13 @@ test("an ingest whose briefing refresh throws still reports the committed event"
   store.saveBriefing = () => {
     throw new Error("disk full");
   };
-  const server = createBridgeServer({ store, token: "t", buildId: null, providerHomes: resolveProviderHomes(fixtureHomes()) });
+  const server = createBridgeServer({
+    store,
+    token: "t",
+    buildId: null,
+    providerHomes: resolveProviderHomes(fixtureHomes()),
+    reconciler: new Reconciler(store),
+  });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address() as AddressInfo;
   const errors = mock.method(console, "error", () => {});

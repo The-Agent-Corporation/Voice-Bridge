@@ -118,7 +118,7 @@ describe("bridge API", () => {
     }
     assert.equal(response.status, 500);
     assert.equal(response.body.error.code, "git_failed");
-    assert.match(response.body.error.message, /ENOENT/);
+    assert.match(response.body.error.message, /git was not found in any absolute PATH entry/);
     assert.deepEqual(await list(), before);
   });
 
@@ -190,6 +190,7 @@ test("the tool API offers no way to start, resume or fork a session", () => {
     "list_sessions",
     "open_project",
     "pin_primary",
+    "reconcile_project",
     "register_project",
     "send_to_primary",
     "unpin_primary",
