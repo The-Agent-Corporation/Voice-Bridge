@@ -128,18 +128,23 @@ function describeError(error: unknown): string {
   return `voice-bridge: ${typeof code === "string" ? `${code}: ` : ""}${message}`;
 }
 
-/** One line in, one reply out, in order; a failed tool call is reported and the conversation goes on. */
+/**
+ * One line in, one reply out, in order. A failed tool call is reported and the conversation goes
+ * on, but the session then exits 1, so a scripted run against a dead daemon does not pass as success.
+ */
 async function runChat(): Promise<number> {
   const conversation = new Conversation(callTool);
+  let failed = false;
   for await (const line of createInterface({ input: process.stdin, crlfDelay: Infinity })) {
     if (!line.trim()) continue;
     try {
       console.log(await conversation.reply(line));
     } catch (error) {
+      failed = true;
       console.error(describeError(error));
     }
   }
-  return 0;
+  return failed ? 1 : 0;
 }
 
 async function run(args: string[]): Promise<number> {

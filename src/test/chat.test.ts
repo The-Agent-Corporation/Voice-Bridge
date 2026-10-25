@@ -11,6 +11,21 @@ import { call, CLI_ENTRY, fixtureHomes, makeRepo, PRD_SAMPLE, removeTempDirs, te
 
 after(removeTempDirs);
 
+async function chatCli(dataDir: string, input: string): Promise<{ status: number | null; stdout: string; stderr: string }> {
+  const child = spawn(process.execPath, [CLI_ENTRY, "chat"], {
+    env: { ...process.env, VOICE_BRIDGE_DATA_DIR: dataDir },
+    stdio: ["pipe", "pipe", "pipe"],
+    timeout: 10_000,
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
+  child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
+  const exited = new Promise<number | null>((resolve) => child.once("exit", resolve));
+  child.stdin.end(input);
+  return { status: await exited, stdout, stderr };
+}
+
 describe("chat grammar", () => {
   test("parses the four commands and nothing else", () => {
     assert.deepEqual(parseCommand("list projects"), { kind: "list" });
@@ -120,6 +135,20 @@ describe("chat conversation over the bridge tools", () => {
     assert.match(await chat.reply("what's happening?"), /^Tennis App \(freshness: unverified\)\n/);
   });
 
+  test("a failed tool call leaves the context as it was and the conversation goes on", async () => {
+    const failing: CallTool = async <T>(tool: string, body: Record<string, unknown>) => {
+      if (tool === "open_project" && body.project_id === "b") throw new Error("bridge unreachable");
+      return callTool<T>(tool, body);
+    };
+    const chat = new Conversation(failing);
+    await chat.reply("open golf app");
+    const before = chat.context;
+
+    await assert.rejects(chat.reply("switch to B"), /bridge unreachable/);
+    assert.deepEqual(chat.context, before);
+    assert.match(await chat.reply("what's happening?"), /^Golf App \(freshness: current\)\n/);
+  });
+
   test("asking before opening, unknown input and listing", async () => {
     const chat = new Conversation(callTool);
     assert.match(await chat.reply("what's happening?"), /^No project is open\./);
@@ -129,19 +158,9 @@ describe("chat conversation over the bridge tools", () => {
   });
 
   test("voice-bridge chat answers stdin lines through the running daemon", async () => {
-    const child = spawn(process.execPath, [CLI_ENTRY, "chat"], {
-      env: { ...process.env, VOICE_BRIDGE_DATA_DIR: dataDir },
-      stdio: ["pipe", "pipe", "pipe"],
-      timeout: 10_000,
-    });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
-    child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
-    const exited = new Promise<number | null>((resolve) => child.once("exit", resolve));
-    child.stdin.end("open golf app\nwhat's happening?\nswitch to B\nwhat's happening?\nopen croquet club\n");
+    const { status, stdout, stderr } = await chatCli(dataDir, "open golf app\nwhat's happening?\nswitch to B\nwhat's happening?\nopen croquet club\n");
 
-    assert.equal(await exited, 0, stderr);
+    assert.equal(status, 0, stderr);
     assert.equal(stderr, "");
     const [, afterSwitch] = stdout.split("Project Bravo (freshness: current)\nOpened.");
     assert.match(stdout, /MARKER-A/);
@@ -149,6 +168,13 @@ describe("chat conversation over the bridge tools", () => {
     assert.doesNotMatch(afterSwitch!, /MARKER-A|Golf App/);
     assert.match(stdout, /No project matches "croquet club"\.\n$/);
   });
+});
+
+test("voice-bridge chat reports each failed tool call, keeps answering, and exits 1", async () => {
+  const { status, stdout, stderr } = await chatCli(tempDir(), "list projects\nopen golf app\ndeploy it\n");
+  assert.equal(status, 1);
+  assert.equal(stderr.match(/^voice-bridge: daemon_not_running: /gm)?.length, 2, stderr);
+  assert.match(stdout, /^I understand:/);
 });
 
 /** Relative runtime imports of a compiled module, followed through the whole local graph. */
