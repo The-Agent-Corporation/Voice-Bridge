@@ -3,7 +3,7 @@ import path from "node:path";
 import type { ProviderHomes } from "./adapters/homes.js";
 import { refreshBriefing, type BriefingRefresh } from "./briefingFile.js";
 import { readVoiceConfig } from "./config.js";
-import { BridgeError } from "./errors.js";
+import { BridgeError, errorMessage } from "./errors.js";
 import { runGit } from "./git.js";
 import type { Reconciler } from "./reconcile.js";
 import { discoverProjectSessions, type DiscoveryCounts } from "./sessions.js";
@@ -102,7 +102,7 @@ export function openProject(store: Store, projectId: string, reconciler: Reconci
   if (!project) throw new BridgeError("project_not_found", `no project registered with id ${projectId}`);
   const briefing = refreshBriefing(store, projectId);
   reconciler.reconcile(projectId).catch((error: unknown) => {
-    console.error(`voice-bridge: reconcile failed for ${projectId}: ${error instanceof Error ? error.message : error}`);
+    console.error(`voice-bridge: reconcile failed for ${projectId}: ${errorMessage(error)}`);
   });
   const { freshness } = briefing.status;
   return {

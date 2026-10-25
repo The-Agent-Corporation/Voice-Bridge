@@ -68,3 +68,7 @@ export function requireString(body: Record<string, unknown>, field: string): str
   }
   return value;
 }
+
+export function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}

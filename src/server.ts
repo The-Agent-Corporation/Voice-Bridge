@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { ProviderHomes } from "./adapters/homes.js";
-import { BridgeError, requireString } from "./errors.js";
+import { BridgeError, errorMessage, requireString } from "./errors.js";
 import { ingestEvent } from "./events.js";
 import { dismissInboxQuestion, listInbox } from "./inbox.js";
 import { answerInboxQuestion, cancelMessage, getMessage, sendToPrimary } from "./messages.js";
@@ -40,12 +40,12 @@ export const TOOLS: Record<string, Tool> = {
     // The event is already committed, so a failed refresh is logged rather than reported as a failed ingest;
     // an event left unprocessed by a crash here is processed by the next reconcile pass.
     const projectId = requireString(body, "project_id");
-    let failure: unknown;
+    let failure: string | null | undefined;
     try {
       const briefing = processEvents(store, projectId);
       if (briefing.write === "failed") failure = briefing.error;
     } catch (error) {
-      failure = error instanceof Error ? error.message : error;
+      failure = errorMessage(error);
     }
     if (failure !== undefined) console.error(`voice-bridge: VOICE.md not written for ${projectId}: ${failure}`);
     return result;

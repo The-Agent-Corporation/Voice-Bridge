@@ -1,5 +1,5 @@
 import { refreshBriefing, type BriefingRefresh } from "./briefingFile.js";
-import { BridgeError } from "./errors.js";
+import { BridgeError, errorMessage } from "./errors.js";
 import { readHead, type HeadRead } from "./git.js";
 import { getProjectStatus, headMoved, latestRecordedCommit, type ProjectStatus } from "./status.js";
 import type { HeadObservation, Project, Store } from "./store.js";
@@ -19,10 +19,6 @@ export interface ReconcileResult {
   status: ProjectStatus;
   briefing_write: BriefingRefresh["write"];
   briefing_write_error: string | null;
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 /**
