@@ -10,6 +10,7 @@ import {
   type InboxItem,
   type MessageMode,
   type NewMessage,
+  questionNotOpen,
   type Store,
   type StoredMessage,
   type StoredSession,
@@ -148,9 +149,7 @@ export async function answerInboxQuestion(
   const stored = store.findMessageByKey(idempotencyKey);
   if (stored) return { ...receipt(matchDuplicateMessage(stored, messageIdentity(request))), duplicate: true };
 
-  if (item.status !== "open") {
-    throw new BridgeError("inbox_question_not_open", `inbox question ${questionId} is ${item.status}, so it cannot be answered`);
-  }
+  if (item.status !== "open") throw questionNotOpen(questionId, item.status);
   if (item.type === "approval") {
     throw new BridgeError(
       "unsupported_capability",

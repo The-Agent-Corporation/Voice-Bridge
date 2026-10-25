@@ -324,6 +324,11 @@ export function matchDuplicateMessage(stored: StoredMessage, request: MessageIde
   return stored;
 }
 
+/** An answer to an inbox item that is not `open`; the tool and the store refuse it with the same error. */
+export function questionNotOpen(questionId: string, status: string): BridgeError {
+  return new BridgeError("inbox_question_not_open", `inbox question ${questionId} is ${status}, so it cannot be answered`);
+}
+
 export interface TurnState {
   session_id: string;
   type: (typeof TURN_EVENT_TYPES)[number];
@@ -1236,12 +1241,7 @@ export function openStore(dataDir: string): Store {
         if (stored) return { message: matchDuplicateMessage(stored, message), duplicate: true };
         if (message.question_id !== null) {
           const item = inboxItemById.get(message.question_id) as InboxItem | undefined;
-          if (item?.status !== "open") {
-            throw new BridgeError(
-              "inbox_question_not_open",
-              `inbox question ${message.question_id} is ${item?.status ?? "missing"}, so it cannot be answered`,
-            );
-          }
+          if (item?.status !== "open") throw questionNotOpen(message.question_id, item?.status ?? "missing");
         }
         const { decision } = message;
         // Routed to a controlled session that ended since: it is kept as that session's other waiting messages are.
