@@ -308,7 +308,7 @@ test("a controlled session whose host process is gone is ended, and its lease is
     store.upsert({ project_id: "p", display_name: "P", canonical_path: "/x/p" });
     const deadPid = spawnSync(process.execPath, ["-e", ""]).pid;
     const controlled = (sessionId: string, holderPid: number, worktreeId: string) => {
-      store.acquireLease({ worktree_id: worktreeId, project_id: "p", holder_pid: holderPid, at: "2026-10-24T12:00:00.000Z", expires_at: "2026-10-24T12:00:30.000Z" }, () => true);
+      store.acquireLease({ worktree_id: worktreeId, project_id: "p", holder_pid: holderPid, at: "2026-10-24T12:00:00.000Z" }, () => true);
       store.connectControlledSession({
         session_id: sessionId,
         project_id: "p",

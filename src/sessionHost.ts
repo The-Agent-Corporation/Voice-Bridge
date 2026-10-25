@@ -10,7 +10,6 @@ import { openStore, sessionId as sessionIdOf } from "./store.js";
 
 const KICK_MS = 250;
 const HEARTBEAT_MS = 5_000;
-const LEASE_EXPIRY_MS = 30_000;
 const SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
 
 /**
@@ -74,7 +73,6 @@ export async function runSessionHost({ projectId, provider, env, dataDir, out = 
   const ended = new Promise<EndReason>((resolve) => (endWith = resolve));
   const onSignal = (signal: (typeof SIGNALS)[number]) => endWith({ reason: "signal", signal });
   const now = () => new Date().toISOString();
-  const expiry = () => new Date(Date.now() + LEASE_EXPIRY_MS).toISOString();
 
   try {
     const project = store.getById(projectId);
@@ -93,7 +91,7 @@ export async function runSessionHost({ projectId, provider, env, dataDir, out = 
     if (!codex) throw new BridgeError("provider_not_installed", "codex was not found in any absolute PATH entry");
 
     const worktreeId = project.canonical_path;
-    store.acquireLease({ worktree_id: worktreeId, project_id: project.project_id, holder_pid: process.pid, at: now(), expires_at: expiry() }, leaseIsLive);
+    store.acquireLease({ worktree_id: worktreeId, project_id: project.project_id, holder_pid: process.pid, at: now() }, leaseIsLive);
     held = { worktree_id: worktreeId, holder_pid: process.pid };
     for (const signal of SIGNALS) process.on(signal, onSignal);
 
@@ -129,7 +127,7 @@ export async function runSessionHost({ projectId, provider, env, dataDir, out = 
     // The interval only notices messages the daemon stored; every state change comes from a provider event.
     const kicker = setInterval(kick, KICK_MS);
     const heartbeat = setInterval(() => {
-      if (!store.heartbeatLease(worktreeId, process.pid, now(), expiry())) endWith({ reason: "lease_lost" });
+      if (!store.heartbeatLease(worktreeId, process.pid, now())) endWith({ reason: "lease_lost" });
     }, HEARTBEAT_MS);
     void kick();
 
