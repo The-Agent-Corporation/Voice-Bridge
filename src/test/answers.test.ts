@@ -5,7 +5,7 @@ import { after, afterEach, beforeEach, describe, test } from "node:test";
 import { resolveProviderHomes, type ProviderHomes } from "../adapters/homes.js";
 import type { ObservedState } from "../adapters/types.js";
 import { createDispatcher, type NextTurnTarget } from "../dispatcher.js";
-import { questionFields } from "../inbox.js";
+import { dismissInboxQuestion, listInbox, questionFields } from "../inbox.js";
 import { answerInboxQuestion, cancelMessage, getMessage, MESSAGE_TTL_MS, submitMessage, type SendRequest } from "../messages.js";
 import { resolveOrigin } from "../primary.js";
 import { openStore, STORE_FILE, type InboxItem, type NewEvent, type Store, type StoredSession } from "../store.js";
@@ -114,6 +114,8 @@ describe("answer delivery and acknowledgement", () => {
   /** The asking session's host delivering what is queued for it, as src/sessionHost.ts does. */
   const deliver = (sessionId: string, via: NextTurnTarget) =>
     createDispatcher({ store, sessionId, target: via, clock, log: () => {}, onFatal: (error) => assert.fail(String(error)) }).kick();
+  let fail: (() => void) | undefined;
+  const failingLater = target(() => new Promise((_resolve, reject) => (fail = () => reject(new Error("session went away")))));
 
   const request = (questionId: string, key = "k", approveQueue = false): SendRequest => ({
     project_id: "a",
@@ -181,6 +183,19 @@ describe("answer delivery and acknowledgement", () => {
     assert.deepEqual(message.transitions.map((t) => t.state), ["accepted", "queued", "delivering", "delivered", "acknowledged"]);
   });
 
+  test("an ack that arrives before a delivery that then fails still resolves the question", async () => {
+    const qa = ask("a", SA);
+    const queued = answer(qa, session(SA));
+    const sending = deliver(SA, failingLater);
+    await new Promise((resolve) => setImmediate(resolve));
+    ack(SA, qa);
+    assert.equal(item(qa).status, "acknowledged");
+    fail!();
+    await sending;
+    assert.equal(current(queued.message_id).state, "failed");
+    assert.equal(item(qa).status, "resolved");
+  });
+
   test("a failed delivery reopens the question so it can be answered again", async () => {
     const qa = ask("a", SA);
     const queued = answer(qa, session(SA));
@@ -204,6 +219,56 @@ describe("answer delivery and acknowledgement", () => {
     const again = submitMessage(store, request(qa, "k2", true), resolveOrigin([saved], SA), saved, clock);
     assert.equal(item(qa).resolution_message_id, again.message_id);
     getMessage(store, { message_id: again.message_id }, () => new Date(NOW.getTime() + MESSAGE_TTL_MS + 1));
+    assert.deepEqual([item(qa).status, item(qa).resolution_message_id], ["open", null]);
+  });
+
+  test("listing or dismissing the inbox expires a queued answer first, so its question reads open again", () => {
+    const saved = session(SA, "saved");
+    const later = () => new Date(NOW.getTime() + MESSAGE_TTL_MS + 1);
+    const qa = ask("a", SA);
+    answer(qa, saved, true);
+    assert.deepEqual(listInbox(store, {}, later).items.map(({ status, resolution_message_id }) => [status, resolution_message_id]), [["open", null]]);
+
+    const qb = ask("a", SA, { summary: "Deploy?" });
+    const queued = submitMessage(store, request(qb, "k2", true), resolveOrigin([saved], SA), saved, clock);
+    assert.equal(dismissInboxQuestion(store, { question_id: qb }, later).dismissed, true);
+    assert.equal(store.getMessage(queued.message_id)!.state, "expired");
+  });
+
+  test("an answered question can still be dismissed, and its answer's later outcome does not reopen it", async () => {
+    const qa = ask("a", SA);
+    answer(qa, session(SA));
+    const sending = deliver(SA, failingLater);
+    await new Promise((resolve) => setImmediate(resolve));
+    ack(SA, qa);
+    assert.equal(item(qa).status, "acknowledged");
+    assert.equal(store.dismissInboxQuestion(qa)!.dismissed, true);
+    fail!();
+    await sending;
+    assert.equal(item(qa).status, "cancelled");
+
+    const qb = ask("a", SA, { summary: "Deploy?" });
+    const queued = submitMessage(store, request(qb, "k2", true), resolveOrigin([session(SA, "saved")], SA), session(SA, "saved"), clock);
+    assert.equal(item(qb).status, "answer_queued");
+    assert.equal(store.dismissInboxQuestion(qb)!.dismissed, true);
+    cancelMessage(store, { message_id: queued.message_id }, clock);
+    assert.equal(item(qb).status, "cancelled");
+
+    const qc = ask("a", SA, { summary: "Merge?" });
+    submitMessage(store, request(qc, "k3"), resolveOrigin([session(SA)], SA), session(SA), clock);
+    await deliver(SA, accepting);
+    assert.equal(item(qc).status, "delivered");
+    assert.equal(store.dismissInboxQuestion(qc)!.dismissed, true);
+    ack(SA, qc);
+    assert.equal(item(qc).status, "cancelled");
+  });
+
+  test("a question retyped to an approval after the tool's check is still refused by the store", () => {
+    const qa = ask("a", SA, { question_id: "theirs", summary: "Ship it?", type: "question" });
+    ingest("a", SA, "user_question", { question_id: "theirs", summary: "Ship it?", type: "approval" });
+    assert.equal(item(qa).type, "approval");
+    assert.throws(() => answer(qa, session(SA)), { code: "unsupported_capability" });
+    assert.equal(messageCount(), 0);
     assert.deepEqual([item(qa).status, item(qa).resolution_message_id], ["open", null]);
   });
 

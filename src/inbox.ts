@@ -1,5 +1,6 @@
 import { oneLine, redactSecrets, stringField } from "./briefing.js";
 import { BridgeError, requireString } from "./errors.js";
+import type { Clock } from "./messages.js";
 import { INBOX_STATUSES, type InboxItem, type InboxStatus, type QuestionFields, type Store } from "./store.js";
 
 function payloadFields(payload: unknown): Record<string, unknown> {
@@ -35,8 +36,11 @@ function presented(item: InboxItem): InboxItem {
   return { ...item, summary: redactSecrets(oneLine(item.summary)) };
 }
 
-/** Reads the store only; it is never given provider homes, so it cannot reach an adapter. */
-export function listInbox(store: Store, body: Record<string, unknown>): { items: InboxItem[] } {
+/**
+ * Never given provider homes, so it cannot reach an adapter; it writes only the expiry of queued answers,
+ * so an item whose answer expired reads `open` again.
+ */
+export function listInbox(store: Store, body: Record<string, unknown>, clock: Clock = () => new Date()): { items: InboxItem[] } {
   const projectId = body.project_id === undefined ? undefined : requireString(body, "project_id");
   if (projectId !== undefined && !store.getById(projectId)) {
     throw new BridgeError("project_not_found", `no project registered with id ${projectId}`);
@@ -45,11 +49,17 @@ export function listInbox(store: Store, body: Record<string, unknown>): { items:
   if (status !== undefined && !isInboxStatus(status)) {
     throw new BridgeError("invalid_request", `status must be one of ${INBOX_STATUSES.join(", ")}`);
   }
+  store.expireMessages(clock().toISOString());
   return { items: store.listInbox({ project_id: projectId, status }).map(presented) };
 }
 
-export function dismissInboxQuestion(store: Store, body: Record<string, unknown>): { item: InboxItem; dismissed: boolean } {
+export function dismissInboxQuestion(
+  store: Store,
+  body: Record<string, unknown>,
+  clock: Clock = () => new Date(),
+): { item: InboxItem; dismissed: boolean } {
   const questionId = requireString(body, "question_id");
+  store.expireMessages(clock().toISOString());
   const result = store.dismissInboxQuestion(questionId);
   if (!result) throw new BridgeError("inbox_question_not_found", `no inbox question with id ${questionId}`);
   return { item: presented(result.item), dismissed: result.dismissed };

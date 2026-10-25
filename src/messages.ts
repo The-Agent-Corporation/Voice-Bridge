@@ -4,6 +4,7 @@ import { BridgeError, requireString } from "./errors.js";
 import { getPrimarySession, resolveOrigin, type PrimaryRoute } from "./primary.js";
 import { discoverProjectSessions } from "./sessions.js";
 import {
+  approvalUnsupported,
   matchDuplicateMessage,
   MESSAGE_MODES,
   type MessageIdentity,
@@ -150,12 +151,7 @@ export async function answerInboxQuestion(
   if (stored) return { ...receipt(matchDuplicateMessage(stored, messageIdentity(request))), duplicate: true };
 
   if (item.status !== "open") throw questionNotOpen(questionId, item.status);
-  if (item.type === "approval") {
-    throw new BridgeError(
-      "unsupported_capability",
-      `answering approval ${questionId} needs the asking session's answerPendingQuestion capability, which no session in this build has; nothing was sent`,
-    );
-  }
+  if (item.type === "approval") throw approvalUnsupported(questionId);
   const origin = item.origin_session_id;
   if (origin === null) {
     throw new BridgeError("no_origin_session", `question ${questionId} has no asking session to answer; dismiss it instead`);

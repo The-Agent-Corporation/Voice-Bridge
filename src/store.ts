@@ -329,6 +329,17 @@ export function questionNotOpen(questionId: string, status: string): BridgeError
   return new BridgeError("inbox_question_not_open", `inbox question ${questionId} is ${status}, so it cannot be answered`);
 }
 
+/**
+ * An answer to an approval; the tool and the store refuse it with the same error, since sending it as a
+ * next turn would fabricate the approval.
+ */
+export function approvalUnsupported(questionId: string): BridgeError {
+  return new BridgeError(
+    "unsupported_capability",
+    `answering approval ${questionId} needs the asking session's answerPendingQuestion capability, which no session in this build has; nothing was sent`,
+  );
+}
+
 export interface TurnState {
   session_id: string;
   type: (typeof TURN_EVENT_TYPES)[number];
@@ -868,7 +879,8 @@ export function openStore(dataDir: string): Store {
   `);
   const inboxItemById = db.prepare("SELECT * FROM inbox_items WHERE question_id = ?");
   const cancelInboxItem = db.prepare(
-    "UPDATE inbox_items SET status = 'cancelled', dismissed_at = ? WHERE question_id = ? AND status = 'open'",
+    `UPDATE inbox_items SET status = 'cancelled', dismissed_at = ?
+     WHERE question_id = ? AND status IN ('open', 'answer_queued', 'delivered', 'acknowledged')`,
   );
   const notifications = db.prepare("SELECT * FROM inbox_notifications ORDER BY notification_id");
 
@@ -1242,6 +1254,7 @@ export function openStore(dataDir: string): Store {
         if (message.question_id !== null) {
           const item = inboxItemById.get(message.question_id) as InboxItem | undefined;
           if (item?.status !== "open") throw questionNotOpen(message.question_id, item?.status ?? "missing");
+          if (item.type === "approval") throw approvalUnsupported(message.question_id);
         }
         const { decision } = message;
         // Routed to a controlled session that ended since: it is kept as that session's other waiting messages are.
