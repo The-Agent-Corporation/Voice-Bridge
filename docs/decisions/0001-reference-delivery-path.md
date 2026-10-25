@@ -1,6 +1,6 @@
 # 0001 — Reference path for live delivery in V1
 
-**Status: Proposed — held for a human (MISSION Q2).** This is not a decision until a person moves Q2 into MISSION's Decisions.
+**Status: Accepted — approved by Fred on 2026-10-24 (MISSION Q2).** Recorded in MISSION's Decisions.
 
 ## Question
 

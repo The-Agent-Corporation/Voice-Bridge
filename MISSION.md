@@ -113,7 +113,6 @@ them**, build against it, and record what it assumed -- the merge is then held f
 human, so nothing ships on a guess and nothing stops for one.
 
 - **Q1** Which one voice provider is the first adapter? Text mode is the acceptance baseline until a person picks one.
-- **Q2** After the Milestone 0 spike, which single bridge-controlled provider path is the reference for live delivery in V1?
 
 **Except these, which do stop the factory** -- they are irreversible (see
 `FACTORY_RULES.md`) rather than open in the ordinary sense:
@@ -129,6 +128,7 @@ stops being asked. **A decision is asked once.**
 - 2026-10-21 **Packaging.** Standalone local daemon plus a CLI and a local API. Electron is optional and is not required for V1. From docs/PRD.md section 19.
 - 2026-10-21 **State.** SQLite in the local application data folder. `VOICE.md` is a generated projection and is generally left uncommitted. `.voice/config.json` is checked in and holds no secrets and no live session ids.
 - 2026-10-21 **Agents.** Codex first, Claude Code second, after the capability spike. Text mode is how acceptance is proven.
+- 2026-10-24 **Reference delivery path (Q2).** Codex App Server, started by the bridge over stdio (`codex app-server --listen stdio://`), delivering only to threads the bridge-owned process created or resumed. Approved by Fred. See docs/decisions/0001-reference-delivery-path.md.
 - 2026-10-21 **Primary session.** The user's pin, otherwise the sole connected session, otherwise the most recent saved session for reading only. If it cannot be attached, say so and do not spawn another writer.
 - 2026-10-21 **Summary size.** Briefings target 250–600 words, with a default cap of 800 model tokens.
 - 2026-10-24 **Stack for the ordinary gate.** TypeScript on Node.js, because the PRD tells the coding agent to scaffold a modular TypeScript program for a Node environment, and a daemon plus CLI is the V1 default. Static check is `npx --no-install tsc --noEmit`. Unit tests are `npm test` running `node --test`. No Electron and no voice vendor in that gate.
