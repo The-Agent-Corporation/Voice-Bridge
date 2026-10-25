@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { after, before, describe, test } from "node:test";
 import { startBridge, type RunningBridge } from "../app.js";
 import { runGit } from "../git.js";
+import { reconcileControlledSessions } from "../lease.js";
 import { openStore } from "../store.js";
 import { readClientToken } from "../token.js";
 import {
@@ -298,4 +300,36 @@ describe("saved session discovery", () => {
     assert.equal(response.status, 404);
     assert.equal(response.body.error.code, "project_not_found");
   });
+});
+
+test("a controlled session whose host process is gone is ended, and its lease is kept for the next start to judge", () => {
+  const store = openStore(tempDir());
+  try {
+    store.upsert({ project_id: "p", display_name: "P", canonical_path: "/x/p" });
+    const deadPid = spawnSync(process.execPath, ["-e", ""]).pid;
+    const controlled = (sessionId: string, holderPid: number, worktreeId: string) => {
+      store.acquireLease({ worktree_id: worktreeId, project_id: "p", holder_pid: holderPid, at: "2026-10-24T12:00:00.000Z", expires_at: "2026-10-24T12:00:30.000Z" }, () => true);
+      store.connectControlledSession({
+        session_id: sessionId,
+        project_id: "p",
+        provider: "codex",
+        native_session_id: sessionId.slice("codex:".length),
+        worktree_id: worktreeId,
+        observed_state: "connected_running",
+        last_activity_at: "2026-10-24T12:00:00.000Z",
+        capabilities: { ...NO_CAPABILITIES, next_turn: true },
+        holder_pid: holderPid,
+        provider_pgid: holderPid,
+        started_at: "2026-10-24T12:00:00.000Z",
+      });
+    };
+    controlled("codex:dead", deadPid, "/x/p");
+    controlled("codex:live", process.pid, "/x/p/linked");
+
+    reconcileControlledSessions(store, "p", "2026-10-24T12:01:00.000Z");
+    assert.deepEqual(store.listLiveControlledSessions("p").map((s) => s.session_id), ["codex:live"]);
+    assert.equal(store.getLease("/x/p")?.owner_session_id, "codex:dead");
+  } finally {
+    store.close();
+  }
 });

@@ -6,6 +6,7 @@ import { resolveDataDir } from "./dataDir.js";
 import type { PrimaryResult } from "./primary.js";
 import { runProbe } from "./probe.js";
 import type { OpenedProject, ProjectSummary, RegisterResult } from "./registry.js";
+import { runSessionHost } from "./sessionHost.js";
 import type { SessionList } from "./sessions.js";
 import type { ProjectStatus } from "./status.js";
 import type { InboxItem } from "./store.js";
@@ -21,7 +22,8 @@ const USAGE = `usage:
   voice-bridge primary <project_id> --unpin
   voice-bridge status <project_id> [--why]
   voice-bridge inbox [--project <project_id>] [--status <status>]
-  voice-bridge probe`;
+  voice-bridge probe
+  voice-bridge session start <project_id> --provider <provider>`;
 
 class CliError extends Error {
   constructor(readonly code: string, message: string) {
@@ -188,6 +190,9 @@ async function run(args: string[]): Promise<number> {
     console.log(JSON.stringify(report, null, 2));
     // A provider process that outlived the probe is a broken guarantee, so it fails the command.
     return report.children.every((child) => child.reaped) ? 0 : 1;
+  }
+  if (command === "session" && arg === "start" && rest.length === 3 && rest[0] && rest[1] === "--provider" && rest[2]) {
+    return runSessionHost({ projectId: rest[0], provider: rest[2], env: process.env, dataDir: resolveDataDir(process.env) });
   }
   console.error(USAGE);
   return 2;

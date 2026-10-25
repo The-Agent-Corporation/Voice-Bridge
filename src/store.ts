@@ -1,10 +1,10 @@
 import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
-import type { DiscoveredSession, Provider } from "./adapters/types.js";
+import type { DiscoveredSession, ObservedState, Provider } from "./adapters/types.js";
 import { BridgeError } from "./errors.js";
 
 export const STORE_FILE = "bridge.sqlite";
-const SCHEMA_VERSION = 7;
+const SCHEMA_VERSION = 8;
 const SQLITE_CONSTRAINT_UNIQUE = 2067;
 
 export interface Project {
@@ -18,6 +18,36 @@ export interface Project {
 export interface StoredSession extends DiscoveredSession {
   /** `<provider>:<native_session_id>`, stable across rediscovery. */
   session_id: string;
+}
+
+/** A session the bridge itself started and holds (src/sessionHost.ts), with the process evidence for it. */
+export interface ControlledSession extends StoredSession {
+  project_id: string;
+  /** The `voice-bridge session start` process that owns the provider connection. */
+  holder_pid: number;
+  /** The provider's process group, led by the provider process. */
+  provider_pgid: number;
+  started_at: string;
+  /** Set once the session is over; it is never reopened. */
+  ended_at: string | null;
+}
+
+/**
+ * One worktree's writer lease (docs/PRD.md §10). The heartbeat and expiry are reported, never used to
+ * judge liveness: only process evidence releases a lease whose holder or provider may still run.
+ */
+export interface WorkspaceLease {
+  worktree_id: string;
+  project_id: string;
+  /** Null until the provider has connected. */
+  owner_session_id: string | null;
+  holder_pid: number;
+  /** Null until the provider has been started. */
+  provider_pgid: number | null;
+  enforceability: "bridge_controlled";
+  acquired_at: string;
+  heartbeat_at: string;
+  expires_at: string;
 }
 
 export interface PrimaryPin {
@@ -166,8 +196,8 @@ export interface InboxNotification {
 
 /**
  * The message states of docs/PRD.md Appendix A but `draft`, which the bridge never stores, plus
- * `delivering`: handed to the adapter, outcome not yet known, so neither cancel nor expiry may touch it.
- * This build writes `accepted`, `queued`, `delivering`, `delivered`, `failed`, `expired` and `cancelled`.
+ * `delivering`: handed to the provider, outcome not yet known, so neither cancel nor expiry may touch it.
+ * This build writes every state but `acknowledged`.
  */
 export const MESSAGE_STATES = [
   "accepted",
@@ -200,8 +230,15 @@ export type MessageReason =
   | "awaiting_delivery"
   | "handed_to_adapter"
   | "adapter_receipt"
+  | "turn_started"
+  | "turn_completed"
+  | "turn_failed"
+  | "owner_disconnected"
   | "cancelled_by_user"
   | "expired_unsent";
+
+/** The reasons a dispatcher sends a queued message for; a message queued for any other reason keeps it. */
+export const SENDABLE_REASONS: ReadonlySet<MessageReason> = new Set(["awaiting_delivery", "awaiting_earlier_messages"]);
 
 export interface MessageChange {
   state: MessageState;
@@ -247,9 +284,10 @@ export interface NewMessage {
   approve_queue: boolean;
   idempotency_key: string;
   /**
-   * The routing decision. `deliverable` stores `delivering`, through `queued` with `awaiting_delivery`,
-   * or `queued` with `awaiting_earlier_messages` when the project already has a queued or delivering
-   * message, which must go first; any other decision is stored as given.
+   * The routing decision. `deliverable` stores `queued`, with `awaiting_delivery`, or with
+   * `awaiting_earlier_messages` when its session already has a queued or delivering message, which
+   * goes first; the session host's dispatcher delivers it. A session that has ended gets it with
+   * `owner_disconnected`. Any other decision is stored as given.
    */
   decision: { deliverable: true } | { deliverable: false; state: MessageState; reason: MessageReason; detail: string };
   created_at: string;
@@ -290,7 +328,10 @@ export interface Store {
   upsert(project: Omit<Project, "created_at" | "updated_at">): { project: Project; created: boolean };
   /** Replaces every stored session of the project with `sessions`, in one transaction. */
   replaceSessions(projectId: string, sessions: readonly DiscoveredSession[]): void;
-  /** Most recent activity first, then by session_id. */
+  /**
+   * Most recent activity first, then by session_id. A live controlled session replaces the discovered
+   * row with its id; an ended one is left out, so discovery reports it as its saved record says.
+   */
   listSessions(projectId: string): StoredSession[];
   getPin(projectId: string): PrimaryPin | undefined;
   /** Pins the session, replacing any earlier pin, and records a `pin` audit row in the same transaction. */
@@ -352,6 +393,35 @@ export interface Store {
   ): { message: StoredMessage; changed: boolean } | undefined;
   /** Moves every queued message whose `expires_at` is at or before `now` to `expired`, in one transaction. */
   expireMessages(now: string): void;
+  /** The session's queued message with the lowest sequence. */
+  nextQueuedMessage(sessionId: string): StoredMessage | undefined;
+  getLease(worktreeId: string): WorkspaceLease | undefined;
+  /**
+   * Takes the worktree's lease for `holder_pid`, in one immediate transaction, so two starts serialize.
+   * A held lease that `isLive` judges live throws `workspace_owned` and writes nothing; a stale one has
+   * its session ended and is replaced.
+   */
+  acquireLease(
+    lease: Pick<WorkspaceLease, "worktree_id" | "project_id" | "holder_pid" | "expires_at"> & { at: string },
+    isLive: (held: WorkspaceLease) => boolean,
+  ): void;
+  /** Deletes the lease only while `holderPid` has it. */
+  releaseLease(worktreeId: string, holderPid: number): void;
+  /** Records the provider's group on the holder's lease; false when the holder no longer has it. */
+  setLeaseProvider(worktreeId: string, holderPid: number, providerPgid: number): boolean;
+  /** Renews the holder's heartbeat; false when the holder no longer has the lease. */
+  heartbeatLease(worktreeId: string, holderPid: number, at: string, expiresAt: string): boolean;
+  /** Inserts the session and names it the owner of its holder's lease, in one transaction. */
+  connectControlledSession(session: Omit<ControlledSession, "ended_at">): void;
+  setControlledState(sessionId: string, state: ObservedState, at: string): void;
+  /**
+   * Ends the session, in one transaction: it becomes `unreachable`; its waiting messages stay `queued`
+   * with `owner_disconnected`; a message handed over or running becomes `failed`, never to be resent.
+   * With `release`, the lease is deleted too, but only while that holder has it.
+   */
+  endControlledSession(sessionId: string, detail: string, at: string, release?: { worktree_id: string; holder_pid: number }): void;
+  /** The project's controlled sessions not yet ended. */
+  listLiveControlledSessions(projectId: string): ControlledSession[];
   close(): void;
 }
 
@@ -503,19 +573,57 @@ const MESSAGE_TABLES = `
   );
 `;
 
+/**
+ * No foreign key to sessions: replaceSessions rewrites that table. The lease's primary key is the
+ * worktree, so one worktree has at most one holder.
+ */
+const CONTROL_TABLES = `
+  CREATE TABLE IF NOT EXISTS controlled_sessions (
+    session_id        TEXT PRIMARY KEY,
+    project_id        TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+    provider          TEXT NOT NULL,
+    native_session_id TEXT NOT NULL,
+    worktree_id       TEXT NOT NULL,
+    observed_state    TEXT NOT NULL,
+    last_activity_at  TEXT,
+    capabilities      TEXT NOT NULL,
+    holder_pid        INTEGER NOT NULL,
+    provider_pgid     INTEGER NOT NULL,
+    started_at        TEXT NOT NULL,
+    ended_at          TEXT
+  );
+  CREATE TABLE IF NOT EXISTS workspace_leases (
+    worktree_id      TEXT PRIMARY KEY,
+    project_id       TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+    owner_session_id TEXT,
+    holder_pid       INTEGER NOT NULL,
+    provider_pgid    INTEGER,
+    enforceability   TEXT NOT NULL CHECK (enforceability IN ('bridge_controlled')),
+    acquired_at      TEXT NOT NULL,
+    heartbeat_at     TEXT NOT NULL,
+    expires_at       TEXT NOT NULL
+  );
+`;
+
 /** Tables each known version still lacks; every step only adds tables and leaves stored rows alone. */
 const MIGRATIONS: Record<number, string> = {
-  0: PROJECTS_TABLE + SESSIONS_TABLE + PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES + BRIEFINGS_TABLE + INBOX_TABLES + MESSAGE_TABLES,
-  1: SESSIONS_TABLE + PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES + BRIEFINGS_TABLE + INBOX_TABLES + MESSAGE_TABLES,
-  2: PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES + BRIEFINGS_TABLE + INBOX_TABLES + MESSAGE_TABLES,
-  3: EVENT_TABLES + BRIEFINGS_TABLE + INBOX_TABLES + MESSAGE_TABLES,
-  4: BRIEFINGS_TABLE + INBOX_TABLES + MESSAGE_TABLES,
-  5: INBOX_TABLES + MESSAGE_TABLES,
-  6: MESSAGE_TABLES,
+  0: PROJECTS_TABLE + SESSIONS_TABLE + PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES + BRIEFINGS_TABLE + INBOX_TABLES + MESSAGE_TABLES + CONTROL_TABLES,
+  1: SESSIONS_TABLE + PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES + BRIEFINGS_TABLE + INBOX_TABLES + MESSAGE_TABLES + CONTROL_TABLES,
+  2: PRIMARY_PINS_TABLE + PIN_AUDIT_TABLE + EVENT_TABLES + BRIEFINGS_TABLE + INBOX_TABLES + MESSAGE_TABLES + CONTROL_TABLES,
+  3: EVENT_TABLES + BRIEFINGS_TABLE + INBOX_TABLES + MESSAGE_TABLES + CONTROL_TABLES,
+  4: BRIEFINGS_TABLE + INBOX_TABLES + MESSAGE_TABLES + CONTROL_TABLES,
+  5: INBOX_TABLES + MESSAGE_TABLES + CONTROL_TABLES,
+  6: MESSAGE_TABLES + CONTROL_TABLES,
+  7: CONTROL_TABLES,
 };
 
+/**
+ * Every transaction here writes, and a session host writes the same store as the daemon. `IMMEDIATE`
+ * takes the write lock up front, where the busy timeout applies; a deferred read that later tries to
+ * write fails at once if the other process committed in between.
+ */
 function inTransaction<T>(db: DatabaseSync, work: () => T): T {
-  db.exec("BEGIN");
+  db.exec("BEGIN IMMEDIATE");
   try {
     const result = work();
     db.exec("COMMIT");
@@ -548,7 +656,7 @@ export function openStore(dataDir: string): Store {
   const file = path.join(dataDir, STORE_FILE);
   const db = new DatabaseSync(file);
   try {
-    db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
+    db.exec("PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
     initSchema(db, file);
   } catch (error) {
     db.close();
@@ -574,11 +682,43 @@ export function openStore(dataDir: string): Store {
     VALUES (:project_id, :session_id, :provider, :native_session_id, :worktree_id,
             :observed_state, :last_activity_at, :capabilities)
   `);
+  const SESSION_COLUMNS = "session_id, provider, native_session_id, worktree_id, observed_state, last_activity_at, capabilities";
+  const LIVE_CONTROLLED = "controlled_sessions WHERE project_id = :project_id AND ended_at IS NULL";
   const sessionsOf = db.prepare(`
-    SELECT session_id, provider, native_session_id, worktree_id, observed_state, last_activity_at, capabilities
-    FROM sessions WHERE project_id = ?
+    SELECT * FROM (
+      SELECT ${SESSION_COLUMNS} FROM sessions
+      WHERE project_id = :project_id AND session_id NOT IN (SELECT session_id FROM ${LIVE_CONTROLLED})
+      UNION ALL
+      SELECT ${SESSION_COLUMNS} FROM ${LIVE_CONTROLLED}
+    )
     ORDER BY last_activity_at IS NULL, last_activity_at DESC, session_id
   `);
+  const liveControlled = db.prepare(`SELECT * FROM ${LIVE_CONTROLLED} ORDER BY started_at, session_id`);
+  const insertControlled = db.prepare(`
+    INSERT INTO controlled_sessions (session_id, project_id, provider, native_session_id, worktree_id, observed_state,
+                                     last_activity_at, capabilities, holder_pid, provider_pgid, started_at)
+    VALUES (:session_id, :project_id, :provider, :native_session_id, :worktree_id, :observed_state,
+            :last_activity_at, :capabilities, :holder_pid, :provider_pgid, :started_at)
+  `);
+  const updateControlledState = db.prepare(
+    "UPDATE controlled_sessions SET observed_state = ?, last_activity_at = ? WHERE session_id = ? AND ended_at IS NULL",
+  );
+  const endedControlled = db.prepare("SELECT 1 FROM controlled_sessions WHERE session_id = ? AND ended_at IS NOT NULL");
+  const endControlled = db.prepare(
+    "UPDATE controlled_sessions SET observed_state = 'unreachable', ended_at = ? WHERE session_id = ? AND ended_at IS NULL",
+  );
+  const leaseOf = db.prepare("SELECT * FROM workspace_leases WHERE worktree_id = ?");
+  const insertLease = db.prepare(`
+    INSERT INTO workspace_leases (worktree_id, project_id, owner_session_id, holder_pid, provider_pgid, enforceability,
+                                  acquired_at, heartbeat_at, expires_at)
+    VALUES (:worktree_id, :project_id, NULL, :holder_pid, NULL, 'bridge_controlled', :at, :at, :expires_at)
+  `);
+  const deleteLease = db.prepare("DELETE FROM workspace_leases WHERE worktree_id = ? AND holder_pid = ?");
+  const setLeaseProvider = db.prepare("UPDATE workspace_leases SET provider_pgid = ? WHERE worktree_id = ? AND holder_pid = ?");
+  const setLeaseOwner = db.prepare("UPDATE workspace_leases SET owner_session_id = ? WHERE worktree_id = ? AND holder_pid = ?");
+  const heartbeat = db.prepare(
+    "UPDATE workspace_leases SET heartbeat_at = ?, expires_at = ? WHERE worktree_id = ? AND holder_pid = ?",
+  );
 
   const pinOf = db.prepare("SELECT project_id, session_id, pinned_at FROM primary_pins WHERE project_id = ?");
   const upsertPin = db.prepare(`
@@ -701,8 +841,14 @@ export function openStore(dataDir: string): Store {
   const nextSequence = db.prepare(
     "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM messages WHERE project_id = ?",
   );
-  const pendingInProject = db.prepare(
-    "SELECT 1 FROM messages WHERE project_id = ? AND state IN ('queued', 'delivering') LIMIT 1",
+  const pendingForSession = db.prepare(
+    "SELECT 1 FROM messages WHERE session_id IS ? AND state IN ('queued', 'delivering') LIMIT 1",
+  );
+  const nextQueued = db.prepare(
+    "SELECT * FROM messages WHERE session_id = ? AND state = 'queued' ORDER BY sequence LIMIT 1",
+  );
+  const sessionMessages = db.prepare(
+    "SELECT message_id, state, reason FROM messages WHERE session_id = ? AND state IN ('queued', 'delivering', 'delivered', 'started') ORDER BY sequence",
   );
   const insertMessage = db.prepare(`
     INSERT INTO messages (message_id, project_id, session_id, sequence, mode, body, approve_queue, idempotency_key,
@@ -798,6 +944,26 @@ export function openStore(dataDir: string): Store {
     return changes > 0;
   };
 
+  const endSession = (sessionId: string, detail: string, at: string) => {
+    endControlled.run(at, sessionId);
+    const messages = sessionMessages.all(sessionId) as { message_id: string; state: MessageState; reason: MessageReason }[];
+    for (const { message_id, state, reason } of messages) {
+      if (state === "queued" && !SENDABLE_REASONS.has(reason)) continue;
+      const outcome =
+        state === "queued"
+          ? `${detail}; not delivered, and it will not be sent to another session`
+          : state === "delivering"
+            ? `${detail}; the provider never confirmed the turn, which may have started, and it will not be resent`
+            : `${detail}; the turn did not complete`;
+      applyTransition(message_id, state, { state: state === "queued" ? "queued" : "failed", reason: "owner_disconnected", detail: outcome }, at);
+    }
+  };
+  const controlledSession = (row: Record<string, unknown>): ControlledSession => ({
+    ...(row as unknown as Omit<ControlledSession, "capabilities">),
+    capabilities: JSON.parse(row.capabilities as string),
+  });
+  const lease = (row: unknown): WorkspaceLease | undefined => (row ? { ...(row as WorkspaceLease) } : undefined);
+
   const getById = (projectId: string) => byId.get(projectId) as Project | undefined;
   const getByPath = (canonicalPath: string) => byPath.get(canonicalPath) as Project | undefined;
 
@@ -855,7 +1021,7 @@ export function openStore(dataDir: string): Store {
       });
     },
     listSessions(projectId) {
-      const rows = sessionsOf.all(projectId) as unknown as (Omit<StoredSession, "capabilities"> & { capabilities: string })[];
+      const rows = sessionsOf.all({ project_id: projectId }) as unknown as (Omit<StoredSession, "capabilities"> & { capabilities: string })[];
       return rows.map((row) => ({ ...row, capabilities: JSON.parse(row.capabilities) }));
     },
     getPin(projectId) {
@@ -955,12 +1121,14 @@ export function openStore(dataDir: string): Store {
         const stored = findMessageByKey(message.idempotency_key);
         if (stored) return { message: matchDuplicateMessage(stored, message), duplicate: true };
         const { decision } = message;
-        const headOfQueue = decision.deliverable && !pendingInProject.get(message.project_id);
+        // Routed to a controlled session that ended since: it is kept as that session's other waiting messages are.
         const { state, reason, detail }: MessageChange = !decision.deliverable
           ? decision
-          : headOfQueue
-            ? { state: "delivering", reason: "handed_to_adapter", detail: "handing the message to the primary session" }
-            : { state: "queued", reason: "awaiting_earlier_messages", detail: "an earlier message in this project is still pending" };
+          : endedControlled.get(message.session_id)
+            ? { state: "queued", reason: "owner_disconnected", detail: `${message.session_id} ended before the message was stored; it will not be sent to another session` }
+            : pendingForSession.get(message.session_id)
+            ? { state: "queued", reason: "awaiting_earlier_messages", detail: "an earlier message to this session is still pending" }
+            : { state: "queued", reason: "awaiting_delivery", detail: "waiting for the session to be idle" };
         const { sequence } = nextSequence.get(message.project_id) as { sequence: number };
         insertMessage.run({
           message_id: message.message_id,
@@ -978,7 +1146,6 @@ export function openStore(dataDir: string): Store {
           expires_at: message.expires_at,
         });
         insertTransition.run(message.message_id, "accepted", "authenticated", message.created_at);
-        if (headOfQueue) insertTransition.run(message.message_id, "queued", "awaiting_delivery", message.created_at);
         insertTransition.run(message.message_id, state, reason, message.created_at);
         return { message: getMessage(message.message_id)!, duplicate: false };
       });
@@ -996,6 +1163,58 @@ export function openStore(dataDir: string): Store {
           applyTransition(message_id, "queued", EXPIRED, now);
         }
       });
+    },
+    nextQueuedMessage(sessionId) {
+      return storedMessage(nextQueued.get(sessionId));
+    },
+    getLease(worktreeId) {
+      return lease(leaseOf.get(worktreeId));
+    },
+    acquireLease(wanted, isLive) {
+      return inTransaction(db, () => {
+        const held = lease(leaseOf.get(wanted.worktree_id));
+        if (held && isLive(held)) {
+          throw new BridgeError(
+            "workspace_owned",
+            `${wanted.worktree_id} is held by bridge session host pid ${held.holder_pid}` +
+              `${held.provider_pgid === null ? "" : `, provider process group ${held.provider_pgid}`}` +
+              `${held.owner_session_id === null ? "" : `, session ${held.owner_session_id}`}` +
+              `, last heartbeat ${held.heartbeat_at}, expiry ${held.expires_at}`,
+          );
+        }
+        if (held) {
+          if (held.owner_session_id !== null) endSession(held.owner_session_id, `the lease of ${held.worktree_id} was found stale`, wanted.at);
+          deleteLease.run(held.worktree_id, held.holder_pid);
+        }
+        insertLease.run({ ...wanted });
+      });
+    },
+    releaseLease(worktreeId, holderPid) {
+      deleteLease.run(worktreeId, holderPid);
+    },
+    setLeaseProvider(worktreeId, holderPid, providerPgid) {
+      return setLeaseProvider.run(providerPgid, worktreeId, holderPid).changes > 0;
+    },
+    heartbeatLease(worktreeId, holderPid, at, expiresAt) {
+      return heartbeat.run(at, expiresAt, worktreeId, holderPid).changes > 0;
+    },
+    connectControlledSession(session) {
+      inTransaction(db, () => {
+        insertControlled.run({ ...session, capabilities: JSON.stringify(session.capabilities) });
+        setLeaseOwner.run(session.session_id, session.worktree_id, session.holder_pid);
+      });
+    },
+    setControlledState(sessionId, state, at) {
+      updateControlledState.run(state, at, sessionId);
+    },
+    endControlledSession(sessionId, detail, at, release) {
+      inTransaction(db, () => {
+        endSession(sessionId, detail, at);
+        if (release) deleteLease.run(release.worktree_id, release.holder_pid);
+      });
+    },
+    listLiveControlledSessions(projectId) {
+      return (liveControlled.all({ project_id: projectId }) as Record<string, unknown>[]).map(controlledSession);
     },
     close() {
       db.close();

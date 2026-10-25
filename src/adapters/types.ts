@@ -50,23 +50,14 @@ export interface DiscoveryResult {
   skipped_records: number;
 }
 
-/** What a provider returns when it has taken a next-turn message. */
-export interface DeliveryReceipt {
-  /** The provider's own id for the delivered input, kept so later events can be matched to it. */
-  provider_ref: string;
-}
-
 /**
- * The slice of the provider adapter contract (docs/PRD.md §8) that has callers. `sendNextTurn` is
- * optional and no adapter implements it yet, so every session is undeliverable; the other control
- * methods there (inspectSession, capabilities, steerActiveTurn, answerPendingQuestion,
- * subscribeEvents) arrive with the work that first calls them. Until then a session's capabilities
- * are the all-false object it was discovered with.
+ * The slice of the provider adapter contract (docs/PRD.md §8) that reads saved records. A discovered
+ * session's capabilities are all false: delivery belongs to the bridge-controlled session host
+ * (src/sessionHost.ts), which holds its provider connection itself. The other control methods there
+ * (inspectSession, steerActiveTurn, answerPendingQuestion) arrive with the work that first calls them.
  */
 export interface AgentAdapter {
   readonly provider: Provider;
   /** Reads the provider's saved records without writing to them and keeps those whose cwd is one of `worktrees`. */
   discoverSessions(worktrees: readonly Worktree[]): Promise<DiscoveryResult>;
-  /** Hands `text` to the session as its next turn; the key lets the provider drop a repeated delivery. */
-  sendNextTurn?(nativeSessionId: string, text: string, idempotencyKey: string): Promise<DeliveryReceipt>;
 }

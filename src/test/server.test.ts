@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, symlinkSync } from "node:fs";
 import path from "node:path";
 import { after, before, describe, test } from "node:test";
 import { startBridge, type RunningBridge } from "../app.js";
+import { TOOLS } from "../server.js";
 import { readClientToken } from "../token.js";
 import { call, fixtureHomes, makeRepo, PRD_SAMPLE, removeTempDirs, tempDir, writeVoiceConfig } from "./helpers.js";
 
@@ -173,4 +174,23 @@ describe("bridge API", () => {
     assert.equal(response.status, 404);
     assert.equal(response.body.error.code, "project_not_found");
   });
+});
+
+test("the tool API offers no way to start, resume or fork a session", () => {
+  assert.deepEqual(Object.keys(TOOLS).sort(), [
+    "cancel_message",
+    "dismiss_inbox_question",
+    "get_message",
+    "get_primary_session",
+    "get_project_status",
+    "ingest_event",
+    "list_inbox",
+    "list_projects",
+    "list_sessions",
+    "open_project",
+    "pin_primary",
+    "register_project",
+    "send_to_primary",
+    "unpin_primary",
+  ]);
 });
