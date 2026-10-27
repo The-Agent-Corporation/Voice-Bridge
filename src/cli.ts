@@ -15,6 +15,7 @@ import type { InboxItem } from "./store.js";
 import { readClientToken } from "./token.js";
 
 const USAGE = `usage:
+  voice-bridge --help | -h | help
   voice-bridge register <path>
   voice-bridge projects
   voice-bridge open <project_id>
@@ -147,8 +148,14 @@ async function runChat(): Promise<number> {
   return failed ? 1 : 0;
 }
 
+const HELP_ALIASES = new Set(["--help", "-h", "help"]);
+
 async function run(args: string[]): Promise<number> {
   const [command, arg, ...rest] = args;
+  if (args.length === 1 && HELP_ALIASES.has(command!)) {
+    console.log(USAGE);
+    return 0;
+  }
   if (command === "register" && arg && rest.length === 0) {
     const result = await callTool<RegisterResult>("register_project", { path: path.resolve(arg) });
     const verb = result.created ? "registered" : "already registered";

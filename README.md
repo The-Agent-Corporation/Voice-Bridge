@@ -13,6 +13,7 @@ node dist/daemon.js --port 4517
 The daemon listens on `127.0.0.1` only. In another terminal:
 
 ```sh
+node dist/cli.js --help                   # or -h or help: the command reference, without the daemon
 node dist/cli.js register /path/to/repo   # reads /path/to/repo/.voice/config.json
 node dist/cli.js projects
 node dist/cli.js open <project_id>
