@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { execFile, spawnSync } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import path from "node:path";
 import { after, before, describe, test } from "node:test";
 import { daemonInfoPath, startBridge, type RunningBridge } from "../app.js";
 import { ensureClientToken, readClientToken } from "../token.js";
@@ -145,7 +146,12 @@ describe("voice-bridge CLI", () => {
   });
 
   test("bad usage exits 2", async () => {
-    assert.equal((await cli("unregister")).status, 2);
+    for (const args of [["unregister"], ["help", "extra"], ["--help", "projects"], ["-h", "-h"], ["--HELP"]]) {
+      const result = await cli(...args);
+      assert.equal(result.status, 2, args.join(" "));
+      assert.equal(result.stdout, "", args.join(" "));
+      assert.match(result.stderr, /^usage:\n/, args.join(" "));
+    }
     for (const args of [["status"], ["status", "desktop-agent", "--bogus"], ["status", "desktop-agent", "--why", "x"]]) {
       assert.equal((await cli(...args)).status, 2, args.join(" "));
     }
@@ -190,6 +196,22 @@ describe("voice-bridge CLI without a healthy daemon", () => {
     assert.equal(result.status, 1);
     assert.match(result.stderr, /daemon_not_running/);
     assert.deepEqual(seenAuthorization, []);
+  });
+
+  test("help prints usage to stdout without creating state or contacting a daemon", async () => {
+    const freshDir = path.join(tempDir(), "absent");
+    const hostileDir = dataDirPointingAt(squatterPort, process.pid);
+    const requestsBefore = seenAuthorization.length;
+    for (const alias of ["--help", "-h", "help"]) {
+      for (const dataDir of [freshDir, hostileDir]) {
+        const result = await runCli(dataDir, alias);
+        assert.equal(result.status, 0, alias);
+        assert.equal(result.stderr, "", alias);
+        assert.match(result.stdout, /^usage:\n {2}voice-bridge --help \| -h \| help\n {2}voice-bridge register <path>\n/, alias);
+      }
+      assert.equal(existsSync(freshDir), false, alias);
+    }
+    assert.equal(seenAuthorization.length, requestsBefore);
   });
 
   test("a connection dropped mid-request names the cause and says the outcome is unknown", async () => {
