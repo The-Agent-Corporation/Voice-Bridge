@@ -128,7 +128,7 @@ class Environments:
                 self.bindings[name] = True
             self.roots[name] = path
         self.stopping = stopping
-        self.base = Path(tempfile.mkdtemp(prefix="factory-runtime-"))
+        self.base = Path(tempfile.mkdtemp(prefix="factory-runtime-")).resolve()
         self.active = {}
         self.used_ports = set()
 
