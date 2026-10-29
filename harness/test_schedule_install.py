@@ -1,9 +1,11 @@
 """Schedule previews preserve bindings; Linux units preserve literal host paths."""
-from contextlib import ExitStack, contextmanager, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
+import stat
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -110,7 +112,7 @@ class ScheduleInstallTests(unittest.TestCase):
 
                 def interrupt(path, mode='r', *args, **kwargs):
                     stream = real_open(path, mode, *args, **kwargs)
-                    if path.parent == binding.parent and mode in ('w', 'x'):
+                    if path.parent == binding.parent and path.name.startswith(binding.name + '.') and mode in ('w', 'x'):
                         return InterruptedWrite(stream)
                     return stream
 
@@ -122,6 +124,99 @@ class ScheduleInstallTests(unittest.TestCase):
                 self.assertEqual(list(binding.parent.glob('*.tmp')), [])
                 self.assertEqual(list(home.rglob('*')), [])
                 self.assertEqual(commands, [])
+
+    def test_guard_sync_failure_preserves_binding_before_installation(self):
+        with self.project() as (root, home, commands, _):
+            binding = root / consumer.TRIGGER
+            original = b'{"installed": "original"}\n'
+            binding.write_bytes(original)
+            real_fsync = os.fsync
+            def fail_directory_sync(fd):
+                if stat.S_ISDIR(os.fstat(fd).st_mode):
+                    raise OSError('synthetic guard sync failure')
+                return real_fsync(fd)
+            with patch.object(consumer.os, 'fsync', fail_directory_sync), \
+                    self.assertRaisesRegex(OSError, 'guard sync failure'):
+                consumer.schedule(root, ['install', '--apply'])
+            self.assertEqual(binding.read_bytes(), original)
+            self.assertTrue((root / '.factory/schedule-install-pending.json').exists())
+            self.assertEqual(commands, [])
+            self.assertEqual(list(home.rglob('*')), [])
+
+    def test_post_replace_sync_failures_block_dispatch_until_successful_reinstall(self):
+        for operation in ('open', 'fsync'):
+            with self.subTest(operation=operation), self.project() as (root, home, commands, _):
+                binding = root / consumer.TRIGGER
+                binding.write_text('{"old": true}')
+                replaced = []
+                real_replace, real_open, real_fsync = os.replace, os.open, os.fsync
+                def replace(source, target):
+                    real_replace(source, target)
+                    if target == binding:
+                        replaced.append(target)
+                def open_directory(path, flags, *args, **kwargs):
+                    if operation == 'open' and replaced and path == binding.parent:
+                        raise OSError('synthetic directory open failure')
+                    return real_open(path, flags, *args, **kwargs)
+                def sync(fd):
+                    if operation == 'fsync' and replaced and stat.S_ISDIR(os.fstat(fd).st_mode):
+                        raise OSError('synthetic directory sync failure')
+                    return real_fsync(fd)
+                with patch.object(consumer.os, 'replace', replace), \
+                        patch.object(consumer.os, 'open', open_directory), \
+                        patch.object(consumer.os, 'fsync', sync), \
+                        self.assertRaisesRegex(OSError, 'synthetic directory') as raised:
+                    consumer.schedule(root, ['install', '--apply'])
+                self.assertEqual(replaced, [binding])
+                self.assertIn('binding', json.loads(binding.read_text()))
+                pending = root / '.factory/schedule-install-pending.json'
+                self.assertTrue(pending.exists(), 'post-commit failure must leave a durable dispatch guard')
+                self.assertIn('scheduled launches remain blocked', '\n'.join(raised.exception.__notes__))
+                errors = io.StringIO()
+                with patch.object(consumer, 'project_root', return_value=root), \
+                        patch.object(consumer, 'invoke', side_effect=raised.exception), redirect_stderr(errors):
+                    self.assertEqual(consumer.main(['schedule', 'install', '--apply']), 1)
+                self.assertIn('partially committed', errors.getvalue())
+                self.assertIn('scheduled launches remain blocked', errors.getvalue())
+                self.assertEqual(commands, [])
+                with patch.multiple(consumer, verify_registry_environment=lambda _: None,
+                                    windowless=lambda: False, wake_allowed=lambda *_: True), \
+                        patch.object(consumer, 'execute', return_value=type('Result', (), {'returncode': 0})()) as execute, \
+                        patch.object(consumer, 'launch_decision') as launch:
+                    self.assertEqual(consumer.schedule(root, ['fire']), 1)
+                launch.assert_not_called()
+                self.assertEqual(execute.call_count, 1)
+                self.assertEqual(execute.call_args.args[0], ['native', 'workflow', 'wake'])
+                self.assertEqual(consumer.schedule(root, ['install', '--apply']), 0)
+                self.assertFalse(pending.exists())
+                self.assertEqual(len(commands), 2)
+
+    def test_install_holds_launch_lock_and_keeps_guard_after_scheduler_interrupt(self):
+        with self.project() as (root, home, commands, _):
+            pending = root / '.factory/schedule-install-pending.json'
+            def interrupted_scheduler(*_):
+                self.assertTrue(pending.exists())
+                with consumer.single_flight(root / '.factory/fire.lock') as held:
+                    self.assertFalse(held, 'a tick must not launch during installation')
+                raise KeyboardInterrupt('synthetic scheduler interruption')
+            with patch.object(consumer, 'checked', side_effect=interrupted_scheduler), \
+                    self.assertRaises(KeyboardInterrupt):
+                consumer.schedule(root, ['install', '--apply'])
+            self.assertTrue(pending.exists())
+            with consumer.single_flight(root / '.factory/fire.lock') as held:
+                self.assertTrue(held, 'failed installation must release the transient lock')
+            self.assertEqual(consumer.schedule(root, ['install', '--apply']), 0)
+            self.assertFalse(pending.exists())
+
+    def test_install_refuses_busy_launch_lock_before_writing_binding(self):
+        with self.project() as (root, home, commands, _):
+            with consumer.single_flight(root / '.factory/fire.lock') as held:
+                self.assertTrue(held)
+                with self.assertRaisesRegex(ValueError, 'launching or installing'):
+                    consumer.schedule(root, ['install', '--apply'])
+            self.assertFalse((root / consumer.TRIGGER).exists())
+            self.assertEqual(commands, [])
+            self.assertEqual(list(home.rglob('*')), [])
 
     def test_linux_unit_preserves_spaces_quotes_backslashes_and_expansion_characters(self):
         # Hand-checked systemd grammar: quoted words, C escaping, %% for specifiers,

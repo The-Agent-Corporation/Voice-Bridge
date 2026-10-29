@@ -898,6 +898,34 @@ def single_flight(path: Path):
         handle.close()
 
 
+SCHEDULE_INSTALL_PENDING = ".factory/schedule-install-pending.json"
+
+
+@contextlib.contextmanager
+def schedule_install_guard(root: Path, apply: bool):
+    """Keep partial binding/scheduler commits out of scheduled admission."""
+    if not apply:
+        yield
+        return
+    shared = shared_root(root)
+    with single_flight(shared / ".factory/fire.lock") as held:
+        if not held:
+            raise ValueError("Another process is launching or installing; schedule installation refused")
+        pending = shared / SCHEDULE_INSTALL_PENDING
+        # Persist before replacing the binding. A crash or failed post-replace
+        # directory sync must leave subsequent ticks unable to use a partial install.
+        _binding_write(pending, {"state": "installing"})
+        try:
+            yield
+            pending.unlink()
+        except BaseException as error:
+            error.add_note(
+                f"Schedule installation may be partially committed; scheduled launches remain blocked by {pending}. "
+                "Inspect the failure and rerun schedule install --apply to complete installation. "
+                "Do not remove this guard to resume launches.")
+            raise
+
+
 ENDED = {"completed", "failed", "cancelled"}
 ACTIVE = {"pending", "running", "paused"}
 # A launch that died before its run started has written its last line by now.
@@ -1133,37 +1161,38 @@ def schedule(root: Path, args: list[str]) -> int:
     if action == "install":
         config = trigger_config(root, settings, source, interval)
         plan = timer_commands(root, interval)
-        binding_text = json.dumps(config, indent=2) + "\n"
-        if apply:
-            config_path.parent.mkdir(parents=True, exist_ok=True)
-            _binding_write(config_path, config)
-            print(f"Wrote {config_path} (Archon trigger binding for {config['binding']['launch']['workflowName']}).")
-        else:
-            print(f"Would write {config_path}:\n{binding_text}")
-        base = config["binding"]["launch"]["isolation"].get("baseOverride")
-        print(f"Laps start from {base}." if base else
-              "No default branch is known locally, so every launch asks the remote for it. "
-              "Run `git remote set-head origin --auto` or set base_branch in schedule.json.")
-        if "launchd" in plan:
-            configure_launchd(root, plan, apply)
-            return 0
-        for task_file, body in plan.get("task_xml", {}).items():
-            print(f"--- {task_file}\n{body}")
+        with schedule_install_guard(root, apply):
+            binding_text = json.dumps(config, indent=2) + "\n"
             if apply:
-                task_file.parent.mkdir(parents=True, exist_ok=True)
-                task_file.write_text(body, encoding="utf-16")
-        if "systemd" in plan:
-            unit_dir = Path.home() / ".config/systemd/user"
-            for file_name, body in plan["systemd"].items():
-                print(f"--- {unit_dir / file_name}\n{body}")
+                config_path.parent.mkdir(parents=True, exist_ok=True)
+                _binding_write(config_path, config)
+                print(f"Wrote {config_path} (Archon trigger binding for {config['binding']['launch']['workflowName']}).")
+            else:
+                print(f"Would write {config_path}:\n{binding_text}")
+            base = config["binding"]["launch"]["isolation"].get("baseOverride")
+            print(f"Laps start from {base}." if base else
+                  "No default branch is known locally, so every launch asks the remote for it. "
+                  "Run `git remote set-head origin --auto` or set base_branch in schedule.json.")
+            if "launchd" in plan:
+                configure_launchd(root, plan, apply)
+                return 0
+            for task_file, body in plan.get("task_xml", {}).items():
+                print(f"--- {task_file}\n{body}")
                 if apply:
-                    unit_dir.mkdir(parents=True, exist_ok=True)
-                    (unit_dir / file_name).write_text(body, encoding="utf-8")
-        for command in plan["install"]:
-            print(("Running: " if apply else "Run to enable: ") + subprocess.list2cmdline(command))
-            if apply:
-                checked(command, root)
-        return 0
+                    task_file.parent.mkdir(parents=True, exist_ok=True)
+                    task_file.write_text(body, encoding="utf-16")
+            if "systemd" in plan:
+                unit_dir = Path.home() / ".config/systemd/user"
+                for file_name, body in plan["systemd"].items():
+                    print(f"--- {unit_dir / file_name}\n{body}")
+                    if apply:
+                        unit_dir.mkdir(parents=True, exist_ok=True)
+                        (unit_dir / file_name).write_text(body, encoding="utf-8")
+            for command in plan["install"]:
+                print(("Running: " if apply else "Run to enable: ") + subprocess.list2cmdline(command))
+                if apply:
+                    checked(command, root)
+            return 0
     if action in {"fire", "wake"}:
         if stop.exists():
             print("Local STOP is set; no trigger fired. Use unhalt to resume.", file=sys.stderr)
@@ -1194,6 +1223,9 @@ def schedule(root: Path, args: list[str]) -> int:
                         if not held:
                             write("Another tick is still launching; this one skips the launch.\n")
                         else:
+                            if (shared_root(root) / SCHEDULE_INSTALL_PENDING).exists():
+                                raise ValueError("Schedule installation is incomplete; scheduled launches are blocked. "
+                                                 "Inspect the failure and rerun schedule install --apply.")
                             schedule_file = shared_root(root) / SCHEDULE
                             data = json.loads(schedule_file.read_text(encoding="utf-8")) if schedule_file.exists() else {}
                             if not isinstance(data, dict):
@@ -1263,6 +1295,8 @@ def main(argv: list[str] | None = None) -> int:
         return invoke(project_root(), args[0], args[1:])
     except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
         print(f"Factory refused: {error}", file=sys.stderr)
+        for note in getattr(error, "__notes__", []):
+            print(note, file=sys.stderr)
         return 1
 
 
