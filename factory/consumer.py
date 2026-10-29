@@ -3,14 +3,18 @@ from __future__ import annotations
 
 import calendar
 import contextlib
+import hashlib
 import json
 import os
 import platform
+import plistlib
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -392,6 +396,7 @@ def trigger_config(root: Path, settings: dict, source: Path, interval: int) -> d
     the durable queue and overlap; this only names what to start."""
     schedule_file = shared_root(root) / SCHEDULE
     schedule_data = json.loads(schedule_file.read_text(encoding="utf-8"))
+    runtime_binding_options(root, schedule_data)
     workflow = schedule_data.get("workflow", "archon-lifecycle")
     inputs = schedule_data.get("inputs")
     if not isinstance(workflow, str) or not isinstance(inputs, dict):
@@ -433,10 +438,227 @@ def trigger_config(root: Path, settings: dict, source: Path, interval: int) -> d
             "capacity": parallel,
             "overlap": "skip",
             "launch": {"cwd": str(root), "workflowName": workflow, "inputs": values,
+                       "discoveryCwd": str(source.resolve()),
                        "isolation": isolation},
         },
         "schedule": {"intervalSeconds": interval, "runAtLoad": False},
     }
+
+
+def _private_path(path: Path, *, directory: bool = False) -> None:
+    if path.is_symlink() or not (path.is_dir() if directory else path.is_file()):
+        raise ValueError(f"Runtime binding requires an ordinary private {'directory' if directory else 'file'}: {path}")
+    metadata = path.stat()
+    if os.name != "nt" and (metadata.st_mode & 0o077 or metadata.st_uid != os.getuid()):
+        raise ValueError(f"Runtime binding path must be private to the current owner: {path}")
+
+
+def runtime_binding_options(root: Path, data: dict) -> dict | None:
+    """Opt-in caller-owned scenarios; the pinned workflow remains unchanged."""
+    value = data.get("runtime_binding")
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"helper", "invocation_root"}:
+        raise ValueError("runtime_binding requires exactly helper and invocation_root")
+    if data.get("workflow", "archon-lifecycle") != "archon-lifecycle":
+        raise ValueError("runtime_binding supports archon-lifecycle only")
+    if type(data.get("parallel", 1)) is not int or data.get("parallel", 1) != 1:
+        raise ValueError("runtime_binding requires parallel=1")
+    result = {}
+    for key in ("helper", "invocation_root"):
+        if not isinstance(value[key], str) or not Path(value[key]).is_absolute():
+            raise ValueError(f"runtime_binding {key} must be an absolute path")
+        path = Path(value[key])
+        if path.is_symlink():
+            raise ValueError(f"runtime_binding {key} must not be a symlink")
+        result[key] = str(path.resolve())
+    if not Path(result["helper"]).is_file():
+        raise ValueError("runtime_binding helper does not exist")
+    directory = Path(result["invocation_root"])
+    if directory.exists():
+        _private_path(directory, directory=True)
+    return result
+
+
+def _binding_write(path: Path, value: dict) -> None:
+    temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+    try:
+        with temporary.open("x", encoding="utf-8") as stream:
+            os.chmod(temporary, 0o600)
+            json.dump(value, stream, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        if os.name != "nt":
+            directory = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _binding_record(directory: Path, record: dict) -> None:
+    # The current journal is written first: a crash must block a new dispatch.
+    _binding_write(directory / "dispatch.json", record)
+    invocation = Path(record["directory"])
+    if invocation.is_dir():
+        _private_path(invocation, directory=True)
+        _binding_write(invocation / "dispatch.json", record)
+
+
+def _binding_receipt(raw: str, config: dict) -> dict:
+    """Require one exact persisted native admission, not just CLI exit zero."""
+    digest = hashlib.sha256(json.dumps(config, separators=(",", ":"),
+                                      ensure_ascii=False).encode()).hexdigest()
+    try:
+        documents = [json.loads(raw)]
+    except ValueError:
+        documents = []
+        for line in raw.splitlines():
+            try:
+                documents.append(json.loads(line))
+            except ValueError:
+                pass
+    receipts = [d for d in documents if isinstance(d, dict) and
+                d.get("contentDigest") == digest and
+                d.get("sourceInstanceId") == config["sourceInstanceId"]]
+    if len(receipts) != 1:
+        raise ValueError("No unambiguous matching native receipt")
+    receipt = receipts[0]
+    bindings = receipt.get("bindings", [])
+    if not receipt.get("id") or receipt.get("outcome") != "matched" or len(bindings) != 1:
+        raise ValueError("Invalid native receipt disposition")
+    binding = bindings[0]
+    expected = dict(config["binding"])
+    observed = dict(binding.get("intent") or {})
+    # Native trigger fire computes this field from the immutable binding itself.
+    expected.pop("bindingRevision", None)
+    observed.pop("bindingRevision", None)
+    if observed != expected or binding.get("bindingId") != expected["bindingId"] or \
+            binding.get("status") != "complete" or \
+            (binding.get("disposition") or {}).get("status") not in {"admitted", "skipped"}:
+        raise ValueError("Native binding is incomplete or differs from dispatch intent")
+    return receipt
+
+
+def dispatch_bound_trigger(root: Path, settings: dict, source: Path, config_path: Path,
+                           options: dict, write) -> int:
+    """Called under fire.lock. Never replay a dispatch with an unknown outcome."""
+    directory = Path(options["invocation_root"])
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _private_path(directory, directory=True)
+    journal = directory / "dispatch.json"
+    if journal.exists():
+        _private_path(journal)
+        previous = json.loads(journal.read_text(encoding="utf-8"))
+        if previous.get("status") not in {"acknowledged", "aborted_before_dispatch"}:
+            raise ValueError(f"Runtime dispatch unresolved; inspect {journal} before another launch")
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    binding = config["binding"]
+    if binding.get("capacity") != 1 or binding.get("overlap") != "skip" or \
+            binding["launch"].get("workflowName") != "archon-lifecycle" or \
+            Path(binding["launch"]["cwd"]).resolve() != root.resolve():
+        raise ValueError("Runtime binding requires this project's single-slot lifecycle trigger")
+    launch = binding["launch"]
+    if launch.get("discoveryCwd") is not None and \
+            Path(launch["discoveryCwd"]).resolve() != source.resolve():
+        raise ValueError("Runtime trigger discovery source differs from the verified pin")
+    # Match native schema key order: its contentDigest hashes JSON.stringify(parsed).
+    # Rebuild old installed triggers rather than appending discoveryCwd after isolation.
+    binding["launch"] = {"cwd": launch["cwd"], "workflowName": launch["workflowName"],
+                         "inputs": launch["inputs"], "discoveryCwd": str(source.resolve()),
+                         **({"configSource": launch["configSource"]} if "configSource" in launch else {}),
+                         "isolation": launch["isolation"]}
+    invocation = directory / str(uuid.uuid4())
+    helper = Path(options["helper"])
+    record = {"version": 1, "status": "preparing", "directory": str(invocation),
+              "project_root": str(root.resolve()), "created_at": time.time(),
+              "helper": str(helper), "helper_sha256": hashlib.sha256(helper.read_bytes()).hexdigest(),
+              "source_revision": settings["revision"]}
+    _binding_record(directory, record)
+    try:
+        raw = checked([sys.executable, str(helper), "create", "--project-root", str(root.resolve()),
+                       "--output", str(invocation)], root)
+        prepared = json.loads(raw)
+        uuid.UUID(prepared["invocation"])
+        _private_path(invocation, directory=True)
+        paths = {}
+        for key in ("runtime", "holdout"):
+            path = Path(prepared[key])
+            if not path.is_absolute() or not path.resolve().is_relative_to(invocation.resolve()):
+                raise ValueError("Runtime scenario escaped its invocation directory")
+            _private_path(path)
+            paths[key] = str(path.resolve())
+        if paths["runtime"] == paths["holdout"]:
+            raise ValueError("Runtime and holdout need separate scenario files")
+        if hashlib.sha256(helper.read_bytes()).hexdigest() != record["helper_sha256"]:
+            raise ValueError("Runtime binding helper changed during preparation")
+        binding["launch"]["inputs"].update(scenario=paths["runtime"], holdout=paths["holdout"])
+        invocation_config = invocation / "trigger.json"
+        _binding_write(invocation_config, config)
+        record.update(invocation=prepared["invocation"], trigger=str(invocation_config),
+                      trigger_sha256=hashlib.sha256(invocation_config.read_bytes()).hexdigest(),
+                      scenario_sha256={k: hashlib.sha256(Path(v).read_bytes()).hexdigest()
+                                       for k, v in paths.items()})
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+        record["status"] = "aborted_before_dispatch"
+        _binding_record(directory, record)
+        raise
+    if (shared_root(root) / ".factory/STOP").exists() or (shared_root(root) / PAUSE).exists():
+        record["status"] = "aborted_before_dispatch"
+        _binding_record(directory, record)
+        write("Runtime prepared, but STOP/PAUSE now blocks dispatch.\n")
+        return 0
+    record["status"] = "dispatching"
+    _binding_record(directory, record)
+    try:
+        result = execute([*cli(settings, source), "trigger", "fire", "--config", str(invocation_config)],
+                         root, capture=True, timeout=None)
+        if result.stdout:
+            write(result.stdout)
+        if result.stderr:
+            write(result.stderr)
+        if result.returncode:
+            raise ValueError(f"Native trigger exited {result.returncode}")
+        receipt = _binding_receipt(result.stdout or "", config)
+        record.update(status="acknowledged", receipt=receipt, acknowledged_at=time.time())
+        _binding_record(directory, record)
+        return 0
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        record.update(status="uncertain", error=str(error)[:500])
+        _binding_record(directory, record)
+        raise ValueError(f"Runtime dispatch uncertain; no retry permitted. Inspect {journal}") from error
+
+
+def reconcile_runtime_dispatch(root: Path, settings: dict, source: Path, options: dict,
+                               receipt_id: str) -> None:
+    directory = Path(options["invocation_root"])
+    _private_path(directory, directory=True)
+    journal = directory / "dispatch.json"
+    _private_path(journal)
+    record = json.loads(journal.read_text(encoding="utf-8"))
+    if record.get("status") not in {"dispatching", "uncertain"}:
+        raise ValueError("Only an unresolved dispatched invocation can be reconciled")
+    if record.get("project_root") != str(root.resolve()) or record.get("source_revision") != settings["revision"]:
+        raise ValueError("Dispatch project or source revision differs from current consumer")
+    path = Path(record["trigger"])
+    if not path.resolve().is_relative_to(directory.resolve()):
+        raise ValueError("Dispatch trigger escaped invocation root")
+    _private_path(path)
+    if hashlib.sha256(path.read_bytes()).hexdigest() != record.get("trigger_sha256"):
+        raise ValueError("Dispatch trigger changed after preparation")
+    config = json.loads(path.read_text(encoding="utf-8"))
+    if config["binding"]["launch"].get("discoveryCwd") != str(source.resolve()):
+        raise ValueError("Dispatch discovery source differs from the verified pin")
+    raw = checked([*cli(settings, source), "trigger", "inspect", receipt_id], root)
+    receipt = _binding_receipt(raw, config)
+    if receipt["id"] != receipt_id:
+        raise ValueError("Native receipt ID differs from the inspected receipt")
+    record.update(status="acknowledged", receipt=receipt, reconciled_at=time.time())
+    _binding_record(directory, record)
 
 
 def task_xml(python: Path, root: Path, minutes: int) -> str:
@@ -476,8 +698,7 @@ def task_xml(python: Path, root: Path, minutes: int) -> str:
 
 
 def timer_commands(root: Path, interval: int) -> dict:
-    """What the host scheduler runs. Archon installs launchd jobs itself; elsewhere the
-    host scheduler calls `factory schedule fire`, which honors the local STOP brake."""
+    """Host schedulers invoke the consumer so STOP/PAUSE are checked before Archon."""
     fire = [sys.executable, str(root / "factory/consumer.py"), "schedule", "fire"]
     name = "ArchonFactory-" + re.sub(r"[^A-Za-z0-9-]", "-", root.name)
     if sys.platform == "win32":
@@ -493,7 +714,30 @@ def timer_commands(root: Path, interval: int) -> dict:
                 "install": [["schtasks", "/Create", "/TN", name, "/XML", str(task), "/F"]],
                 "remove": [["schtasks", "/Delete", "/TN", name, "/F"]]}
     if sys.platform == "darwin":
-        return {"install": [], "remove": []}  # Archon installs its own launchd jobs.
+        root = shared_root(root)
+        identity = hashlib.sha256(str(root).encode()).hexdigest()
+        directory = Path.home() / "Library/LaunchAgents"
+        domain = f"gui/{os.getuid()}"
+        jobs = {}
+        # A separate wake keeps CI continuations responsive while a fire is running.
+        # Both paths check STOP; wake intentionally ignores PAUSE. No run at install.
+        for action, seconds in (("fire", interval), ("wake", 60)):
+            label = f"com.archon.factory.{identity}.{action}"
+            path = directory / f"{label}.plist"
+            jobs[path] = plistlib.dumps({
+                "Label": label,
+                "ProgramArguments": [sys.executable, str(root / "factory/consumer.py"),
+                                     "schedule", action],
+                "WorkingDirectory": str(root),
+                "EnvironmentVariables": {"ARCHON_HOME": str(archon_home().resolve()),
+                                         "PATH": os.environ.get("PATH", "")},
+                "StartInterval": seconds, "RunAtLoad": False,
+                "StandardOutPath": str(root / ".factory/schedule.log"),
+                "StandardErrorPath": str(root / ".factory/schedule.log"),
+            }, sort_keys=True).decode()
+        return {"launchd": jobs,
+                "install": [["/bin/launchctl", "bootstrap", domain, str(path)] for path in jobs],
+                "remove": [["/bin/launchctl", "bootout", f"{domain}/{path.stem}"] for path in jobs]}
     unit = name.lower()
     # The timer gets what a manual run had: the same tool PATH, credentials from a
     # mode-600 file outside the repository, and IS_SANDBOX for Claude Code as root.
@@ -507,6 +751,62 @@ def timer_commands(root: Path, interval: int) -> dict:
         "install": [["systemctl", "--user", "daemon-reload"],
                     ["systemctl", "--user", "enable", "--now", f"{unit}.timer"]],
         "remove": [["systemctl", "--user", "disable", "--now", f"{unit}.timer"]]}
+
+
+def legacy_launchd_jobs(root: Path) -> list[Path]:
+    """Find the actual old job, even if a preview or repo transfer changed its binding ID.
+    Match config path/home from the plist instead of recomputing an obsolete hash."""
+    directory = Path.home() / "Library/LaunchAgents"
+    config = (shared_root(root) / TRIGGER).resolve()
+    home = archon_home().resolve()
+    found = []
+    for path in sorted(directory.glob("com.archon.trigger.*.plist")):
+        job = plistlib.loads(path.read_bytes())
+        args = job.get("ProgramArguments", [])
+        if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+            raise ValueError(f"Invalid native launchd job: {path}")
+        job_home = job.get("EnvironmentVariables", {}).get("ARCHON_HOME")
+        if not job_home or Path(job_home).expanduser().resolve() != home:
+            continue
+        trigger = any(args[i:i + 3] == ["trigger", "fire", "--config"] and
+                      Path(args[i + 3]).resolve() == config for i in range(len(args) - 3))
+        wake = path.name.startswith("com.archon.trigger.workflow-wake-") and any(
+            args[i:i + 2] == ["workflow", "wake"] for i in range(len(args) - 1))
+        if trigger or wake:
+            if job.get("Label") != path.stem:
+                raise ValueError(f"Native launchd label does not match its file: {path}")
+            found.append(path)
+    return found
+
+
+def remove_launchd_job(path: Path, root: Path) -> None:
+    service = f"gui/{os.getuid()}/{path.stem}"
+    loaded = execute(["/bin/launchctl", "print", service], root)
+    if loaded.returncode == 0:
+        checked(["/bin/launchctl", "bootout", service], root)
+    path.unlink(missing_ok=True)
+
+
+def configure_launchd(root: Path, plan: dict, apply: bool, *, remove: bool = False) -> None:
+    # Remove all previous jobs before registering any replacement. An already unloaded
+    # job still has its plist deleted so it cannot return after the next login.
+    paths = list(dict.fromkeys([*legacy_launchd_jobs(root), *plan["launchd"]]))
+    for path in paths:
+        print(f"{'Removing' if apply else 'Would remove'} launchd job: {path}")
+        if apply:
+            remove_launchd_job(path, root)
+    if remove:
+        return
+    for path, body in plan["launchd"].items():
+        print(f"--- {path}\n{body}")
+        if apply:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body, encoding="utf-8")
+            path.chmod(0o600)
+    for command in plan["install"]:
+        print(("Running: " if apply else "Run to enable: ") + subprocess.list2cmdline(command))
+        if apply:
+            checked(command, root)
 
 
 @contextlib.contextmanager
@@ -539,7 +839,54 @@ STUCK_AFTER_SECONDS = 600
 
 
 def archon_home() -> Path:
-    return Path(os.environ.get("ARCHON_HOME") or Path.home() / ".archon")
+    return Path(os.environ.get("ARCHON_HOME") or Path.home() / ".archon").expanduser().resolve()
+
+
+def verify_registry_environment(root: Path) -> None:
+    # Match native CLI boot, not Bun's discarded application .env files:
+    # strip-cwd-env-boot runs first, then loadCliEnv loads ARCHON_HOME/.env
+    # and <cwd>/.archon/.env with override=true. User-scope keys may move the
+    # home after the Python process has selected its SQLite registry. Native
+    # Docker detection can also override ARCHON_HOME entirely.
+    for key in ("DATABASE_URL", "ARCHON_DOCKER", "WORKSPACE_PATH"):
+        if os.environ.get(key):
+            raise ValueError(f"{key} selects an unsupported registry environment")
+    registry_keys = "DATABASE_URL|ARCHON_HOME|HOME|USERPROFILE|ARCHON_DOCKER|WORKSPACE_PATH"
+    assignment = re.compile(rf"(?mi)^\s*(?:export\s+)?({registry_keys})\s*(?:=|:\s)")
+    for env_file in (archon_home() / ".env", root / ".archon/.env"):
+        if env_file.is_file():
+            keys = sorted(set(assignment.findall(env_file.read_text(encoding="utf-8-sig"))))
+            if keys:
+                # Even an empty override can clear a pinned ARCHON_HOME and
+                # redirect to the default registry. Never print the values.
+                raise ValueError(f"Registry redirect keys {', '.join(keys)} are configured in {env_file}")
+
+
+def wake_allowed(root: Path, source: Path, write) -> bool:
+    """Native wake is home-wide, not cwd-scoped. Withhold it if ANY registered repo
+    is halted. Fail closed if the local SQLite registry cannot be verified. This is
+    deliberately conservative until Archon exposes project-scoped continuations."""
+    try:
+        verify_registry_environment(root)
+        registry = archon_home() / "archon.db"
+        with contextlib.closing(sqlite3.connect(registry.as_uri() + "?mode=ro", uri=True, timeout=5)) as db:
+            rows = db.execute("SELECT default_cwd FROM remote_agent_codebases").fetchall()
+        if not rows:
+            raise ValueError("registry contains no codebases")
+        roots = set()
+        for (cwd,) in rows:
+            if not isinstance(cwd, str) or not Path(cwd).is_absolute() or not Path(cwd).is_dir():
+                raise ValueError("registry contains an unavailable or ambiguous codebase path")
+            roots.add(shared_root(Path(cwd)))
+        if shared_root(root) not in roots:
+            raise ValueError("this project is absent from the registry")
+        for registered_root in sorted(roots):
+            if (registered_root / ".factory/STOP").exists():
+                write(f"Global wake withheld: STOP is set in {registered_root}.\n")
+                return False
+        return True
+    except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as error:
+        raise ValueError(f"Global wake refused: cannot verify the Archon registry: {error}") from error
 
 
 def sweep_stuck(root: Path, settings: dict, source: Path, runs: list[dict], write) -> set[str]:
@@ -701,6 +1048,20 @@ def schedule(root: Path, args: list[str]) -> int:
     config_path = shared_root(root) / TRIGGER
     stop = shared_root(root) / ".factory/STOP"
     native = cli(settings, source)
+    if action == "reconcile-runtime":
+        if len(flags) != 2 or flags[0] != "--receipt":
+            raise ValueError("Usage: factory schedule reconcile-runtime --receipt <native-receipt-id>")
+        verify_registry_environment(root)
+        data = json.loads((shared_root(root) / SCHEDULE).read_text(encoding="utf-8"))
+        options = runtime_binding_options(root, data)
+        if options is None:
+            raise ValueError("No runtime_binding configured")
+        with single_flight(shared_root(root) / ".factory/fire.lock") as held:
+            if not held:
+                raise ValueError("Another tick is still launching; reconciliation refused")
+            reconcile_runtime_dispatch(root, settings, source, options, flags[1])
+        print("Exact native receipt reconciled; no launch was repeated.")
+        return 0
     if action == "install":
         config = trigger_config(root, settings, source, interval)
         config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -711,9 +1072,9 @@ def schedule(root: Path, args: list[str]) -> int:
         print(f"Laps start from {base}." if base else
               "No default branch is known locally, so every launch asks the remote for it. "
               "Run `git remote set-head origin --auto` or set base_branch in schedule.json.")
-        if sys.platform == "darwin":
-            plan = {"install": [[*native, "trigger", "schedule", "install", "--config", str(config_path)],
-                                [*native, "workflow", "wake", "schedule", "install", "--interval", "60"]]}
+        if "launchd" in plan:
+            configure_launchd(root, plan, apply)
+            return 0
         for task_file, body in plan.get("task_xml", {}).items():
             print(f"--- {task_file}\n{body}")
             if apply:
@@ -731,11 +1092,13 @@ def schedule(root: Path, args: list[str]) -> int:
             if apply:
                 checked(command, root)
         return 0
-    if action == "fire":
+    if action in {"fire", "wake"}:
         if stop.exists():
             print("Local STOP is set; no trigger fired. Use unhalt to resume.", file=sys.stderr)
             return 0
-        if not config_path.is_file():
+        # Refuse redirects before intake as well as before global continuation.
+        verify_registry_environment(root)
+        if action == "fire" and not config_path.is_file():
             raise ValueError("No trigger binding. Run factory schedule install first")
         # A windowless timer tick (pythonw) has no console, so its output goes to a log.
         log = ((shared_root(root) / ".factory/schedule.log").open("a", encoding="utf-8")
@@ -746,7 +1109,9 @@ def schedule(root: Path, args: list[str]) -> int:
                 log.flush()
             write = log.write if log else sys.stderr.write
             fired = 0
-            if (shared_root(root) / PAUSE).exists():
+            if action == "wake":
+                pass
+            elif (shared_root(root) / PAUSE).exists():
                 write("Scheduled launches paused; no trigger fired, waking only. Use unpause to resume.\n")
             else:
                 # Ticks run in parallel (a long wake must not hold back the next launch), so
@@ -755,17 +1120,23 @@ def schedule(root: Path, args: list[str]) -> int:
                     if not held:
                         write("Another tick is still launching; this one skips the launch.\n")
                     elif launch_decision(root, settings, source, write):
-                        fired = execute([*native, "trigger", "fire", "--config", str(config_path)], root,
-                                        capture=False, timeout=None, output=log).returncode
+                        schedule_file = shared_root(root) / SCHEDULE
+                        data = json.loads(schedule_file.read_text(encoding="utf-8")) if schedule_file.exists() else {}
+                        options = runtime_binding_options(root, data)
+                        if options:
+                            fired = dispatch_bound_trigger(root, settings, source, config_path, options, write)
+                        else:
+                            fired = execute([*native, "trigger", "fire", "--config", str(config_path)], root,
+                                            capture=False, timeout=None, output=log).returncode
             if log:
                 log.flush()
             # Resume due durable waits (CI pauses, usage-limit resumes) in the same tick.
             woken = 0
-            with single_flight(shared_root(root) / ".factory/wake.lock") as held:
-                if held:
+            with single_flight(archon_home() / "factory-wake.lock") as held:
+                if held and wake_allowed(root, source, write):
                     woken = execute([*native, "workflow", "wake"], root, capture=False, timeout=None,
                                     output=log).returncode
-                else:
+                elif not held:
                     write("A wake from an earlier tick is still running; this one skips it.\n")
         finally:
             if log:
@@ -773,8 +1144,11 @@ def schedule(root: Path, args: list[str]) -> int:
         return fired or woken
     if action == "remove":
         plan = timer_commands(root, interval)
-        if sys.platform == "darwin" and config_path.is_file():
-            plan = {"remove": [[*native, "trigger", "schedule", "remove", "--config", str(config_path)]]}
+        if "launchd" in plan:
+            configure_launchd(root, plan, apply, remove=True)
+            if apply:
+                config_path.unlink(missing_ok=True)
+            return 0
         for command in plan["remove"]:
             print(("Running: " if apply else "Run to disable: ") + subprocess.list2cmdline(command))
             if apply:
@@ -784,7 +1158,7 @@ def schedule(root: Path, args: list[str]) -> int:
         return 0
     if action == "status":
         return execute([*native, "trigger", "list"], root, capture=False, timeout=None).returncode
-    raise ValueError("Usage: factory schedule install|fire|remove|status [--interval <seconds>] [--apply]")
+    raise ValueError("Usage: factory schedule install|fire|wake|remove|status [--interval <seconds>] [--apply] | reconcile-runtime --receipt <id>")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -793,7 +1167,8 @@ def main(argv: list[str] | None = None) -> int:
         print("factory run <shared-workflow> [native arguments]\n"
               "factory run <shared-workflow> --runtime-host <config.json> [foreground native arguments]\n"
               "Runtime host: fresh ordinary apps; detach/resume unsupported. Manual: python factory/runtime_host.py serve --help\n"
-              "factory schedule install [--interval <seconds>] [--apply] | fire | remove [--apply] | status\n"
+              "factory schedule install [--interval <seconds>] [--apply] | fire | wake | remove [--apply] | status\n"
+              "factory schedule reconcile-runtime --receipt <native-receipt-id> (inspect only; never relaunch)\n"
               "factory list | doctor | status | runs | get <run-id>\n"
               "factory approve | reject | respond | cancel | resume | abandon <run-id>\n"
               "factory halt | unhalt (local launch brake only)\n"

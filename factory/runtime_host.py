@@ -128,7 +128,7 @@ class Environments:
                 self.bindings[name] = True
             self.roots[name] = path
         self.stopping = stopping
-        self.base = Path(tempfile.mkdtemp(prefix="factory-runtime-"))
+        self.base = Path(tempfile.mkdtemp(prefix="factory-runtime-")).resolve()
         self.active = {}
         self.used_ports = set()
 
@@ -353,7 +353,10 @@ def serve(config):
                 pass
 
     def parent_pipe():
-        sys.stdin.buffer.read()
+        # Raw fd read: a daemon thread blocked in the buffered reader holds
+        # its lock, and closing stdin at shutdown then aborts the interpreter.
+        while os.read(sys.stdin.fileno(), 65536):
+            pass
         stopping.set()
     threading.Thread(target=parent_pipe, daemon=True).start()
     for signum in (signal.SIGINT, signal.SIGTERM):
