@@ -132,6 +132,11 @@ prepare ordinary data/dependencies under its snapshot/state. Configuration and
 scripts are trusted code, and must never wrap a provider or launch workflows.
 Source inclusion must cover all application code; mutable code loaded from outside
 the snapshot is outside this identity claim.
+The post-setup digest, read-only source marking, and later identity checks cover
+the configured `include` set. Setup-created files under an included path are
+selected unless a forbidden directory component causes source selection to fail.
+Directories outside every included path are not selected and remain outside the
+source identity claim.
 
 The app receives a small OS environment plus configured `env`. Provider credentials,
 control credentials and arbitrary parent variables are not inherited. HOME and

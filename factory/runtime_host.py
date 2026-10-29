@@ -47,18 +47,22 @@ def safe_path(root, relative):
     return path
 
 
-def source_files(root, includes):
+def source_files(root, includes, *, directories=None):
     files = {}
     for rel in includes:
         path = safe_path(root, rel)
         if not path.exists():
             raise ValueError("configured source missing")
+        if directories is not None and path.is_dir():
+            directories.add(path.relative_to(root).as_posix())
         candidates = path.rglob("*") if path.is_dir() else [path]
         for child in candidates:
             name = child.relative_to(root).as_posix()
             safe_path(root, name)
             if child.is_file():
                 files[name] = child
+            elif directories is not None and child.is_dir():
+                directories.add(name)
     if not files:
         raise ValueError("empty source snapshot")
     return files
@@ -170,7 +174,8 @@ class Environments:
         cfg = self.config
         if cfg.get("shape") not in {"http", "cli", "library"}:
             raise ValueError("supported shapes: http, cli, library")
-        original = source_files(root, cfg["include"])
+        directories = set()
+        original = source_files(root, cfg["include"], directories=directories)
         before = digest(original)
         if request.get("expected_source", before) != before:
             raise ValueError("stale requested source")
@@ -181,6 +186,10 @@ class Environments:
         item = {"directory": directory, "source": source, "processes": []}
         self.active[slot] = item
         try:
+            # Directory entries are part of the selected layout even when no
+            # files below them contribute to the existing byte-only digest.
+            for rel in sorted(directories):
+                safe_path(source, rel).mkdir(parents=True, exist_ok=True)
             for rel, path in original.items():
                 target = source / rel
                 target.parent.mkdir(parents=True, exist_ok=True)

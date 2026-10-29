@@ -105,23 +105,26 @@ def configured_includes(config: Path) -> list[str]:
     return result
 
 
-def committed_files(repository: Path, revision: str, includes: list[str]) -> None:
+def committed_files(repository: Path, revision: str, includes: list[str]) -> list[str]:
     for include in includes:
         entry = checked_bytes(["git", "ls-tree", "-z", revision, "--", include], repository)
         if not entry:
             raise ValueError("configured include is missing from the delivering revision")
 
     entries = checked_bytes(
-        ["git", "ls-tree", "-rz", "--full-tree", revision, "--", *includes], repository
+        ["git", "ls-tree", "-rtz", "--full-tree", revision, "--", *includes], repository
     )
     if not entries:
         raise ValueError("configured includes produced an empty resource")
+    directories = []
     for raw in entries.split(b"\0"):
         if not raw:
             continue
         metadata, separator, name = raw.partition(b"\t")
         fields = metadata.split()
-        if not separator or len(fields) != 3 or fields[0] not in {b"100644", b"100755"}:
+        if (not separator or len(fields) != 3
+                or (fields[0], fields[1]) not in {
+                    (b"100644", b"blob"), (b"100755", b"blob"), (b"040000", b"tree")}):
             raise ValueError("linked or unsupported committed source path refused")
         try:
             decoded = name.decode("utf-8")
@@ -132,6 +135,9 @@ def committed_files(repository: Path, revision: str, includes: list[str]) -> Non
                 or any(part in {"", ".", ".."} or part.lower() in FORBIDDEN
                        for part in path.parts)):
             raise ValueError("private or escaping committed source path refused")
+        if fields[1] == b"tree":
+            directories.append(decoded)
+    return directories
 
 
 def validate_destination(destination: Path, repository: Path) -> Path:
@@ -154,7 +160,7 @@ def prepare(destination: Path, config: Path, expected_revision: str | None = Non
     repository, actual_revision = delivery(expected_revision)
     destination = validate_destination(destination, repository)
     includes = configured_includes(config)
-    committed_files(repository, actual_revision, includes)
+    directories = committed_files(repository, actual_revision, includes)
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.parent.is_symlink():
         raise ValueError("linked destination parents are unsupported")
@@ -174,6 +180,10 @@ def prepare(destination: Path, config: Path, expected_revision: str | None = Non
                 if not target.is_relative_to(staging):
                     raise ValueError("Git archive contains an escaping path")
             bundle.extractall(staging)
+        # Git archives may omit empty trees; preserve the validated selected
+        # layout without changing the file-byte identity format.
+        for relative in directories:
+            (staging / relative).mkdir(parents=True, exist_ok=True)
         mapping = {
             "version": 1,
             "kind": "factory-runtime-resource",

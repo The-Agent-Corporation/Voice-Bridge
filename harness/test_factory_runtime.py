@@ -9,7 +9,8 @@ import tempfile
 import threading
 import time
 import unittest
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
+from socketserver import ThreadingTCPServer
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "factory"))
@@ -110,12 +111,14 @@ class HttpOwnershipTests(unittest.TestCase):
             def log_message(self, *args):
                 pass
 
-        with ThreadingHTTPServer(('127.0.0.1', 0), Handler) as server:
+        # The fixture uses a numeric loopback target and needs no reverse DNS.
+        with patch('socket.getfqdn', side_effect=AssertionError('fixture attempted DNS')), \
+                ThreadingTCPServer(('127.0.0.1', 0), Handler) as server:
             thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': .01}, daemon=True)
             thread.start()
             try:
                 app = HttpApp({'http': {}})
-                app.base = f'http://127.0.0.1:{server.server_port}'
+                app.base = f'http://127.0.0.1:{server.server_address[1]}'
                 with patch('urllib.request.getproxies', return_value={'http': app.base}), \
                         patch('urllib.request.proxy_bypass', return_value=False), \
                         patch('urllib.request._opener', None):
@@ -131,11 +134,11 @@ class HttpOwnershipTests(unittest.TestCase):
                 thread.join(timeout=5)
 
     def test_chatty_app_starts_without_stdout_backpressure(self):
-        command = self.script("import sys\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n"
+        command = self.script("import sys\nfrom http.server import BaseHTTPRequestHandler\nfrom socketserver import TCPServer\n"
             "sys.stdout.write('x' * 1_000_000); sys.stdout.flush()\n"
             "class Handler(BaseHTTPRequestHandler):\n"
             " def do_GET(self):\n  self.send_response(200); self.end_headers(); self.wfile.write(b'ok')\n"
-            "HTTPServer(('127.0.0.1', int(sys.argv[1])), Handler).serve_forever()\n")
+            "TCPServer(('127.0.0.1', int(sys.argv[1])), Handler).serve_forever()\n")
         app = HttpApp({"http": {"start": command, "boot_timeout_s": 2}})
         try:
             with app:
@@ -218,8 +221,11 @@ class HttpOwnershipTests(unittest.TestCase):
                 app._output.close()
 
     def test_teardown_stops_owned_listener_descendants(self):
+        child = ("import sys; from http.server import SimpleHTTPRequestHandler; "
+                 "from socketserver import TCPServer; "
+                 "TCPServer(('127.0.0.1', int(sys.argv[1])), SimpleHTTPRequestHandler).serve_forever()")
         command = self.script("import subprocess,sys\n"
-            "child=subprocess.Popen([sys.executable, '-m', 'http.server', sys.argv[1], '--bind', '127.0.0.1'])\n"
+            f"child=subprocess.Popen([sys.executable, '-c', {child!r}, sys.argv[1]])\n"
             "child.wait()\n")
         app = HttpApp({"http": {"start": command, "health_path": "/", "boot_timeout_s": 5}})
         try:
