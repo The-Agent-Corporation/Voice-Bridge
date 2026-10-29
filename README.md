@@ -26,6 +26,54 @@ node dist/cli.js session start <project_id> --provider codex
 
 State lives in `VOICE_BRIDGE_DATA_DIR` when that is set, otherwise in the OS application-data folder (`~/Library/Application Support/voice-bridge` on macOS). The folder holds `bridge.sqlite`, the `client-token` (mode 0600) that every `/tools/*` call presents as `Authorization: Bearer <token>`, and `daemon.json`, which tells the CLI which port the running daemon chose and its pid; the CLI ignores the file once that process is gone.
 
+## Text chat
+
+```sh
+node dist/cli.js chat
+```
+
+`chat` reads one line at a time from stdin and answers each in order; blank lines are skipped and end of input (Ctrl-D, or the end of a pipe) ends the session. It understands exactly four commands, `list projects`, `open <name>`, `switch to <name>` and `what's happening?`, ignoring case and extra spaces. It is a fixed text parser: it needs no microphone and no model, but every project command calls the running daemon, so start it and register your projects as above first. With two projects registered, a session reads like this (the ids are placeholders for the ones `list projects` prints):
+
+```text
+> list projects
+<project_a_id> (Project A)
+<project_b_id> (Project B)
+> open project a
+Project A (freshness: current)
+Opened. Ask "what's happening?" for its briefing.
+> what's happening?
+Project A (freshness: current)
+<Project A's briefing, as in VOICE.md>
+> switch to project b
+Project B (freshness: unverified)
+Opened. Ask "what's happening?" for its briefing.
+> what's happening?
+Project B (freshness: unverified)
+<Project B's briefing>
+```
+
+`open` and `switch to` do the same thing. The name is compared, ignoring case, with each project's id and display name: an exact match wins, otherwise every project whose id or display name contains the name is a candidate. With no candidate (`No project matches "<name>".`) or several (`Several projects match "<name>"; say open with one of these ids:` and the list), the project already open stays open. Opening a project replaces the conversation's context, so after a switch `what's happening?` answers from the new project's briefing only; before any project is open it answers `No project is open.` and the command list.
+
+Replies go to stdout. A tool call that fails, such as one made while the daemon is down, prints `voice-bridge: <code>: <message>` to stderr, leaves the open project as it was, and the session goes on with the next line; at end of input `chat` then exits 1 instead of 0. Any other input, `help` included, only prints the command list (`I understand: list projects | open <name> | switch to <name> | what's happening?`); that is neither a failed call nor proof that anything was delivered.
+
+This offline check, run after `npm run build`, exercises the CLI's handling of both cases without a daemon, registered project, token or provider; it says nothing about a live daemon:
+
+```sh
+smoke_root=$(mktemp -d)
+printf '%s\n' "what's happening?" help |
+  VOICE_BRIDGE_DATA_DIR="$smoke_root/absent-data" node dist/cli.js chat
+printf 'exit=%s\n' "$?"   # exit=0, after "No project is open." and the command list
+test ! -e "$smoke_root/absent-data"
+
+printf '%s\n' 'list projects' help |
+  VOICE_BRIDGE_DATA_DIR="$smoke_root/absent-data" node dist/cli.js chat
+printf 'exit=%s\n' "$?"   # exit=1: daemon_not_running on stderr, the command list on stdout
+test ! -e "$smoke_root/absent-data"
+rmdir "$smoke_root"
+```
+
+Both `test` lines pass: neither run creates any bridge state.
+
 ## Saved sessions
 
 `register` and `sessions` read the saved Codex and Claude Code sessions on this machine, from `VOICE_BRIDGE_CODEX_HOME` (default `~/.codex`) and `VOICE_BRIDGE_CLAUDE_HOME` (default `~/.claude`), and keep those whose working directory is, after `realpath`, exactly the project's root or, for a project at the repository's main checkout, one of its linked Git worktrees that is not registered as a project of its own; a folder with a similar name never matches. A project registered at a linked worktree owns only that worktree, so no session is listed under two projects. They only read those files. Which providers count comes from `allowed_providers` in `.voice/config.json` (`["codex", "claude-code"]` when absent). Every session found is `saved`, with every capability `false`: a saved record says nothing about whether an agent is running. Records that cannot be read or parsed are counted as `skipped_records` rather than failing the call. A provider folder that cannot be listed, or a home set by one of those variables that does not exist, fails the call with `session_discovery_failed` and leaves the stored sessions as they were.
