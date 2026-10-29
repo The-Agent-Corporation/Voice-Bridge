@@ -26,4 +26,5 @@ regressions and `python3 harness/ci.py` for the ordinary project gates.
 
 Runtime snapshot identity hashes the configured include paths after setup.
 Dependency directories outside those includes may be prepared in the snapshot;
-setup cannot change included source files without invalidating the candidate.
+the candidate binds the included bytes after setup. Later changes to those bytes
+invalidate identity. `input_digest` separately records the pre-setup input.
