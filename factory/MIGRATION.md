@@ -26,7 +26,31 @@ What the factory owns, and what Archon owns:
 
 If you scheduled the factory, rerun `python factory/consumer.py schedule install`
 after an upgrade to preview the refreshed binding and timer, then add `--apply` to install.
+Preview prints the proposed binding and timer without writing either or changing loaded jobs.
+Only `--apply` persists the new `.factory/trigger.json` and installs the timer.
 Preserve the existing `.factory/trigger.json` and LaunchAgent files until migration finishes.
+
+Applied installation holds the same launch lock as `schedule fire` and persists
+`.factory/schedule-install-pending.json` before replacing the binding. If binding
+durability, scheduler updates, or installation cleanup fail or are interrupted,
+the guard blocks subsequent scheduled launches while existing runs may still wake.
+The binding may already contain the new configuration; failure is not a rollback.
+Inspect the error and preview the plan, then rerun `schedule install --apply` to
+finish installation. Only a successful install removes the guard. Do not delete it
+to bypass a failed install. STOP and PAUSE remain unchanged. This protection requires
+the updated consumer: legacy native timers and direct native commands bypass it and
+must follow the supervised migration procedure below.
+
+## Scheduled policy refusals
+
+A merging workflow (including `archon-lifecycle`) needs valid explicit
+`required_checks` and `protected_paths` declarations in `harness/harness.config.json`.
+If that declaration is missing or invalid, repair it first: reinstalling alone
+cannot repair an invalid policy. If the declaration is valid but installed inputs
+are stale after an edit, preview and rerun `schedule install --apply` to bind the
+current effective policy. Unchanged valid policies continue to admit launches.
+Windowless timers report refusals in `.factory/schedule.log` and exit nonzero;
+`status` lists native triggers and is not proof of current policy readiness.
 
 ## macOS timer migration
 

@@ -25,7 +25,7 @@ ASSERTION_EVIDENCE = {"e2e": "E2E_FAIL", "holdout": "HOLDOUT_FAIL"}
 # failure detail immediately above GATE_FAILED. A suite whose own output happens to
 # contain one of these reads as inconclusive, which is the safe direction: it fails
 # the gate loudly instead of scoring a catch nobody made.
-NOT_A_VERDICT = ("TIMEOUT after ", "could not run ", "UNIT_ERROR:")
+NOT_A_VERDICT = ("TIMEOUT after ", "could not run ", "UNIT_ERROR:", "Source checks failed:")
 IMPORT_FAILURES = ("ModuleNotFoundError:", "ImportError:", "Error: Cannot find module")
 INFRASTRUCTURE_RUNGS = {"app-start", "e2e-harness", "holdout-harness", "mutations"}
 
@@ -166,13 +166,27 @@ def apply(dest: Path, d: dict) -> tuple[bool, str]:
     matches -- a defect that cannot be placed precisely is a defect that proves
     nothing.
     """
+    dest = dest.resolve()
+    source = HERE.parents[1].resolve()
+    # This CLI operates on a separate disposable copy, never on its own source
+    # tree or a Git checkout/worktree. This is an accident guard, not a sandbox.
+    if dest.is_relative_to(source) or source.is_relative_to(dest):
+        return False, "candidate must be a separate disposable copy outside the source checkout"
     target = (dest / d["file"]).resolve()
-    if not target.is_relative_to(dest.resolve()):
+    if not target.is_relative_to(dest):
         return False, "mutation path escapes the candidate"
+    for parent in (target.parent, *target.parent.parents):
+        marker = parent / '.git'
+        if marker.exists() or marker.is_symlink():
+            return False, "candidate must be a disposable copy without Git checkout/worktree metadata"
     if not d.get("find") or d.get("find") == d.get("replace"):
         return False, "mutation must change a nonempty unique anchor"
     if not target.exists():
         return False, f"{d['file']} does not exist in the build copy"
+    # A separate path can still share its inode with a source checkout. Refuse
+    # hard-linked targets before opening them for mutation.
+    if target.stat().st_nlink > 1:
+        return False, "mutation target has hard links; use an independent disposable copy"
     body = target.read_text(encoding="utf-8")
     count = body.count(d["find"])
     if count == 0:
@@ -194,7 +208,8 @@ def main() -> int:
     subs.add_parser("list")
     mutation = subs.add_parser("apply")
     mutation.add_argument("id")
-    mutation.add_argument("--candidate", type=Path, required=True)
+    mutation.add_argument("--candidate", type=Path, required=True,
+                          help="separate disposable copy outside any Git checkout/worktree")
     score = subs.add_parser("score")
     score.add_argument("--log", type=Path, required=True)
     score.add_argument("--exit-code", type=int, required=True)

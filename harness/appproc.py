@@ -32,19 +32,27 @@ The universal parts, kept in one place because getting them wrong is subtle:
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+_PROCESS_SPEC = importlib.util.spec_from_file_location(
+    '_factory_http_runtime_process', ROOT / 'factory' / 'runtime_process.py')
+_PROCESS = importlib.util.module_from_spec(_PROCESS_SPEC)
+_PROCESS_SPEC.loader.exec_module(_PROCESS)
+group_has_live_members = _PROCESS.group_has_live_members
 
 
 class AppDidNotStart(RuntimeError):
@@ -102,9 +110,17 @@ class HttpApp:
         self.port = _free_port()
         self.base = f"http://127.0.0.1:{self.port}"
         self.proc: subprocess.Popen | None = None
+        self._output = None
+        self._closed = False
+        self._reaped_by_cleanup = False
         self.env_overrides = env or {}
 
     def __enter__(self) -> "HttpApp":
+        if os.name == "nt":
+            raise AppDidNotStart("owned HTTP cleanup is unsupported on Windows")
+        if not callable(getattr(os, "waitid", None)) or not hasattr(os, "WNOWAIT"):
+            raise AppDidNotStart("owned HTTP cleanup requires POSIX waitid/WNOWAIT support "
+                                "(on macOS, Python 3.13 or later)")
         cmd = (self.cfg.get("start") or "").replace("{port}", str(self.port))
         if not cmd:
             raise AppDidNotStart("driver=http but http.start is empty in harness.config.json")
@@ -114,72 +130,85 @@ class HttpApp:
         if merged:
             env = {**os.environ, **{k: str(v).replace("{port}", str(self.port))
                                     for k, v in merged.items()}}
-        self.proc = subprocess.Popen(
-            _argv(cmd), cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="replace", env=env,
-        )
-        self._await_health()
+        # A file cannot apply pipe backpressure to a chatty server. It is private,
+        # removed on close, and only the bounded tail is exposed on startup failure.
+        self.proc = None
+        self._closed = False
+        self._reaped_by_cleanup = False
+        self._output = tempfile.TemporaryFile()
+        try:
+            self.proc = subprocess.Popen(
+                _argv(cmd), cwd=ROOT, stdout=self._output, stderr=subprocess.STDOUT,
+                env=env, start_new_session=os.name != "nt",
+            )
+            self._await_health()
+        except BaseException as failure:
+            try:
+                self.__exit__()
+            except BaseException as cleanup_error:
+                failure.add_note(f"HTTP app cleanup failed: {cleanup_error}")
+            raise
         print(f"APP_STARTED port={self.port}", flush=True)
         return self
 
-    def __exit__(self, *exc) -> None:
-        if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-        self._free_the_port()
-
-    def _free_the_port(self) -> None:
-        """Kill whatever is still listening, even if this object did not start it.
-
-        Killing `self.proc` frees the port only when the process on it is the one
-        this object spawned. A journey may restart the app, and that replacement is
-        untracked: the original dies, the agent's copy keeps the port, `__exit__`
-        terminates a corpse, and the next lap gets `[Errno 10048] address already in
-        use` from a factory that thinks it tore everything down.
-
-        Measured after a morning of gate runs: four orphaned interpreters holding
-        four ports, on the exact class of leak the teardown comment already warned
-        about.
-
-        Best effort by design. This runs during teardown, on every path including a
-        failure, and a port that cannot be freed must not turn a reported failure
-        into a traceback about cleanup.
-        """
-        if not self.port:
+    def __exit__(self, exc_type=None, exc_value=None, traceback=None) -> None:
+        # Port numbers are not ownership evidence. Only stop the process tree we
+        # launched; a replacement started outside that tree belongs to its caller.
+        if self._closed:
             return
         try:
-            if os.name == "nt":
-                out = subprocess.run(
-                    ["netstat", "-ano"], capture_output=True, text=True,
-                    encoding="utf-8", errors="replace", timeout=30,
-                ).stdout
-                pids = {
-                    line.split()[-1]
-                    for line in out.splitlines()
-                    if f":{self.port} " in line and "LISTENING" in line
-                }
-                for pid in pids:
-                    if pid.isdigit() and pid != "0" and (
-                        not self.proc or str(self.proc.pid) != pid
-                    ):
-                        subprocess.run(["taskkill", "/PID", pid, "/F"],
-                                       capture_output=True, timeout=30)
-            else:
-                out = subprocess.run(
-                    ["lsof", "-ti", f"tcp:{self.port}"], capture_output=True,
-                    text=True, timeout=30,
-                ).stdout
-                for pid in out.split():
-                    if pid.isdigit() and (not self.proc or str(self.proc.pid) != pid):
-                        subprocess.run(["kill", "-9", pid], capture_output=True, timeout=30)
-        except (OSError, subprocess.SubprocessError):
-            # Named, not swallowed: a port left held is a real cost on the next lap,
-            # and silence here is how it becomes a mystery instead of a line in a log.
-            print(f"PORT_NOT_FREED {self.port} - something may still be listening",
-                  flush=True)
+            try:
+                if self.proc:
+                    self._stop_owned_group()
+                self._closed = True
+            finally:
+                if self._output:
+                    self._output.close()
+                    self._output = None
+        except BaseException as cleanup_error:
+            if exc_value is None:
+                raise
+            exc_value.add_note(f"HTTP app cleanup failed: {cleanup_error}")
+
+    def _exit_status(self) -> int | None:
+        if self.proc.returncode is not None:
+            raise RuntimeError("HTTP process owner was reaped; refusing unreserved group cleanup")
+        try:
+            state = os.waitid(os.P_PID, self.proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except ChildProcessError:
+            raise RuntimeError("HTTP process owner was reaped outside its cleanup") from None
+        if state is None:
+            return None
+        return state.si_status if state.si_code == os.CLD_EXITED else -state.si_status
+
+    def _signal_owned_group(self, signum) -> None:
+        # WNOWAIT keeps the leader's identity reserved until the last signal.
+        self._exit_status()
+        try:
+            os.killpg(self.proc.pid, signum)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            # macOS may report EPERM for an exited, unreaped leader alone.
+            # This is not cleanup proof; live membership is checked after reaping.
+            if self._exit_status() is None:
+                raise
+
+    def _stop_owned_group(self) -> None:
+        if not self._reaped_by_cleanup:
+            self._signal_owned_group(signal.SIGTERM)
+            deadline = time.monotonic() + 10
+            while self._exit_status() is None and time.monotonic() < deadline:
+                time.sleep(.05)
+            self._signal_owned_group(signal.SIGKILL)
+            self.proc.wait(timeout=10)
+            self._reaped_by_cleanup = True
+        # Queries after reaping may refuse success, but must never signal again.
+        deadline = time.monotonic() + 10
+        while group_has_live_members(self.proc.pid):
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Owned HTTP process group did not exit; cleanup is unverified")
+            time.sleep(.05)
 
     def _await_health(self) -> None:
         path = self.cfg.get("health_path", "/health")
@@ -187,10 +216,17 @@ class HttpApp:
         deadline = time.time() + int(self.cfg.get("boot_timeout_s", 45))
         last = "never answered"
         while time.time() < deadline:
-            if self.proc and self.proc.poll() is not None:
-                out = (self.proc.stdout.read() if self.proc.stdout else "") or ""
+            exited = self._exit_status() if self.proc else None
+            if exited is not None:
+                out = ""
+                if self._output:
+                    descriptor = self._output.fileno()
+                    size = os.fstat(descriptor).st_size
+                    # Descendants share this open file description. Positional
+                    # reads must not move their next output write offset.
+                    out = os.pread(descriptor, 2500, max(0, size - 2500)).decode("utf-8", errors="replace")
                 raise AppDidNotStart(
-                    f"the app exited with {self.proc.returncode} before answering:\n{out[-2500:]}"
+                    f"the app exited with {exited} before answering:\n{out[-2500:]}"
                 )
             try:
                 status, body, _ = self.get(path)
@@ -232,15 +268,16 @@ class HttpApp:
                 return None
 
         opener = (
-            urllib.request.build_opener()
+            urllib.request.build_opener(urllib.request.ProxyHandler({}))
             if follow
-            else urllib.request.build_opener(_NoRedirect)
+            else urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
         )
         try:
             with opener.open(req, timeout=30) as r:
                 return r.status, r.read().decode("utf-8", "replace"), dict(r.headers)
         except urllib.error.HTTPError as e:
-            return e.code, e.read().decode("utf-8", "replace"), dict(e.headers)
+            with e:
+                return e.code, e.read().decode("utf-8", "replace"), dict(e.headers)
 
     def request(self, method: str, path: str, body: str = "", headers: dict | None = None):
         h = {"Content-Type": "application/json"}
@@ -251,11 +288,14 @@ class HttpApp:
             headers=h,
             method=method.upper(),
         )
+        # These requests target the owned loopback fixture, never an ambient proxy.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         try:
-            with urllib.request.urlopen(req, timeout=30) as r:
+            with opener.open(req, timeout=30) as r:
                 return r.status, r.read().decode("utf-8", "replace"), dict(r.headers)
         except urllib.error.HTTPError as e:
-            return e.code, e.read().decode("utf-8", "replace"), dict(e.headers)
+            with e:
+                return e.code, e.read().decode("utf-8", "replace"), dict(e.headers)
 
     def post(self, path: str, body: str, headers: dict | None = None):
         return self.request("POST", path, body, headers)

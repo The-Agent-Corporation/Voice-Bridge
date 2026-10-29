@@ -1,13 +1,17 @@
 """Authenticated ordinary project environments, owned until the parent pipe closes."""
 from __future__ import annotations
 import argparse
+import errno
 import hashlib
 import hmac
+import io
 import json
+import math
 import os
 from pathlib import Path
 import re
 import secrets
+import select
 import shutil
 import signal
 import socket
@@ -18,6 +22,8 @@ import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.client import HTTPConnection, HTTPException, HTTPResponse
+from urllib.parse import urlsplit
 from urllib.request import Request, build_opener, ProxyHandler, HTTPRedirectHandler
 from urllib.error import URLError
 
@@ -30,6 +36,144 @@ class NoRedirect(HTTPRedirectHandler):
 
 
 HTTP = build_opener(ProxyHandler({}), NoRedirect())
+# One cooperative budget includes queueing, preparation and both execution
+# phases. Blocking filesystem calls are checked between operations, not killed.
+START_BUDGET_S = 610
+START_CLEANUP_HEADROOM_S = 60
+
+
+class RequestReader(io.RawIOBase):
+    """Bound the accepted request before the HTTP handler has parsed its headers."""
+    def __init__(self, connection, stopping):
+        super().__init__()
+        self.connection, self.stopping = connection, stopping
+        self.deadline = time.monotonic() + 2
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        # Read directly: socket.makefile's buffered reader cannot resume safely
+        # after a socket timeout. Short waits also observe parent cancellation.
+        while True:
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0 or self.stopping.is_set():
+                raise TimeoutError("runtime request read cancelled or timed out")
+            self.connection.settimeout(min(.05, remaining))
+            try:
+                count = self.connection.recv_into(buffer)
+            except TimeoutError:
+                continue
+            if self.stopping.is_set() or time.monotonic() >= self.deadline:
+                raise TimeoutError("runtime request read cancelled or timed out")
+            return count
+
+
+class ProbeReader(io.RawIOBase):
+    """Let the standard HTTP parser read through cancellable socket operations."""
+    def __init__(self, transport):
+        self.transport = transport
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        return self.transport.receive(buffer)
+
+
+class ProbeSocket:
+    """A single-threaded socket with one absolute deadline for all I/O."""
+    def __init__(self, sock, deadline, stopping):
+        self.sock, self.deadline, self.stopping = sock, deadline, stopping
+        sock.setblocking(False)
+
+    def check(self):
+        remaining = self.deadline - time.monotonic()
+        if self.stopping.is_set() or remaining <= 0:
+            raise ValueError("runtime HTTP probe cancelled or timed out")
+        return remaining
+
+    def wait(self, *, writing=False):
+        while True:
+            remaining = self.check()
+            readable, writable, _ = select.select(
+                [] if writing else [self.sock], [self.sock] if writing else [], [], min(.05, remaining))
+            self.check()
+            if readable or writable:
+                return
+
+    def connect(self, address):
+        self.check()
+        error = self.sock.connect_ex(address)
+        if error not in (0, errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY):
+            raise OSError(error, "runtime probe connection failed")
+        if error:
+            self.wait(writing=True)
+            error = self.sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+            if error:
+                raise OSError(error, "runtime probe connection failed")
+        self.check()
+
+    def sendall(self, data):
+        pending = memoryview(data)
+        while pending:
+            self.wait(writing=True)
+            try:
+                sent = self.sock.send(pending)
+            except BlockingIOError:
+                continue
+            if not sent:
+                raise ConnectionError("runtime probe connection closed")
+            pending = pending[sent:]
+        self.check()
+
+    def receive(self, buffer):
+        while True:
+            self.wait()
+            try:
+                count = self.sock.recv_into(buffer)
+            except BlockingIOError:
+                continue
+            self.check()
+            return count
+
+    def makefile(self, mode):
+        if mode != "rb":
+            raise ValueError("runtime probe requires binary reads")
+        return io.BufferedReader(ProbeReader(self))
+
+    def close(self):
+        self.sock.close()
+
+
+def probe_http(target, path, deadline, stopping):
+    """Read one bounded loopback response, retaining standard HTTP framing."""
+    address = urlsplit(target)
+    if (address.scheme != "http" or address.hostname != "127.0.0.1" or not address.port
+            or address.username or address.password or address.path or address.query or address.fragment):
+        raise ValueError("runtime probe requires an owned loopback target")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        transport = ProbeSocket(sock, deadline, stopping)
+        transport.connect(("127.0.0.1", address.port))
+        connection = HTTPConnection("127.0.0.1", address.port)
+        connection.sock = transport
+        try:
+            connection.request("GET", path, headers={"Connection": "close"})
+            # Parse directly so HTTPConnection does not close a Connection:close
+            # socket before this explicitly owned reader has consumed its body.
+            with HTTPResponse(transport, method="GET") as response:
+                response.begin()
+                if response.status != 200:
+                    raise ValueError("redirected or unhealthy target")
+                body = response.read(65537)
+                transport.check()
+                if len(body) > 65536:
+                    raise ValueError("runtime probe response is too large")
+                return body.decode("utf-8")
+        finally:
+            connection.close()
+
+
 def safe_path(root, relative):
     if (not isinstance(relative, str) or not relative or Path(relative).anchor
             or Path(relative).drive):
@@ -47,18 +191,22 @@ def safe_path(root, relative):
     return path
 
 
-def source_files(root, includes):
+def source_files(root, includes, *, directories=None):
     files = {}
     for rel in includes:
         path = safe_path(root, rel)
         if not path.exists():
             raise ValueError("configured source missing")
+        if directories is not None and path.is_dir():
+            directories.add(path.relative_to(root).as_posix())
         candidates = path.rglob("*") if path.is_dir() else [path]
         for child in candidates:
             name = child.relative_to(root).as_posix()
             safe_path(root, name)
             if child.is_file():
                 files[name] = child
+            elif directories is not None and child.is_dir():
+                directories.add(name)
     if not files:
         raise ValueError("empty source snapshot")
     return files
@@ -135,23 +283,50 @@ class Environments:
     def teardown(self, slot):
         item = self.active.get(slot)
         if item:
+            failures = []
             for proc in reversed(item["processes"]):
-                proc.close()
+                try:
+                    proc.close()
+                except Exception as error:
+                    failures.append(error)
+            if failures:
+                # Retain ownership and the directory until every process is
+                # confirmed stopped; a later teardown may retry failed cleanup.
+                raise ExceptionGroup("Runtime process cleanup incomplete", failures)
             remove_tree(item["directory"])
             del self.active[slot]
         return {"version": 1, "stopped": True}
 
-    def close(self):
+    def teardown_all(self):
+        failures = []
         for slot in list(self.active):
-            self.teardown(slot)
+            try:
+                self.teardown(slot)
+            except Exception as error:
+                failures.append(error)
+        if failures:
+            raise ExceptionGroup("Runtime environment cleanup incomplete", failures)
+
+    def close(self):
+        self.teardown_all()
         remove_tree(self.base)
 
-    def start(self, request):
+    def check_start(self, deadline):
+        if self.stopping.is_set() or time.monotonic() >= deadline:
+            raise ValueError("runtime startup cancelled or timed out")
+
+    def start(self, request, *, deadline=None):
+        limit = time.monotonic() + START_BUDGET_S
+        if deadline is not None and (not isinstance(deadline, (int, float)) or not math.isfinite(deadline)):
+            raise ValueError("invalid startup deadline")
+        deadline = min(deadline, limit) if deadline is not None else limit
+        self.check_start(deadline)
         slot = request.get("slot")
         if not isinstance(slot, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,80}", slot):
             raise ValueError("invalid slot")
         # Replacement is cleanup-first, including a malformed retry request.
         self.teardown(slot)
+        self.check_start(deadline)
         if set(request) - {"slot", "root", "mutation", "expected_source", "expected_revision"}:
             raise ValueError("unknown start fields; commands and paths cannot be supplied by callers")
         root = self.roots.get(request.get("root"))
@@ -167,11 +342,15 @@ class Environments:
                 raise ValueError("stale expected candidate revision")
             if resource_digest(root) != binding["resource_digest"]:
                 raise ValueError("prepared candidate resource changed")
+            self.check_start(deadline)
         cfg = self.config
         if cfg.get("shape") not in {"http", "cli", "library"}:
             raise ValueError("supported shapes: http, cli, library")
-        original = source_files(root, cfg["include"])
+        directories = set()
+        original = source_files(root, cfg["include"], directories=directories)
+        self.check_start(deadline)
         before = digest(original)
+        self.check_start(deadline)
         if request.get("expected_source", before) != before:
             raise ValueError("stale requested source")
         directory = self.base / secrets.token_hex(16)
@@ -181,12 +360,20 @@ class Environments:
         item = {"directory": directory, "source": source, "processes": []}
         self.active[slot] = item
         try:
+            # Directory entries are part of the selected layout even when no
+            # files below them contribute to the existing byte-only digest.
+            for rel in sorted(directories):
+                self.check_start(deadline)
+                safe_path(source, rel).mkdir(parents=True, exist_ok=True)
             for rel, path in original.items():
+                self.check_start(deadline)
                 target = source / rel
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(path, target)
+                self.check_start(deadline)
             if tree_digest(source) != before or digest(source_files(root, cfg["include"])) != before:
                 raise ValueError("source changed during snapshot")
+            self.check_start(deadline)
             mutation = request.get("mutation")
             if mutation:
                 matches = [d for d in cfg.get("mutations", []) if d.get("id") == mutation]
@@ -199,6 +386,7 @@ class Environments:
                 if not find or find == replace or body.count(find) != 1:
                     raise ValueError("mutation requires a unique changing anchor")
                 target.write_bytes(body.replace(find, replace, 1))
+                self.check_start(deadline)
             for _ in range(100):
                 with socket.socket() as lease:
                     lease.bind(("127.0.0.1", 0))
@@ -225,75 +413,90 @@ class Environments:
             if not 0 < timeout <= 300:
                 raise ValueError("timeout_s must be between 0 and 300")
             if cfg.get("setup"):
-                setup = ProcessTree(command(cfg["setup"], variables), source, env)
-                item["processes"].append(setup)
-                self.wait_exit(setup, timeout)
-                if setup.proc.returncode != 0:
+                self.check_start(deadline)
+                setup = ProcessTree(command(cfg["setup"], variables), source, env,
+                                    on_owner_created=item["processes"].append)
+                if self.wait_exit(setup, timeout, deadline=deadline) != 0:
                     raise ValueError("project setup failed (output withheld)")
                 setup.close()
                 item["processes"].remove(setup)
-            actual = tree_digest(source)
+            self.check_start(deadline)
+            selected = source_files(source, cfg["include"])
+            self.check_start(deadline)
+            actual = digest(selected)
+            self.check_start(deadline)
             argv = command(cfg["command"], variables)
             identity = "factory-v1:" + hashlib.sha256(json.dumps(
                 {"source": actual, "argv": argv, "env": env}, sort_keys=True).encode()).hexdigest()
             env["FACTORY_RUNTIME_CANDIDATE"] = identity
-            for path in source.rglob("*"):
-                if path.is_file():
-                    path.chmod(stat.S_IREAD)
-            proc = ProcessTree(argv, source, env)
-            item["processes"].append(proc)
+            for path in selected.values():
+                self.check_start(deadline)
+                path.chmod(stat.S_IREAD)
+            self.check_start(deadline)
+            proc = ProcessTree(argv, source, env,
+                               on_owner_created=item["processes"].append)
             item.update(candidate=identity, digest=actual, proc=proc, shape=cfg["shape"],
                         target=f"http://127.0.0.1:{port}", original=before, binding=binding)
             if cfg["shape"] == "http":
-                deadline = time.monotonic() + timeout
+                ready_deadline = min(deadline, time.monotonic() + timeout)
                 while True:
-                    if self.stopping.is_set() or proc.proc.poll() is not None:
+                    self.check_start(ready_deadline)
+                    if self.stopping.is_set() or proc.poll() is not None:
                         raise ValueError("app stopped before readiness")
                     try:
-                        self.probe(item)
+                        self.probe(item, deadline=ready_deadline)
                         break
-                    except (URLError, OSError, ValueError):
-                        if time.monotonic() >= deadline:
+                    except (URLError, OSError, ValueError, HTTPException):
+                        if time.monotonic() >= ready_deadline:
                             raise ValueError("app readiness/identity refused") from None
                         self.stopping.wait(.05)
             else:
-                self.wait_exit(proc, timeout)
-                item["exit_code"] = proc.proc.returncode
+                item["exit_code"] = self.wait_exit(proc, timeout, deadline=deadline)
                 proc.close()  # includes descendants of finite commands
-            return self.identity(slot)
-        except BaseException:
-            self.teardown(slot)
+            self.check_start(deadline)
+            result = self.identity(slot, deadline=deadline)
+            self.check_start(deadline)
+            return result
+        except BaseException as failure:
+            try:
+                self.teardown(slot)
+            except BaseException as cleanup_error:
+                failure.add_note(f"Runtime environment cleanup failed: {cleanup_error}")
             raise
 
-    def wait_exit(self, proc, timeout):
-        deadline = time.monotonic() + timeout
-        while proc.proc.poll() is None:
-            if self.stopping.wait(.05) or time.monotonic() >= deadline:
-                raise ValueError("project command cancelled or timed out")
+    def wait_exit(self, proc, timeout, *, deadline=None):
+        phase_deadline = time.monotonic() + timeout
+        deadline = min(deadline, phase_deadline) if deadline is not None else phase_deadline
+        while True:
+            self.check_start(deadline)
+            status = proc.poll()
+            if status is not None:
+                return status
+            self.stopping.wait(.05)
 
-    def probe(self, item):
-        if item["proc"].proc.poll() is not None:
+    def probe(self, item, *, deadline=None):
+        deadline = time.monotonic() + 1 if deadline is None else deadline
+        self.check_start(deadline)
+        if item["proc"].poll() is not None:
             raise ValueError("owned app is dead")
         for key in ("health_path", "identity_path"):
             path = self.config.get(key)
             if not isinstance(path, str) or not path.startswith("/") or path.startswith("//"):
                 raise ValueError("HTTP requires health_path and identity_path")
-            with HTTP.open(item["target"] + path, timeout=.5) as response:
-                if response.geturl() != item["target"] + path or response.status != 200:
-                    raise ValueError("redirected or unhealthy target")
-                body = response.read(65537).decode("utf-8")
+            body = probe_http(item["target"], path, min(deadline, time.monotonic() + .5), self.stopping)
             if key == "identity_path" and body.strip() != item["candidate"]:
                 raise ValueError("wrong target identity")
-        if item["proc"].proc.poll() is not None:
+        self.check_start(deadline)
+        if item["proc"].poll() is not None:
             raise ValueError("owned app died during probe")
 
-    def identity(self, slot):
+    def identity(self, slot, *, deadline=None):
         item = self.active.get(slot)
-        if not item or tree_digest(item["source"]) != item["digest"]:
+        if not item or digest(source_files(item["source"], self.config["include"])) != item["digest"]:
             raise ValueError("missing or changed candidate snapshot")
         if item["shape"] == "http":
-            self.probe(item)
-            if tree_digest(item["source"]) != item["digest"]:
+            self.probe(item, deadline=deadline)
+            if digest(source_files(item["source"], self.config["include"])) != item["digest"]:
                 raise ValueError("candidate changed during probe")
         result = {"version": 1, "slot": slot, "candidate": item["candidate"],
                 "source_digest": item["digest"], "input_digest": item["original"],
@@ -312,6 +515,11 @@ def serve(config):
     manager = Environments(config, stopping)
     token = secrets.token_urlsafe(32)
     class Handler(BaseHTTPRequestHandler):
+        def setup(self):
+            super().setup()
+            self.rfile.close()
+            self.rfile = io.BufferedReader(RequestReader(self.connection, stopping))
+
         def log_message(self, *args):
             pass
 
@@ -327,9 +535,15 @@ def serve(config):
                 data = json.loads(self.rfile.read(length))
                 if not isinstance(data, dict):
                     raise ValueError("request must be an object")
-                if self.path in {"/setup", "/start"}:
+                if self.path == "/start":
+                    # The local client uses the same host monotonic clock so
+                    # queueing cannot grant an abandoned request a fresh budget.
+                    raw_deadline = self.headers.get("X-Factory-Deadline")
+                    deadline = float(raw_deadline) if raw_deadline is not None else None
+                    result = manager.start(data, deadline=deadline)
+                elif self.path == "/setup":
                     # setup is a cleanup boundary; start performs provisioning atomically.
-                    result = manager.teardown(data["slot"]) if self.path == "/setup" else manager.start(data)
+                    result = manager.teardown(data["slot"])
                 elif self.path == "/teardown":
                     result = manager.teardown(data["slot"])
                 elif self.path == "/identity":
@@ -339,18 +553,27 @@ def serve(config):
                 status = 200
             except Exception:
                 # Never echo caller text, project output, paths or secrets on failure.
-                for slot in list(manager.active):
-                    manager.teardown(slot)
-                status, result = 400, {"error": "runtime request refused; active environments cleaned"}
+                try:
+                    manager.teardown_all()
+                except Exception:
+                    status, result = 500, {"error": "runtime request refused; cleanup incomplete"}
+                else:
+                    status, result = 400, {"error": "runtime request refused; active environments cleaned"}
             payload = json.dumps(result).encode()
             try:
+                self.connection.settimeout(2)
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
                 self.wfile.write(payload)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+            except OSError:
+                if self.path == "/start" and status == 200:
+                    try:
+                        manager.teardown(data["slot"])
+                    except Exception:
+                        # Keep failed ownership records for an explicit retry.
+                        print("Runtime start response lost; cleanup incomplete", file=sys.stderr, flush=True)
 
     def parent_pipe():
         # Raw fd read: a daemon thread blocked in the buffered reader holds
@@ -410,10 +633,13 @@ def request(action, data, connection=None):
     # Environment is trusted, but credentials must never be sent to remote hosts.
     if not re.fullmatch(r"http://127\.0\.0\.1:[0-9]+", connection["url"]):
         raise ValueError("runtime control must be loopback")
-    req = Request(connection["url"] + "/" + action, data=json.dumps(data).encode(),
-                  headers={"Authorization": "Bearer " + connection["token"],
-                           "Content-Type": "application/json"})
-    with HTTP.open(req, timeout=310) as response:
+    headers = {"Authorization": "Bearer " + connection["token"], "Content-Type": "application/json"}
+    if action == "start":
+        headers["X-Factory-Deadline"] = str(time.monotonic() + START_BUDGET_S)
+    req = Request(connection["url"] + "/" + action, data=json.dumps(data).encode(), headers=headers)
+    # Leave the owner time to clean an expired startup before the client gives up.
+    timeout = START_BUDGET_S + START_CLEANUP_HEADROOM_S if action == "start" else 310
+    with HTTP.open(req, timeout=timeout) as response:
         return json.load(response)
 
 

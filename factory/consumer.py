@@ -233,18 +233,66 @@ def harness_inputs(root: Path, name: str) -> dict:
     # so the project declares both once in its harness configuration.
     if name not in MERGING_WORKFLOWS:
         return {}
+    policy_file = "harness/harness.config.json"
+    requirement = (f"Merge policy required: {policy_file} must be a readable JSON object "
+                   "declaring required_checks and protected_paths as nonempty comma-separated "
+                   "strings (or explicit \"none\").")
     try:
-        config = json.loads((root / "harness/harness.config.json").read_text(encoding="utf-8-sig"))
+        config = json.loads((root / policy_file).read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
-        return {}
+        raise ValueError(requirement) from None
     if not isinstance(config, dict):
-        return {}
-    return {key: config[key] for key in MERGE_POLICY_KEYS
-            if isinstance(config.get(key), str) and config[key].strip()}
+        raise ValueError(requirement)
+    policy = {}
+    for key in MERGE_POLICY_KEYS:
+        value = config.get(key)
+        invalid = not isinstance(value, str) or not value.strip()
+        if not invalid:
+            # Match the native policy grammar; whitespace around list items is allowed.
+            # Native path-policy treats mixed `none` as a literal path pattern;
+            # only required-check lists reserve it exclusively as a sentinel.
+            items = [re.sub(r"^[\s\ufeff]+|[\s\ufeff]+$", "", item)
+                     for item in value.split(",")]
+            invalid = bool(re.search(r"[\x00-\x08\x0e-\x1f\x7f-\x9f]", value)) or any(
+                not item or re.search(r"[\x00-\x1f\x7f-\x9f]", item)
+                or (key == "required_checks" and len(items) > 1 and item.lower() == "none")
+                or (key == "protected_paths" and item == "/") for item in items)
+        if invalid:
+            label = "check names" if key == "required_checks" else "path patterns"
+            raise ValueError(f"Invalid merge policy: {policy_file} {key} must be a nonempty "
+                             f"comma-separated string of {label}, or explicit \"none\".")
+        policy[key] = value
+    return policy
 
 
 def workflow_defaults(root: Path, name: str) -> dict:
     return {**MANIFEST.get("default_inputs", {}).get(name, {}), **harness_inputs(root, name)}
+
+
+def verify_scheduled_policy(root: Path, config_path: Path, schedule_data: dict) -> None:
+    """Refuse stale installed merge inputs before changing admission state."""
+    reinstall = ("Installed trigger policy is stale or malformed. Run factory schedule install "
+                 "to preview, then repeat with --apply.")
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    binding = config.get("binding") if isinstance(config, dict) else None
+    launch = binding.get("launch") if isinstance(binding, dict) else None
+    workflow = schedule_data.get("workflow", "archon-lifecycle")
+    if (not isinstance(launch, dict) or not isinstance(workflow, str)
+            or launch.get("workflowName") != workflow):
+        raise ValueError(reinstall)
+    inputs = schedule_data.get("inputs")
+    if not isinstance(inputs, dict):
+        raise ValueError("schedule.json requires an inputs object")
+    if workflow not in MERGING_WORKFLOWS:
+        return
+    # Validate the declaration even when explicit schedule inputs override it,
+    # matching install/direct-run behavior. Overrides remain authoritative.
+    policy = harness_inputs(root, workflow)
+    effective = {key: (inputs[key] if isinstance(inputs[key], str) else json.dumps(inputs[key]))
+                 if key in inputs else value for key, value in policy.items()}
+    installed = launch.get("inputs")
+    if not isinstance(installed, dict) or any(installed.get(key) != value for key, value in effective.items()):
+        raise ValueError(reinstall)
 
 
 def with_default_inputs(name: str, args: list[str], options: list[str], root: Path) -> list[str]:
@@ -455,6 +503,8 @@ def _private_path(path: Path, *, directory: bool = False) -> None:
 
 def runtime_binding_options(root: Path, data: dict) -> dict | None:
     """Opt-in caller-owned scenarios; the pinned workflow remains unchanged."""
+    if not isinstance(data, dict):
+        raise ValueError("schedule.json must contain a JSON object")
     value = data.get("runtime_binding")
     if value is None:
         return None
@@ -583,6 +633,8 @@ def dispatch_bound_trigger(root: Path, settings: dict, source: Path, config_path
         raw = checked([sys.executable, str(helper), "create", "--project-root", str(root.resolve()),
                        "--output", str(invocation)], root)
         prepared = json.loads(raw)
+        if not isinstance(prepared, dict) or not isinstance(prepared.get("invocation"), str):
+            raise ValueError("Runtime binding helper returned an invalid invocation")
         uuid.UUID(prepared["invocation"])
         _private_path(invocation, directory=True)
         paths = {}
@@ -697,6 +749,13 @@ def task_xml(python: Path, root: Path, minutes: int) -> str:
 """
 
 
+def _systemd_word(value: str) -> str:
+    """Quote one systemd word, preserving literal specifiers and C escape characters."""
+    if re.search(r"[\x00-\x1f\x7f-\x9f]", value):
+        raise ValueError("Systemd paths and environment values cannot contain control characters")
+    return json.dumps(value.replace("%", "%%"), ensure_ascii=False)
+
+
 def timer_commands(root: Path, interval: int) -> dict:
     """Host schedulers invoke the consumer so STOP/PAUSE are checked before Archon."""
     fire = [sys.executable, str(root / "factory/consumer.py"), "schedule", "fire"]
@@ -739,13 +798,20 @@ def timer_commands(root: Path, interval: int) -> dict:
                 "install": [["/bin/launchctl", "bootstrap", domain, str(path)] for path in jobs],
                 "remove": [["/bin/launchctl", "bootout", f"{domain}/{path.stem}"] for path in jobs]}
     unit = name.lower()
+    # systemd is not a shell: quote each word, escape %-specifiers, and disable
+    # environment expansion with ':' so literal dollars survive in every argument.
+    command = " ".join(_systemd_word(value) for value in [":" + fire[0], *fire[1:]])
+    path_environment = _systemd_word("PATH=" + os.environ.get("PATH", ""))
+    # WorkingDirectory accepts a raw path (no unquoting/C-unescaping). '/.' protects
+    # a trailing space or backslash in the directory name from unit line parsing.
+    working_directory = str(root).replace("%", "%%") + "/."
     # The timer gets what a manual run had: the same tool PATH, credentials from a
     # mode-600 file outside the repository, and IS_SANDBOX for Claude Code as root.
     return {"systemd": {
         f"{unit}.service": "[Unit]\nDescription=Archon factory trigger\n\n[Service]\nType=oneshot\n"
-                           f"WorkingDirectory={root}\nEnvironment=PATH={os.environ.get('PATH', '')}\n"
+                           f"WorkingDirectory={working_directory}\nEnvironment={path_environment}\n"
                            "Environment=IS_SANDBOX=1\nEnvironmentFile=-%h/.factory-env\n"
-                           f"ExecStart={' '.join(fire)}\n",
+                           f"ExecStart={command}\n",
         f"{unit}.timer": f"[Unit]\nDescription=Archon factory trigger\n\n[Timer]\nOnBootSec=2min\n"
                          f"OnUnitInactiveSec={interval}s\n\n[Install]\nWantedBy=timers.target\n"},
         "install": [["systemctl", "--user", "daemon-reload"],
@@ -830,6 +896,34 @@ def single_flight(path: Path):
         yield True
     finally:
         handle.close()
+
+
+SCHEDULE_INSTALL_PENDING = ".factory/schedule-install-pending.json"
+
+
+@contextlib.contextmanager
+def schedule_install_guard(root: Path, apply: bool):
+    """Keep partial binding/scheduler commits out of scheduled admission."""
+    if not apply:
+        yield
+        return
+    shared = shared_root(root)
+    with single_flight(shared / ".factory/fire.lock") as held:
+        if not held:
+            raise ValueError("Another process is launching or installing; schedule installation refused")
+        pending = shared / SCHEDULE_INSTALL_PENDING
+        # Persist before replacing the binding. A crash or failed post-replace
+        # directory sync must leave subsequent ticks unable to use a partial install.
+        _binding_write(pending, {"state": "installing"})
+        try:
+            yield
+            pending.unlink()
+        except BaseException as error:
+            error.add_note(
+                f"Schedule installation may be partially committed; scheduled launches remain blocked by {pending}. "
+                "Inspect the failure and rerun schedule install --apply to complete installation. "
+                "Do not remove this guard to resume launches.")
+            raise
 
 
 ENDED = {"completed", "failed", "cancelled"}
@@ -922,6 +1016,8 @@ def tick_state(root: Path, **updates) -> dict:
         state = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         state = {}
+    if not isinstance(state, dict):
+        raise ValueError(f".factory/gate.json must contain a JSON object (found {type(state).__name__})")
     if updates:
         state.update(updates)
         path.write_text(json.dumps(state) + "\n", encoding="utf-8")
@@ -1064,42 +1160,45 @@ def schedule(root: Path, args: list[str]) -> int:
         return 0
     if action == "install":
         config = trigger_config(root, settings, source, interval)
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
         plan = timer_commands(root, interval)
-        print(f"Wrote {config_path} (Archon trigger binding for {config['binding']['launch']['workflowName']}).")
-        base = config["binding"]["launch"]["isolation"].get("baseOverride")
-        print(f"Laps start from {base}." if base else
-              "No default branch is known locally, so every launch asks the remote for it. "
-              "Run `git remote set-head origin --auto` or set base_branch in schedule.json.")
-        if "launchd" in plan:
-            configure_launchd(root, plan, apply)
-            return 0
-        for task_file, body in plan.get("task_xml", {}).items():
-            print(f"--- {task_file}\n{body}")
+        with schedule_install_guard(root, apply):
+            binding_text = json.dumps(config, indent=2) + "\n"
             if apply:
-                task_file.parent.mkdir(parents=True, exist_ok=True)
-                task_file.write_text(body, encoding="utf-16")
-        if "systemd" in plan:
-            unit_dir = Path.home() / ".config/systemd/user"
-            for file_name, body in plan["systemd"].items():
-                print(f"--- {unit_dir / file_name}\n{body}")
+                config_path.parent.mkdir(parents=True, exist_ok=True)
+                _binding_write(config_path, config)
+                print(f"Wrote {config_path} (Archon trigger binding for {config['binding']['launch']['workflowName']}).")
+            else:
+                print(f"Would write {config_path}:\n{binding_text}")
+            base = config["binding"]["launch"]["isolation"].get("baseOverride")
+            print(f"Laps start from {base}." if base else
+                  "No default branch is known locally, so every launch asks the remote for it. "
+                  "Run `git remote set-head origin --auto` or set base_branch in schedule.json.")
+            if "launchd" in plan:
+                configure_launchd(root, plan, apply)
+                return 0
+            for task_file, body in plan.get("task_xml", {}).items():
+                print(f"--- {task_file}\n{body}")
                 if apply:
-                    unit_dir.mkdir(parents=True, exist_ok=True)
-                    (unit_dir / file_name).write_text(body, encoding="utf-8")
-        for command in plan["install"]:
-            print(("Running: " if apply else "Run to enable: ") + subprocess.list2cmdline(command))
-            if apply:
-                checked(command, root)
-        return 0
+                    task_file.parent.mkdir(parents=True, exist_ok=True)
+                    task_file.write_text(body, encoding="utf-16")
+            if "systemd" in plan:
+                unit_dir = Path.home() / ".config/systemd/user"
+                for file_name, body in plan["systemd"].items():
+                    print(f"--- {unit_dir / file_name}\n{body}")
+                    if apply:
+                        unit_dir.mkdir(parents=True, exist_ok=True)
+                        (unit_dir / file_name).write_text(body, encoding="utf-8")
+            for command in plan["install"]:
+                print(("Running: " if apply else "Run to enable: ") + subprocess.list2cmdline(command))
+                if apply:
+                    checked(command, root)
+            return 0
     if action in {"fire", "wake"}:
         if stop.exists():
             print("Local STOP is set; no trigger fired. Use unhalt to resume.", file=sys.stderr)
             return 0
         # Refuse redirects before intake as well as before global continuation.
         verify_registry_environment(root)
-        if action == "fire" and not config_path.is_file():
-            raise ValueError("No trigger binding. Run factory schedule install first")
         # A windowless timer tick (pythonw) has no console, so its output goes to a log.
         log = ((shared_root(root) / ".factory/schedule.log").open("a", encoding="utf-8")
                if windowless() else None)
@@ -1116,18 +1215,36 @@ def schedule(root: Path, args: list[str]) -> int:
             else:
                 # Ticks run in parallel (a long wake must not hold back the next launch), so
                 # each phase admits one tick at a time; a tick that finds a phase busy skips it.
-                with single_flight(shared_root(root) / ".factory/fire.lock") as held:
-                    if not held:
-                        write("Another tick is still launching; this one skips the launch.\n")
-                    elif launch_decision(root, settings, source, write):
-                        schedule_file = shared_root(root) / SCHEDULE
-                        data = json.loads(schedule_file.read_text(encoding="utf-8")) if schedule_file.exists() else {}
-                        options = runtime_binding_options(root, data)
-                        if options:
-                            fired = dispatch_bound_trigger(root, settings, source, config_path, options, write)
+                try:
+                    if not config_path.is_file():
+                        raise ValueError("No trigger binding. Run factory schedule install to preview, "
+                                         "then repeat with --apply.")
+                    with single_flight(shared_root(root) / ".factory/fire.lock") as held:
+                        if not held:
+                            write("Another tick is still launching; this one skips the launch.\n")
                         else:
-                            fired = execute([*native, "trigger", "fire", "--config", str(config_path)], root,
-                                            capture=False, timeout=None, output=log).returncode
+                            if (shared_root(root) / SCHEDULE_INSTALL_PENDING).exists():
+                                raise ValueError("Schedule installation is incomplete; scheduled launches are blocked. "
+                                                 "Inspect the failure and rerun schedule install --apply.")
+                            schedule_file = shared_root(root) / SCHEDULE
+                            data = json.loads(schedule_file.read_text(encoding="utf-8")) if schedule_file.exists() else {}
+                            if not isinstance(data, dict):
+                                raise ValueError("schedule.json must contain a JSON object")
+                            verify_scheduled_policy(root, config_path, data)
+                            if launch_decision(root, settings, source, write):
+                                options = runtime_binding_options(root, data)
+                                if options:
+                                    fired = dispatch_bound_trigger(root, settings, source, config_path, options, write)
+                                else:
+                                    fired = execute([*native, "trigger", "fire", "--config", str(config_path)], root,
+                                                    capture=False, timeout=None, output=log).returncode
+                except Exception as error:
+                    # Admission and continuation are independent: even an unexpected
+                    # launch error must leave existing durable waits able to wake.
+                    # STOP, registry trust checks, wake failures and operator interrupts
+                    # remain outside this launch-only recovery boundary.
+                    write(f"Launch phase error ({type(error).__name__}): {error}\n")
+                    fired = 1
             if log:
                 log.flush()
             # Resume due durable waits (CI pauses, usage-limit resumes) in the same tick.
@@ -1178,6 +1295,8 @@ def main(argv: list[str] | None = None) -> int:
         return invoke(project_root(), args[0], args[1:])
     except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
         print(f"Factory refused: {error}", file=sys.stderr)
+        for note in getattr(error, "__notes__", []):
+            print(note, file=sys.stderr)
         return 1
 
 
