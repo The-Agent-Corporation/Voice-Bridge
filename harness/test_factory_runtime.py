@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "factory"))
@@ -86,6 +87,48 @@ class HttpOwnershipTests(unittest.TestCase):
             proc.wait(timeout=5)
             if proc.stdout:
                 proc.stdout.close()
+
+    def test_loopback_requests_ignore_ambient_proxies(self):
+        paths = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                paths.append(self.path)
+                self.rfile.read(int(self.headers.get('Content-Length', '0')))
+                if self.path.startswith('http://'):
+                    self.send_response(502)  # An ambient proxy received local traffic.
+                elif self.path == '/redirect':
+                    self.send_response(302)
+                    self.send_header('Location', '/health')
+                else:
+                    self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'local fixture')
+
+            do_POST = do_GET
+
+            def log_message(self, *args):
+                pass
+
+        with ThreadingHTTPServer(('127.0.0.1', 0), Handler) as server:
+            thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': .01}, daemon=True)
+            thread.start()
+            try:
+                app = HttpApp({'http': {}})
+                app.base = f'http://127.0.0.1:{server.server_port}'
+                with patch('urllib.request.getproxies', return_value={'http': app.base}), \
+                        patch('urllib.request.proxy_bypass', return_value=False), \
+                        patch('urllib.request._opener', None):
+                    for request, expected in ((lambda: app.get('/health'), 200),
+                            (lambda: app.get('/redirect'), 302),
+                            (lambda: app.get('/redirect', follow=True), 200),
+                            (lambda: app.request('POST', '/health', '{}'), 200)):
+                        with self.subTest(expected=expected):
+                            self.assertEqual(request()[0], expected)
+                self.assertFalse(any(path.startswith('http://') for path in paths))
+            finally:
+                server.shutdown()
+                thread.join(timeout=5)
 
     def test_chatty_app_starts_without_stdout_backpressure(self):
         command = self.script("import sys\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n"

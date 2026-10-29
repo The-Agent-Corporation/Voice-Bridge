@@ -263,15 +263,16 @@ class HttpApp:
                 return None
 
         opener = (
-            urllib.request.build_opener()
+            urllib.request.build_opener(urllib.request.ProxyHandler({}))
             if follow
-            else urllib.request.build_opener(_NoRedirect)
+            else urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
         )
         try:
             with opener.open(req, timeout=30) as r:
                 return r.status, r.read().decode("utf-8", "replace"), dict(r.headers)
         except urllib.error.HTTPError as e:
-            return e.code, e.read().decode("utf-8", "replace"), dict(e.headers)
+            with e:
+                return e.code, e.read().decode("utf-8", "replace"), dict(e.headers)
 
     def request(self, method: str, path: str, body: str = "", headers: dict | None = None):
         h = {"Content-Type": "application/json"}
@@ -282,11 +283,14 @@ class HttpApp:
             headers=h,
             method=method.upper(),
         )
+        # These requests target the owned loopback fixture, never an ambient proxy.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         try:
-            with urllib.request.urlopen(req, timeout=30) as r:
+            with opener.open(req, timeout=30) as r:
                 return r.status, r.read().decode("utf-8", "replace"), dict(r.headers)
         except urllib.error.HTTPError as e:
-            return e.code, e.read().decode("utf-8", "replace"), dict(e.headers)
+            with e:
+                return e.code, e.read().decode("utf-8", "replace"), dict(e.headers)
 
     def post(self, path: str, body: str, headers: dict | None = None):
         return self.request("POST", path, body, headers)
