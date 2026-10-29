@@ -41,6 +41,17 @@ to bypass a failed install. STOP and PAUSE remain unchanged. This protection req
 the updated consumer: legacy native timers and direct native commands bypass it and
 must follow the supervised migration procedure below.
 
+## Scheduled policy refusals
+
+A merging workflow (including `archon-lifecycle`) needs valid explicit
+`required_checks` and `protected_paths` declarations in `harness/harness.config.json`.
+If that declaration is missing or invalid, repair it first: reinstalling alone
+cannot repair an invalid policy. If the declaration is valid but installed inputs
+are stale after an edit, preview and rerun `schedule install --apply` to bind the
+current effective policy. Unchanged valid policies continue to admit launches.
+Windowless timers report refusals in `.factory/schedule.log` and exit nonzero;
+`status` lists native triggers and is not proof of current policy readiness.
+
 ## macOS timer migration
 
 1. Run `python factory/consumer.py halt` before upgrading the installed consumer.

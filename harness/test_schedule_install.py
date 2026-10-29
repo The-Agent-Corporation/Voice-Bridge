@@ -6,6 +6,9 @@ import json
 import os
 from pathlib import Path
 import stat
+import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -235,6 +238,26 @@ class ScheduleInstallTests(unittest.TestCase):
         # trailing space/backslash in the directory name from becoming unit syntax.
         self.assertIn('WorkingDirectory=/srv/project %%n ${HOME} "quoted" \\tail /.\n', service)
         self.assertIn('EnvironmentFile=-%h/.factory-env\n', service)
+
+    @unittest.skipUnless(sys.platform == 'linux' and shutil.which('systemd-analyze'),
+                         'requires Linux systemd-analyze for unit parser qualification')
+    def test_generated_linux_units_are_accepted_by_systemd_parser(self):
+        with tempfile.TemporaryDirectory(prefix='factory-systemd-') as folder:
+            root = Path(folder) / 'project %n ${HOME} "quoted" \\tail '
+            root.mkdir()
+            (root / 'factory').mkdir()
+            (root / 'factory/consumer.py').write_text('pass\n')
+            with patch.dict(consumer.os.environ, {'PATH': '/opt/tool box/%n/$HOME/"q"/\\bin:/usr/bin'}):
+                plan = consumer.timer_commands(root, 600)
+            units = []
+            for name, body in plan['systemd'].items():
+                path = Path(folder) / name
+                path.write_text(body)
+                units.append(str(path))
+            version = subprocess.check_output(['systemd-analyze', '--version'], text=True).splitlines()[0]
+            result = subprocess.run(['systemd-analyze', '--man=no', 'verify', *units],
+                                    text=True, capture_output=True, timeout=30)
+            self.assertEqual(result.returncode, 0, version + '\n' + result.stdout + result.stderr)
 
     def test_linux_generation_refuses_control_characters_before_binding_write(self):
         with self.project() as (root, home, commands, _), \

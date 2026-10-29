@@ -26,6 +26,13 @@ slot only after teardown succeeds. After reaping the leader, retries only observ
 membership and never signal the numeric group again. Restarting the host or
 discarding ownership records does not establish verified cleanup.
 
+If a reliably observed member persists after its leader was reaped, passive retries
+will not terminate it. Keep the owner and directory, stop further admissions for
+that slot, and have the operator investigate the individual processes and confirm
+independently that they have stopped before retrying teardown. Never signal a bare
+numeric process group after its reserving leader has been reaped; the ID may have
+been reused. Automatic identity-safe member termination is not implemented.
+
 ## Foreground lifetime
 
 ```text
@@ -56,6 +63,11 @@ received the response; undetected delivery loss is not an acknowledgement protoc
 This is not a hard filesystem wall-clock bound: a blocked synchronous filesystem
 call cannot be interrupted by these checks, and cleanup may itself fail. The owner
 reports incomplete cleanup instead of success and keeps failed state for retry.
+The foreground wrapper waits up to 30 seconds for owner exit; a start request has
+60 seconds of cleanup headroom. Sequential multi-slot cleanup can exceed either
+caller wait. A client timeout means the cleanup outcome is unknown, not that the
+owner stopped or cleanup completed. Preserve ownership and inspect the retained
+host/slots before recovery; do not launch replacement workers on a timeout alone.
 
 `--runtime-host` cannot accompany `--detach`, `-d`, or `--resume`, including equals
 forms. Native durable ownership/terminal notification is not integrated. A paused
@@ -192,6 +204,12 @@ the configured `include` set. Setup-created files under an included path are
 selected unless a forbidden directory component causes source selection to fail.
 Directories outside every included path are not selected and remain outside the
 source identity claim.
+Resource and runtime digests cover selected file names and bytes, not permission
+bits or empty-directory layout. Preparation verifies committed modes and selected
+directories, but later mode/layout drift is outside the digest claim. Started
+snapshot files are made read-only (0400), so executable bits preserved in a prepared
+resource do not reach the started snapshot. Launch selected code through the
+configured Python/Node interpreter; direct executable-file launch is unsupported.
 
 The app receives a small OS environment plus configured `env`. Provider credentials,
 control credentials and arbitrary parent variables are not inherited. HOME and
@@ -229,7 +247,10 @@ cases must use distinct slots. This owner serializes requests.
 `start`. `teardown` is idempotent and terminates descendants before deleting files.
 Authenticated malformed/failed requests clean all active slots, fail closed, and
 return a generic error without echoing commands, secrets or evaluator contents.
-Unauthenticated requests return 403 without disturbing running apps.
+Unauthenticated requests return 403 without disturbing running apps. A slow
+authenticated request body exceeding its read budget also follows this host-wide
+cleanup policy: even `/identity` or `/teardown` for one slot cleans every active
+slot. Use separate hosts when that failure domain is inappropriate.
 
 `start` and `describe` return JSON with `version`, `slot`, `candidate`,
 `source_digest` (post-setup/mutation included bytes), `input_digest` (included

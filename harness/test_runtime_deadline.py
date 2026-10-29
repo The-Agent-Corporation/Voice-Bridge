@@ -83,7 +83,7 @@ class RuntimeDeadlineTests(unittest.TestCase):
         return observed
 
     @contextmanager
-    def accepted_request(self, prefix, *, trickle):
+    def accepted_request(self, prefix, *, trickle, second_slot=False):
         """Real accepted socket and live owned process, with a disposable parent pipe."""
         manager = runtime_host.Environments(self.manager.config, threading.Event())
         directory = manager.base / "existing"
@@ -145,6 +145,20 @@ class RuntimeDeadlineTests(unittest.TestCase):
             while not marker.exists() or marker.read_text() != "ready":
                 self.assertLess(time.monotonic(), deadline, "owned child did not become ready")
                 time.sleep(.01)
+            if second_slot:
+                second_directory = manager.base / "second"
+                second_directory.mkdir()
+                second = {"directory": second_directory, "processes": []}
+                manager.active["second"] = second
+                second_marker = second_directory / "child-ready"
+                runtime_process.ProcessTree([sys.executable, "-c",
+                    "from pathlib import Path; import sys,time; "
+                    "Path(sys.argv[1]).write_text('ready'); time.sleep(60)", str(second_marker)],
+                    self.root, {}, on_owner_created=second["processes"].append)
+                deadline = time.monotonic() + 5
+                while not second_marker.exists() or second_marker.read_text() != "ready":
+                    self.assertLess(time.monotonic(), deadline, "second owned child did not become ready")
+                    time.sleep(.01)
             with patch.object(runtime_host, "Environments", side_effect=manager_factory), \
                     patch.object(runtime_host, "HTTPServer", side_effect=server_factory), \
                     patch.object(runtime_host, "sys", fixture_sys), \
@@ -208,6 +222,27 @@ class RuntimeDeadlineTests(unittest.TestCase):
                 self.assertEqual(failures, [], f"server failed before owned cleanup: {failures!r}")
                 self.assertTrue(owner.closed)
                 self.assertEqual(manager.active, {})
+
+    def test_authenticated_slow_body_cleans_both_slots_before_response(self):
+        request = (b"POST /identity HTTP/1.0\r\nAuthorization: Bearer fixture\r\n"
+                   b"Content-Length: 16000\r\n\r\n{")
+        with self.accepted_request(request, trickle=True, second_slot=True) as fixture:
+            client, close_parent, worker, owner, manager, failures = fixture
+            owners = [p for item in manager.active.values() for p in item["processes"]]
+            self.assertEqual(len(owners), 2)
+            client.settimeout(5)
+            with HTTPResponse(client) as response:
+                response.begin()
+                self.assertEqual(response.status, 400)
+                self.assertIn("active environments cleaned", json.loads(response.read())["error"])
+            # Assert before closing the parent pipe: EOF cleanup must not mask
+            # whether the authenticated request failure cleaned every slot.
+            self.assertEqual(manager.active, {})
+            for process in owners:
+                self.assertTrue(process.closed)
+                if os.name == "posix":
+                    self.assertFalse(runtime_process.group_has_live_members(process.proc.pid))
+            self.assertEqual(failures, [])
 
     def test_complete_authenticated_inbound_request_keeps_response_contract(self):
         body = b'{"slot":"existing"}'
