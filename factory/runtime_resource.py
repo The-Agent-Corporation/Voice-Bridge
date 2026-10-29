@@ -12,7 +12,6 @@ import stat
 import subprocess
 import sys
 import tempfile
-import zipfile
 
 
 MARKER = ".factory-resource.json"
@@ -27,8 +26,8 @@ def checked(argv: list[str], cwd: Path) -> str:
     return result.stdout.strip()
 
 
-def checked_bytes(argv: list[str], cwd: Path) -> bytes:
-    result = subprocess.run(argv, cwd=cwd, capture_output=True, timeout=120)
+def checked_bytes(argv: list[str], cwd: Path, *, input: bytes | None = None) -> bytes:
+    result = subprocess.run(argv, cwd=cwd, input=input, capture_output=True, timeout=120)
     if result.returncode:
         raise ValueError("Git could not verify the delivering revision")
     return result.stdout
@@ -97,7 +96,7 @@ def configured_includes(config: Path) -> list[str]:
     result = []
     for value in includes:
         path = PurePosixPath(value)
-        if (not value or value != path.as_posix() or "\\" in value or path.is_absolute()
+        if (not value or value != path.as_posix() or "\\" in value or ":" in value or path.is_absolute()
                 or any(part in {"", ".", ".."} or part.lower() in FORBIDDEN
                        for part in path.parts)):
             raise ValueError("private or escaping include path refused")
@@ -105,7 +104,8 @@ def configured_includes(config: Path) -> list[str]:
     return result
 
 
-def committed_files(repository: Path, revision: str, includes: list[str]) -> list[str]:
+def committed_files(repository: Path, revision: str, includes: list[str]) -> tuple[list[str], dict[str, tuple[str, int]]]:
+    """Select directory layout and exact blob identities, independent of export attributes."""
     for include in includes:
         entry = checked_bytes(["git", "ls-tree", "-z", revision, "--", include], repository)
         if not entry:
@@ -117,6 +117,7 @@ def committed_files(repository: Path, revision: str, includes: list[str]) -> lis
     if not entries:
         raise ValueError("configured includes produced an empty resource")
     directories = []
+    files = {}
     for raw in entries.split(b"\0"):
         if not raw:
             continue
@@ -131,13 +132,90 @@ def committed_files(repository: Path, revision: str, includes: list[str]) -> lis
         except UnicodeDecodeError as error:
             raise ValueError("committed source path is not UTF-8") from error
         path = PurePosixPath(decoded)
-        if ("\\" in decoded or path.is_absolute()
+        # Colons can select a Windows drive or alternate data stream instead of
+        # the ordinary relative file represented by the Git entry.
+        if ("\\" in decoded or ":" in decoded or path.is_absolute()
                 or any(part in {"", ".", ".."} or part.lower() in FORBIDDEN
                        for part in path.parts)):
             raise ValueError("private or escaping committed source path refused")
         if fields[1] == b"tree":
             directories.append(decoded)
-    return directories
+        else:
+            if len(fields[2]) != 40 or any(value not in b"0123456789abcdef" for value in fields[2]):
+                raise ValueError("committed source has an invalid blob identity")
+            files[decoded] = (fields[2].decode("ascii"), int(fields[0], 8) & 0o777)
+    return directories, files
+
+
+def staging_path(staging: Path, relative: str) -> Path:
+    target = (staging / relative).resolve()
+    if not target.is_relative_to(staging):
+        raise ValueError("committed source contains an escaping path")
+    return target
+
+
+def materialize_blobs(repository: Path, files: dict[str, tuple[str, int]], staging: Path) -> None:
+    # Git archive applies export-ignore/export-subst, so its output need not
+    # contain the selected commit's paths or bytes. Read immutable blobs instead.
+    identities = list(dict.fromkeys(identity for identity, _ in files.values()))
+    output = checked_bytes(["git", "cat-file", "--batch"], repository,
+                           input="".join(identity + "\n" for identity in identities).encode("ascii"))
+    contents = {}
+    offset = 0
+    for identity in identities:
+        end = output.find(b"\n", offset)
+        if end < 0:
+            raise ValueError("Git returned incomplete committed blob data")
+        header = output[offset:end].split(b" ")
+        if (len(header) != 3 or header[0] != identity.encode("ascii")
+                or header[1] != b"blob" or not header[2].isdigit()):
+            raise ValueError("Git returned an unexpected committed blob")
+        size = int(header[2])
+        offset = end + 1
+        content = output[offset:offset + size]
+        if len(content) != size or output[offset + size:offset + size + 1] != b"\n":
+            raise ValueError("Git returned truncated committed blob data")
+        actual = hashlib.sha1(b"blob " + str(size).encode("ascii") + b"\0" + content).hexdigest()
+        if actual != identity:
+            raise ValueError("Git returned changed committed blob bytes")
+        contents[identity] = content
+        offset += size + 1
+    if offset != len(output):
+        raise ValueError("Git returned unexpected extra committed blob data")
+    for relative, (identity, mode) in files.items():
+        target = staging_path(staging, relative)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(contents[identity])
+        target.chmod(mode)
+
+
+def verify_materialized(staging: Path, directories: list[str], files: dict[str, tuple[str, int]]) -> None:
+    expected_directories = set(directories)
+    for relative in [*directories, *files]:
+        expected_directories.update(parent.as_posix() for parent in PurePosixPath(relative).parents
+                                    if parent != PurePosixPath("."))
+    actual_files = {}
+    actual_directories = set()
+    for path in staging.rglob("*"):
+        relative = path.relative_to(staging).as_posix()
+        if path.is_symlink():
+            raise ValueError("materialized source contains linked paths")
+        if path.is_dir():
+            actual_directories.add(relative)
+        elif path.is_file():
+            actual_files[relative] = path
+        else:
+            raise ValueError("materialized source contains unsupported paths")
+    # Case folding and other host filename aliases must not silently collapse
+    # distinct committed names into a resource bearing the original revision.
+    if set(actual_files) != set(files) or actual_directories != expected_directories:
+        raise ValueError("materialized source paths differ from the delivering revision")
+    for relative, path in actual_files.items():
+        identity, mode = files[relative]
+        content = path.read_bytes()
+        actual = hashlib.sha1(b"blob " + str(len(content)).encode("ascii") + b"\0" + content).hexdigest()
+        if actual != identity or (os.name == "posix" and stat.S_IMODE(path.stat().st_mode) != mode):
+            raise ValueError("materialized source bytes or mode differ from the delivering revision")
 
 
 def validate_destination(destination: Path, repository: Path) -> Path:
@@ -146,8 +224,7 @@ def validate_destination(destination: Path, repository: Path) -> Path:
         raise ValueError("destination must be an explicit absolute directory")
     cursor = destination
     while cursor != cursor.parent:
-        if cursor.exists() and (cursor.is_symlink()
-                or (hasattr(cursor, "is_junction") and cursor.is_junction())):
+        if cursor.is_symlink() or (hasattr(cursor, "is_junction") and cursor.is_junction()):
             raise ValueError("linked destinations are unsupported")
         cursor = cursor.parent
     resolved = destination.resolve()
@@ -160,7 +237,7 @@ def prepare(destination: Path, config: Path, expected_revision: str | None = Non
     repository, actual_revision = delivery(expected_revision)
     destination = validate_destination(destination, repository)
     includes = configured_includes(config)
-    directories = committed_files(repository, actual_revision, includes)
+    directories, files = committed_files(repository, actual_revision, includes)
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.parent.is_symlink():
         raise ValueError("linked destination parents are unsupported")
@@ -168,22 +245,12 @@ def prepare(destination: Path, config: Path, expected_revision: str | None = Non
         raise ValueError("destination exists and is not an owned runtime resource")
 
     staging = Path(tempfile.mkdtemp(prefix=".factory-resource-", dir=destination.parent))
-    archive = staging.with_suffix(".zip")
     try:
-        result = subprocess.run(["git", "archive", "--format=zip", "--output", str(archive),
-                                 actual_revision, "--", *includes], cwd=repository, timeout=120)
-        if result.returncode:
-            raise ValueError("Git could not materialize the delivering revision")
-        with zipfile.ZipFile(archive) as bundle:
-            for info in bundle.infolist():
-                target = (staging / info.filename).resolve()
-                if not target.is_relative_to(staging):
-                    raise ValueError("Git archive contains an escaping path")
-            bundle.extractall(staging)
-        # Git archives may omit empty trees; preserve the validated selected
-        # layout without changing the file-byte identity format.
+        # Preserve selected empty trees without changing the file-byte digest.
         for relative in directories:
-            (staging / relative).mkdir(parents=True, exist_ok=True)
+            staging_path(staging, relative).mkdir(parents=True, exist_ok=True)
+        materialize_blobs(repository, files, staging)
+        verify_materialized(staging, directories, files)
         mapping = {
             "version": 1,
             "kind": "factory-runtime-resource",
@@ -199,7 +266,6 @@ def prepare(destination: Path, config: Path, expected_revision: str | None = Non
         staging.replace(destination)
         return mapping
     finally:
-        archive.unlink(missing_ok=True)
         if staging.exists():
             remove_tree(staging)
 
@@ -228,7 +294,7 @@ def main(argv=None) -> int:
         if args.mutation:
             command.extend(["--mutation", args.mutation])
         return subprocess.run(command, cwd=repository).returncode
-    except (OSError, ValueError, subprocess.SubprocessError, zipfile.BadZipFile):
+    except (OSError, ValueError, subprocess.SubprocessError):
         print("Runtime resource operation refused", file=sys.stderr)
         return 1
 

@@ -1,6 +1,8 @@
 """Synthetic directory-preservation and source-identity regressions."""
 import json
+import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
@@ -60,7 +62,7 @@ class SnapshotTests(unittest.TestCase):
 
     def test_bound_git_resource_preserves_selected_empty_tree(self):
         # Git's object format supports an empty tree even though git add does not
-        # record empty working directories. Exercise the actual archive preparer.
+        # record empty working directories. Exercise the actual object preparer.
         repository = self.root
         self.git("init", "-q")
         blob = self.git("hash-object", "-w", "app.py")
@@ -111,6 +113,214 @@ class SnapshotTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         runtime_resource.prepare(destination, config, revision)
                 self.assertFalse(destination.exists())
+
+    def resource_fixture(self, *, attributes=""):
+        self.git("init", "-q")
+        (self.root / "assets").mkdir()
+        (self.root / "assets/selected.txt").write_bytes(b"selected committed bytes\x00\xff\n")
+        (self.root / "assets/version.txt").write_bytes(b"$Format:%H$\n")
+        (self.root / ".gitattributes").write_text(attributes)
+        self.git("add", ".")
+        self.git("update-index", "--chmod=+x", "app.py")
+        self.git("commit", "-qm", "Synthetic resource inputs")
+        revision = self.git("rev-parse", "HEAD")
+        config = self.root.parent / "config.json"
+        config.write_text(json.dumps({"version": 1, "include": ["app.py", "assets"]}))
+        return revision, config
+
+    def test_resource_keeps_selected_blobs_marked_export_ignore(self):
+        revision, config = self.resource_fixture(attributes="assets/selected.txt export-ignore\n")
+        destination = self.root.parent / "prepared"
+        with patch.object(runtime_resource, "delivery", return_value=(self.root, revision)):
+            binding = runtime_resource.prepare(destination, config, revision)
+        expected = {"app.py", "assets/selected.txt", "assets/version.txt"}
+        actual = {path.relative_to(destination).as_posix() for path in destination.rglob("*")
+                  if path.is_file() and path.name != runtime_resource.MARKER}
+        self.assertEqual(actual, expected)
+        for relative in expected:
+            committed = subprocess.run(["git", "cat-file", "blob", f"{revision}:{relative}"],
+                cwd=self.root, capture_output=True, check=True).stdout
+            self.assertEqual((destination / relative).read_bytes(), committed)
+        if os.name == "posix":
+            self.assertEqual(stat.S_IMODE((destination / "app.py").stat().st_mode), 0o755)
+            self.assertEqual(stat.S_IMODE((destination / "assets/selected.txt").stat().st_mode), 0o644)
+        self.assertEqual(binding["resource_digest"], runtime_resource.resource_digest(destination))
+        self.assertEqual(binding["source_revision"], revision)
+
+    def test_resource_keeps_literal_committed_export_subst_bytes(self):
+        revision, config = self.resource_fixture(attributes="assets/version.txt export-subst\n")
+        destination = self.root.parent / "prepared"
+        with patch.object(runtime_resource, "delivery", return_value=(self.root, revision)):
+            runtime_resource.prepare(destination, config, revision)
+        self.assertEqual((destination / "assets/version.txt").read_bytes(), b"$Format:%H$\n")
+
+    def test_resource_rejects_windows_drive_and_stream_paths_before_writes(self):
+        revision, config = self.resource_fixture()
+        destination = self.root.parent / "prepared"
+        with patch.object(runtime_resource, "delivery", return_value=(self.root, revision)):
+            binding = runtime_resource.prepare(destination, config, revision)
+        marker = (destination / runtime_resource.MARKER).read_bytes()
+        blob = self.git("rev-parse", f"{revision}:app.py")
+        leaf = self.git("mktree", input=f"100644 blob {blob}\tescape.txt\n")
+        cases = {
+            "drive-relative": (f"100644 blob {blob}\tC:escape.txt\n", "C:escape.txt"),
+            "drive-absolute": (f"040000 tree {leaf}\tC:\n", "C:"),
+            "alternate-stream": (f"100644 blob {blob}\tapp.py:stream\n", "app.py:stream"),
+        }
+        for name, (entry, include) in cases.items():
+            with self.subTest(name=name):
+                tree = self.git("mktree", input=entry)
+                unsafe_revision = self.git("commit-tree", tree, "-m", "Synthetic Windows path")
+                config.write_text(json.dumps({"version": 1, "include": [include]}))
+                with patch.object(runtime_resource, "delivery", return_value=(self.root, unsafe_revision)):
+                    with self.assertRaisesRegex(ValueError, "escaping include"):
+                        runtime_resource.prepare(destination, config, unsafe_revision)
+                with self.assertRaisesRegex(ValueError, "escaping committed source"):
+                    runtime_resource.committed_files(self.root, unsafe_revision, [include])
+                self.assertEqual((destination / runtime_resource.MARKER).read_bytes(), marker)
+                self.assertEqual(runtime_resource.resource_digest(destination), binding["resource_digest"])
+                self.assertEqual(list(destination.parent.glob(".factory-resource-*")), [])
+
+        # A safe include can contain a Windows alternate stream deeper in its tree.
+        assets = self.git("mktree", input=f"100644 blob {blob}\tfile:stream\n")
+        tree = self.git("mktree", input=f"040000 tree {assets}\tassets\n")
+        unsafe_revision = self.git("commit-tree", tree, "-m", "Synthetic nested stream")
+        config.write_text(json.dumps({"version": 1, "include": ["assets"]}))
+        with patch.object(runtime_resource, "delivery", return_value=(self.root, unsafe_revision)):
+            with self.assertRaisesRegex(ValueError, "escaping committed source"):
+                runtime_resource.prepare(destination, config, unsafe_revision)
+        self.assertEqual((destination / runtime_resource.MARKER).read_bytes(), marker)
+        self.assertEqual(runtime_resource.resource_digest(destination), binding["resource_digest"])
+        self.assertEqual(list(destination.parent.glob(".factory-resource-*")), [])
+
+    def test_resource_preserves_duplicate_blobs_and_literal_binary_paths(self):
+        _, config = self.resource_fixture()
+        relative = "assets/copy with\ttab\nand newline.py"
+        (self.root / relative).write_bytes((self.root / "app.py").read_bytes())
+        self.git("add", "assets")
+        self.git("commit", "-qm", "Synthetic duplicate blob")
+        revision = self.git("rev-parse", "HEAD")
+        destination = self.root.parent / "prepared"
+        with patch.object(runtime_resource, "delivery", return_value=(self.root, revision)):
+            runtime_resource.prepare(destination, config, revision)
+        self.assertEqual((destination / relative).read_bytes(), (destination / "app.py").read_bytes())
+        self.assertEqual((destination / "assets/selected.txt").read_bytes(), b"selected committed bytes\x00\xff\n")
+        if os.name == "posix":
+            self.assertEqual(stat.S_IMODE((destination / relative).stat().st_mode), 0o644)
+            self.assertEqual(stat.S_IMODE((destination / "app.py").stat().st_mode), 0o755)
+
+    def test_resource_preserves_distinct_git_names_or_refuses_filesystem_aliases(self):
+        revision, config = self.resource_fixture()
+        destination = self.root.parent / "prepared"
+        with patch.object(runtime_resource, "delivery", return_value=(self.root, revision)):
+            binding = runtime_resource.prepare(destination, config, revision)
+        marker = (destination / runtime_resource.MARKER).read_bytes()
+        first = self.git("rev-parse", f"{revision}:app.py")
+        second = self.git("rev-parse", f"{revision}:assets/selected.txt")
+        tree = self.git("mktree", input=f"100644 blob {first}\tCASE.py\n100644 blob {second}\tcase.py\n")
+        alias_revision = self.git("commit-tree", tree, "-m", "Synthetic distinct Git names")
+        config.write_text(json.dumps({"version": 1, "include": ["CASE.py", "case.py"]}))
+        probe = self.root.parent / "CASE-PROBE"
+        probe.touch()
+        aliases = (self.root.parent / "case-probe").exists()
+        probe.unlink()
+        with patch.object(runtime_resource, "delivery", return_value=(self.root, alias_revision)):
+            if aliases:
+                with self.assertRaisesRegex(ValueError, "materialized.*paths"):
+                    runtime_resource.prepare(destination, config, alias_revision)
+                self.assertEqual((destination / runtime_resource.MARKER).read_bytes(), marker)
+                self.assertEqual(runtime_resource.resource_digest(destination), binding["resource_digest"])
+            else:
+                runtime_resource.prepare(destination, config, alias_revision)
+                self.assertEqual((destination / "CASE.py").read_bytes(), (self.root / "app.py").read_bytes())
+                self.assertEqual((destination / "case.py").read_bytes(), (self.root / "assets/selected.txt").read_bytes())
+        self.assertEqual(list(destination.parent.glob(".factory-resource-*")), [])
+
+    def test_invalid_blob_batch_cannot_replace_previous_owned_resource(self):
+        revision, config = self.resource_fixture()
+        destination = self.root.parent / "prepared"
+        read = runtime_resource.checked_bytes
+        def changed_payload(output):
+            start = output.index(b"\n") + 1
+            return output[:start] + bytes([output[start] ^ 1]) + output[start + 1:]
+        corruptions = {
+            "missing": lambda output: output.split(b" ", 1)[0] + b" missing\n",
+            "truncated": lambda output: output[:-2],
+            "extra": lambda output: output + b"unexpected",
+            "wrong type": lambda output: output.replace(b" blob ", b" tree ", 1),
+            "negative size": lambda output: output.replace(b" blob ", b" blob -", 1),
+            "wrong identity": lambda output: b"x" + output[1:],
+            "changed bytes": changed_payload,
+        }
+        with patch.object(runtime_resource, "delivery", return_value=(self.root, revision)):
+            binding = runtime_resource.prepare(destination, config, revision)
+            marker = (destination / runtime_resource.MARKER).read_bytes()
+            for name, corrupt in corruptions.items():
+                with self.subTest(response=name):
+                    def altered(argv, cwd, **kwargs):
+                        output = read(argv, cwd, **kwargs)
+                        return corrupt(output) if argv[1:3] == ["cat-file", "--batch"] else output
+                    with patch.object(runtime_resource, "checked_bytes", side_effect=altered):
+                        with self.assertRaisesRegex(ValueError, "committed blob"):
+                            runtime_resource.prepare(destination, config, revision)
+                    self.assertEqual((destination / runtime_resource.MARKER).read_bytes(), marker)
+                    self.assertEqual(runtime_resource.resource_digest(destination), binding["resource_digest"])
+                    self.assertEqual(list(destination.parent.glob(".factory-resource-*")), [])
+
+    def test_materialization_changes_cannot_replace_previous_owned_resource(self):
+        revision, config = self.resource_fixture()
+        destination = self.root.parent / "prepared"
+        materialize = runtime_resource.materialize_blobs
+        with patch.object(runtime_resource, "delivery", return_value=(self.root, revision)):
+            binding = runtime_resource.prepare(destination, config, revision)
+            marker = (destination / runtime_resource.MARKER).read_bytes()
+            for change in ("bytes", "missing", "extra", "directory"):
+                with self.subTest(change=change):
+                    def changed_materialize(repository, files, staging):
+                        materialize(repository, files, staging)
+                        target = staging / "assets/selected.txt"
+                        if change == "bytes":
+                            target.write_bytes(b"not the selected committed blob")
+                        elif change == "missing":
+                            target.unlink()
+                        elif change == "extra":
+                            (staging / "unexpected.txt").write_bytes(b"extra")
+                        else:
+                            (staging / "unexpected-directory").mkdir()
+                    with patch.object(runtime_resource, "materialize_blobs", side_effect=changed_materialize):
+                        with self.assertRaisesRegex(ValueError, "materialized source"):
+                            runtime_resource.prepare(destination, config, revision)
+                    self.assertEqual((destination / runtime_resource.MARKER).read_bytes(), marker)
+                    self.assertEqual(runtime_resource.resource_digest(destination), binding["resource_digest"])
+                    self.assertEqual(list(destination.parent.glob(".factory-resource-*")), [])
+
+    def test_preparation_rejects_dangling_destination_and_ancestor_links(self):
+        revision, config = self.resource_fixture()
+        for ancestor in (False, True):
+            with self.subTest(ancestor=ancestor):
+                outside = self.root.parent / f"outside-{ancestor}"
+                link = self.root.parent / f"linked-{ancestor}"
+                link.symlink_to(outside, target_is_directory=True)
+                destination = link / "prepared" if ancestor else link
+                with patch.object(runtime_resource, "delivery", return_value=(self.root, revision)):
+                    with self.assertRaisesRegex(ValueError, "linked destination"):
+                        runtime_resource.prepare(destination, config, revision)
+                self.assertTrue(link.is_symlink())
+                self.assertFalse(outside.exists(), "refusal must not write through the dangling link")
+
+    def test_unavailable_committed_blob_preserves_previous_owned_resource(self):
+        revision, config = self.resource_fixture()
+        destination = self.root.parent / "prepared"
+        with patch.object(runtime_resource, "delivery", return_value=(self.root, revision)):
+            binding = runtime_resource.prepare(destination, config, revision)
+            marker = (destination / runtime_resource.MARKER).read_bytes()
+            blob = self.git("rev-parse", f"{revision}:assets/selected.txt")
+            (self.root / ".git/objects" / blob[:2] / blob[2:]).unlink()
+            with self.assertRaises(ValueError):
+                runtime_resource.prepare(destination, config, revision)
+        self.assertEqual((destination / runtime_resource.MARKER).read_bytes(), marker)
+        self.assertEqual(runtime_resource.resource_digest(destination), binding["resource_digest"])
+        self.assertEqual(list(destination.parent.glob(".factory-resource-*")), [])
 
     def test_snapshot_still_rejects_links_and_private_directories(self):
         (self.root / "empty").mkdir()

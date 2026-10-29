@@ -26,6 +26,8 @@ What the factory owns, and what Archon owns:
 
 If you scheduled the factory, rerun `python factory/consumer.py schedule install`
 after an upgrade to preview the refreshed binding and timer, then add `--apply` to install.
+Preview prints the proposed binding and timer without writing either or changing loaded jobs.
+Only `--apply` persists the new `.factory/trigger.json` and installs the timer.
 Preserve the existing `.factory/trigger.json` and LaunchAgent files until migration finishes.
 
 ## macOS timer migration

@@ -1,14 +1,17 @@
 """Authenticated ordinary project environments, owned until the parent pipe closes."""
 from __future__ import annotations
 import argparse
+import errno
 import hashlib
 import hmac
+import io
 import json
 import math
 import os
 from pathlib import Path
 import re
 import secrets
+import select
 import shutil
 import signal
 import socket
@@ -19,6 +22,8 @@ import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.client import HTTPConnection, HTTPException, HTTPResponse
+from urllib.parse import urlsplit
 from urllib.request import Request, build_opener, ProxyHandler, HTTPRedirectHandler
 from urllib.error import URLError
 
@@ -35,6 +40,111 @@ HTTP = build_opener(ProxyHandler({}), NoRedirect())
 # phases. Blocking filesystem calls are checked between operations, not killed.
 START_BUDGET_S = 610
 START_CLEANUP_HEADROOM_S = 60
+
+
+class ProbeReader(io.RawIOBase):
+    """Let the standard HTTP parser read through cancellable socket operations."""
+    def __init__(self, transport):
+        self.transport = transport
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        return self.transport.receive(buffer)
+
+
+class ProbeSocket:
+    """A single-threaded socket with one absolute deadline for all I/O."""
+    def __init__(self, sock, deadline, stopping):
+        self.sock, self.deadline, self.stopping = sock, deadline, stopping
+        sock.setblocking(False)
+
+    def check(self):
+        remaining = self.deadline - time.monotonic()
+        if self.stopping.is_set() or remaining <= 0:
+            raise ValueError("runtime HTTP probe cancelled or timed out")
+        return remaining
+
+    def wait(self, *, writing=False):
+        while True:
+            remaining = self.check()
+            readable, writable, _ = select.select(
+                [] if writing else [self.sock], [self.sock] if writing else [], [], min(.05, remaining))
+            self.check()
+            if readable or writable:
+                return
+
+    def connect(self, address):
+        self.check()
+        error = self.sock.connect_ex(address)
+        if error not in (0, errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY):
+            raise OSError(error, "runtime probe connection failed")
+        if error:
+            self.wait(writing=True)
+            error = self.sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+            if error:
+                raise OSError(error, "runtime probe connection failed")
+        self.check()
+
+    def sendall(self, data):
+        pending = memoryview(data)
+        while pending:
+            self.wait(writing=True)
+            try:
+                sent = self.sock.send(pending)
+            except BlockingIOError:
+                continue
+            if not sent:
+                raise ConnectionError("runtime probe connection closed")
+            pending = pending[sent:]
+        self.check()
+
+    def receive(self, buffer):
+        while True:
+            self.wait()
+            try:
+                count = self.sock.recv_into(buffer)
+            except BlockingIOError:
+                continue
+            self.check()
+            return count
+
+    def makefile(self, mode):
+        if mode != "rb":
+            raise ValueError("runtime probe requires binary reads")
+        return io.BufferedReader(ProbeReader(self))
+
+    def close(self):
+        self.sock.close()
+
+
+def probe_http(target, path, deadline, stopping):
+    """Read one bounded loopback response, retaining standard HTTP framing."""
+    address = urlsplit(target)
+    if (address.scheme != "http" or address.hostname != "127.0.0.1" or not address.port
+            or address.username or address.password or address.path or address.query or address.fragment):
+        raise ValueError("runtime probe requires an owned loopback target")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        transport = ProbeSocket(sock, deadline, stopping)
+        transport.connect(("127.0.0.1", address.port))
+        connection = HTTPConnection("127.0.0.1", address.port)
+        connection.sock = transport
+        try:
+            connection.request("GET", path, headers={"Connection": "close"})
+            # Parse directly so HTTPConnection does not close a Connection:close
+            # socket before this explicitly owned reader has consumed its body.
+            with HTTPResponse(transport, method="GET") as response:
+                response.begin()
+                if response.status != 200:
+                    raise ValueError("redirected or unhealthy target")
+                body = response.read(65537)
+                transport.check()
+                if len(body) > 65536:
+                    raise ValueError("runtime probe response is too large")
+                return body.decode("utf-8")
+        finally:
+            connection.close()
 
 
 def safe_path(root, relative):
@@ -307,9 +417,9 @@ class Environments:
                     if self.stopping.is_set() or proc.poll() is not None:
                         raise ValueError("app stopped before readiness")
                     try:
-                        self.probe(item)
+                        self.probe(item, deadline=ready_deadline)
                         break
-                    except (URLError, OSError, ValueError):
+                    except (URLError, OSError, ValueError, HTTPException):
                         if time.monotonic() >= ready_deadline:
                             raise ValueError("app readiness/identity refused") from None
                         self.stopping.wait(.05)
@@ -317,7 +427,7 @@ class Environments:
                 item["exit_code"] = self.wait_exit(proc, timeout, deadline=deadline)
                 proc.close()  # includes descendants of finite commands
             self.check_start(deadline)
-            result = self.identity(slot)
+            result = self.identity(slot, deadline=deadline)
             self.check_start(deadline)
             return result
         except BaseException as failure:
@@ -337,28 +447,28 @@ class Environments:
                 return status
             self.stopping.wait(.05)
 
-    def probe(self, item):
+    def probe(self, item, *, deadline=None):
+        deadline = time.monotonic() + 1 if deadline is None else deadline
+        self.check_start(deadline)
         if item["proc"].poll() is not None:
             raise ValueError("owned app is dead")
         for key in ("health_path", "identity_path"):
             path = self.config.get(key)
             if not isinstance(path, str) or not path.startswith("/") or path.startswith("//"):
                 raise ValueError("HTTP requires health_path and identity_path")
-            with HTTP.open(item["target"] + path, timeout=.5) as response:
-                if response.geturl() != item["target"] + path or response.status != 200:
-                    raise ValueError("redirected or unhealthy target")
-                body = response.read(65537).decode("utf-8")
+            body = probe_http(item["target"], path, min(deadline, time.monotonic() + .5), self.stopping)
             if key == "identity_path" and body.strip() != item["candidate"]:
                 raise ValueError("wrong target identity")
+        self.check_start(deadline)
         if item["proc"].poll() is not None:
             raise ValueError("owned app died during probe")
 
-    def identity(self, slot):
+    def identity(self, slot, *, deadline=None):
         item = self.active.get(slot)
         if not item or digest(source_files(item["source"], self.config["include"])) != item["digest"]:
             raise ValueError("missing or changed candidate snapshot")
         if item["shape"] == "http":
-            self.probe(item)
+            self.probe(item, deadline=deadline)
             if digest(source_files(item["source"], self.config["include"])) != item["digest"]:
                 raise ValueError("candidate changed during probe")
         result = {"version": 1, "slot": slot, "candidate": item["candidate"],

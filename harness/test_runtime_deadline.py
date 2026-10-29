@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+from socketserver import BaseRequestHandler, TCPServer
 import sys
 import tempfile
 import threading
@@ -141,6 +142,7 @@ class RuntimeDeadlineTests(unittest.TestCase):
         self.assertNotIn("private diagnostic", diagnostic.getvalue())
         self.assertTrue(self.manager.teardown("test")["stopped"])
 
+    @unittest.skipUnless(os.name == "posix", "POSIX process-group observation fixture")
     def test_failed_process_initialization_retains_ownership_until_cleanup_is_verified(self):
         for phase in ("app", "setup"):
             with self.subTest(phase=phase):
@@ -231,6 +233,7 @@ class RuntimeDeadlineTests(unittest.TestCase):
                 self.manager.start({"slot": "test", "root": "candidate"})
         self.assertEqual(self.manager.active, {})
 
+    @unittest.skipUnless(os.name == "posix", "POSIX setup PID/process-group fixture")
     def test_shared_deadline_stops_owned_setup_before_app_launch(self):
         clock = SimpleNamespace(monotonic=Mock(return_value=100), sleep=time.sleep)
         self.manager.config["setup"] = [sys.executable, "-c", "import json,os,pathlib,time; "
@@ -277,7 +280,7 @@ class RuntimeDeadlineTests(unittest.TestCase):
     def test_expiry_during_final_identity_cannot_report_success(self):
         clock = SimpleNamespace(monotonic=Mock(return_value=100), sleep=time.sleep)
         process = Mock(poll=Mock(return_value=0))
-        def late_identity(slot):
+        def late_identity(slot, *, deadline=None):
             clock.monotonic.return_value = 102
             return {"version": 1, "slot": slot}
         with patch.object(runtime_host, "ProcessTree", return_value=process), \
@@ -301,6 +304,148 @@ class RuntimeDeadlineTests(unittest.TestCase):
         deadline = float(request.get_header("X-factory-deadline"))
         self.assertGreater(deadline, before)
         self.assertGreater(timeout, deadline - before)
+
+    def test_trickled_http_stops_at_deadline_or_cancellation_including_final_identity(self):
+        self.manager.config.update(shape="http", health_path="/health", identity_path="/identity")
+        for phase, request_number in (("readiness", 1), ("final_identity", 4)):
+            for part in ("headers", "body"):
+                for reason in ("deadline", "cancellation"):
+                    with self.subTest(phase=phase, part=part, reason=reason):
+                        clock = SimpleNamespace(monotonic=Mock(return_value=100), sleep=time.sleep)
+                        state = {"requests": 0, "trickle_complete": False}
+                        stop_server = threading.Event()
+                        owner = Mock(poll=Mock(return_value=None))
+                        retain = (phase, part, reason) == ("final_identity", "body", "deadline")
+                        if retain:
+                            owner.close.side_effect = OSError("fixture cleanup unverified")
+                        servers = []
+                        stopping = self.stopping
+
+                        class Handler(BaseRequestHandler):
+                            def handle(handler):
+                                handler.request.settimeout(2)
+                                request = b""
+                                while b"\r\n\r\n" not in request:
+                                    chunk = handler.request.recv(4096)
+                                    if not chunk:
+                                        return
+                                    request += chunk
+                                state["requests"] += 1
+                                body = state["candidate"] if b"GET /identity " in request else b"healthy"
+                                headers = (b"Content-Length: " + str(len(body)).encode()
+                                           + b"\r\nConnection: close\r\n\r\n")
+                                try:
+                                    if state["requests"] != request_number:
+                                        handler.request.sendall(b"HTTP/1.1 200 OK\r\n" + headers + body)
+                                        return
+                                    if part == "headers":
+                                        prefix = b"HTTP/1.1 200 OK\r\nX-Trickle: "
+                                        trickle, suffix = b"x" * 20, b"\r\n" + headers + body
+                                    else:
+                                        prefix = b"HTTP/1.1 200 OK\r\n" + headers + body[:1]
+                                        trickle, suffix = body[1:], b""
+                                    handler.request.sendall(prefix)
+                                    if reason == "deadline":
+                                        clock.monotonic.return_value = 102
+                                    else:
+                                        stopping.set()
+                                    for byte in trickle:
+                                        if stop_server.wait(.01):
+                                            return
+                                        handler.request.sendall(bytes([byte]))
+                                    handler.request.sendall(suffix)
+                                    state["trickle_complete"] = True
+                                except (BrokenPipeError, ConnectionResetError):
+                                    pass
+
+                        def spawn(argv, cwd, env, *, on_owner_created):
+                            on_owner_created(owner)
+                            state["candidate"] = env["FACTORY_RUNTIME_CANDIDATE"].encode()
+                            server = TCPServer(("127.0.0.1", int(env["FACTORY_RUNTIME_PORT"])), Handler)
+                            worker = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .01})
+                            servers.append((server, worker))
+                            worker.start()
+                            return owner
+
+                        try:
+                            with patch.object(runtime_host, "ProcessTree", side_effect=spawn), \
+                                    patch.object(runtime_host, "time", clock):
+                                with self.assertRaises(ValueError) as caught:
+                                    self.manager.start({"slot": "test", "root": "candidate"}, deadline=101)
+                            self.assertFalse(state["trickle_complete"], "probe consumed the trickle after cancellation/expiry")
+                            owner.close.assert_called_once()
+                            if retain:
+                                item = self.manager.active["test"]
+                                self.assertEqual(item["processes"], [owner])
+                                self.assertTrue(item["directory"].exists())
+                                self.assertTrue(any("cleanup failed" in note for note in caught.exception.__notes__))
+                            else:
+                                self.assertEqual(self.manager.active, {})
+                        finally:
+                            stop_server.set()
+                            for server, worker in servers:
+                                server.shutdown()
+                                server.server_close()
+                                worker.join(5)
+                                self.assertFalse(worker.is_alive(), "synthetic server did not stop")
+                            self.stopping.clear()
+                            owner.close.side_effect = None
+                            self.manager.teardown("test")
+
+    def test_http_probe_preserves_framing_and_refuses_redirects_wrong_identity_and_large_bodies(self):
+        self.manager.config.update(health_path="/health", identity_path="/identity")
+        for mode in ("length", "chunked", "close", "redirect", "wrong_identity", "oversized"):
+            with self.subTest(mode=mode):
+                paths = []
+
+                class Handler(BaseRequestHandler):
+                    def handle(handler):
+                        handler.request.settimeout(2)
+                        request = b""
+                        while b"\r\n\r\n" not in request:
+                            chunk = handler.request.recv(4096)
+                            if not chunk:
+                                return
+                            request += chunk
+                        path = request.split(b" ")[1]
+                        paths.append(path)
+                        body = b"candidate" if path == b"/identity" else b"healthy"
+                        if mode == "wrong_identity" and path == b"/identity":
+                            body = b"other"
+                        if mode == "oversized":
+                            body = b"x" * 65537
+                        if mode == "redirect":
+                            response = (b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/other\r\n"
+                                        b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+                        elif mode == "chunked":
+                            chunks = [body[:2], body[2:]]
+                            response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                            response += b"".join(format(len(chunk), "x").encode() + b"\r\n" + chunk + b"\r\n"
+                                                 for chunk in chunks) + b"0\r\nX-Trailer: yes\r\n\r\n"
+                        elif mode == "close":
+                            response = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n" + body
+                        else:
+                            response = (b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode()
+                                        + b"\r\nConnection: close\r\n\r\n" + body)
+                        handler.request.sendall(response)
+
+                with TCPServer(("127.0.0.1", 0), Handler) as server:
+                    worker = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .01})
+                    worker.start()
+                    item = {"proc": Mock(poll=Mock(return_value=None)), "candidate": "candidate",
+                            "target": f"http://127.0.0.1:{server.server_address[1]}"}
+                    try:
+                        if mode in ("redirect", "wrong_identity", "oversized"):
+                            with self.assertRaises(ValueError):
+                                self.manager.probe(item)
+                        else:
+                            self.manager.probe(item)
+                        self.assertEqual(paths, [b"/health"] if mode in ("redirect", "oversized")
+                                         else [b"/health", b"/identity"])
+                    finally:
+                        server.shutdown()
+                        worker.join(5)
+                        self.assertFalse(worker.is_alive(), "synthetic server did not stop")
 
 
 if __name__ == "__main__":

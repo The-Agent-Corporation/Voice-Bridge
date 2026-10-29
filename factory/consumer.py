@@ -271,7 +271,8 @@ def workflow_defaults(root: Path, name: str) -> dict:
 
 def verify_scheduled_policy(root: Path, config_path: Path, schedule_data: dict) -> None:
     """Refuse stale installed merge inputs before changing admission state."""
-    reinstall = "Installed trigger policy is stale or malformed. Run factory schedule install again."
+    reinstall = ("Installed trigger policy is stale or malformed. Run factory schedule install "
+                 "to preview, then repeat with --apply.")
     config = json.loads(config_path.read_text(encoding="utf-8"))
     binding = config.get("binding") if isinstance(config, dict) else None
     launch = binding.get("launch") if isinstance(binding, dict) else None
@@ -748,6 +749,13 @@ def task_xml(python: Path, root: Path, minutes: int) -> str:
 """
 
 
+def _systemd_word(value: str) -> str:
+    """Quote one systemd word, preserving literal specifiers and C escape characters."""
+    if re.search(r"[\x00-\x1f\x7f-\x9f]", value):
+        raise ValueError("Systemd paths and environment values cannot contain control characters")
+    return json.dumps(value.replace("%", "%%"), ensure_ascii=False)
+
+
 def timer_commands(root: Path, interval: int) -> dict:
     """Host schedulers invoke the consumer so STOP/PAUSE are checked before Archon."""
     fire = [sys.executable, str(root / "factory/consumer.py"), "schedule", "fire"]
@@ -790,13 +798,20 @@ def timer_commands(root: Path, interval: int) -> dict:
                 "install": [["/bin/launchctl", "bootstrap", domain, str(path)] for path in jobs],
                 "remove": [["/bin/launchctl", "bootout", f"{domain}/{path.stem}"] for path in jobs]}
     unit = name.lower()
+    # systemd is not a shell: quote each word, escape %-specifiers, and disable
+    # environment expansion with ':' so literal dollars survive in every argument.
+    command = " ".join(_systemd_word(value) for value in [":" + fire[0], *fire[1:]])
+    path_environment = _systemd_word("PATH=" + os.environ.get("PATH", ""))
+    # WorkingDirectory accepts a raw path (no unquoting/C-unescaping). '/.' protects
+    # a trailing space or backslash in the directory name from unit line parsing.
+    working_directory = str(root).replace("%", "%%") + "/."
     # The timer gets what a manual run had: the same tool PATH, credentials from a
     # mode-600 file outside the repository, and IS_SANDBOX for Claude Code as root.
     return {"systemd": {
         f"{unit}.service": "[Unit]\nDescription=Archon factory trigger\n\n[Service]\nType=oneshot\n"
-                           f"WorkingDirectory={root}\nEnvironment=PATH={os.environ.get('PATH', '')}\n"
+                           f"WorkingDirectory={working_directory}\nEnvironment={path_environment}\n"
                            "Environment=IS_SANDBOX=1\nEnvironmentFile=-%h/.factory-env\n"
-                           f"ExecStart={' '.join(fire)}\n",
+                           f"ExecStart={command}\n",
         f"{unit}.timer": f"[Unit]\nDescription=Archon factory trigger\n\n[Timer]\nOnBootSec=2min\n"
                          f"OnUnitInactiveSec={interval}s\n\n[Install]\nWantedBy=timers.target\n"},
         "install": [["systemctl", "--user", "daemon-reload"],
@@ -1117,10 +1132,14 @@ def schedule(root: Path, args: list[str]) -> int:
         return 0
     if action == "install":
         config = trigger_config(root, settings, source, interval)
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
         plan = timer_commands(root, interval)
-        print(f"Wrote {config_path} (Archon trigger binding for {config['binding']['launch']['workflowName']}).")
+        binding_text = json.dumps(config, indent=2) + "\n"
+        if apply:
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(binding_text, encoding="utf-8")
+            print(f"Wrote {config_path} (Archon trigger binding for {config['binding']['launch']['workflowName']}).")
+        else:
+            print(f"Would write {config_path}:\n{binding_text}")
         base = config["binding"]["launch"]["isolation"].get("baseOverride")
         print(f"Laps start from {base}." if base else
               "No default branch is known locally, so every launch asks the remote for it. "
@@ -1169,7 +1188,8 @@ def schedule(root: Path, args: list[str]) -> int:
                 # each phase admits one tick at a time; a tick that finds a phase busy skips it.
                 try:
                     if not config_path.is_file():
-                        raise ValueError("No trigger binding. Run factory schedule install first")
+                        raise ValueError("No trigger binding. Run factory schedule install to preview, "
+                                         "then repeat with --apply.")
                     with single_flight(shared_root(root) / ".factory/fire.lock") as held:
                         if not held:
                             write("Another tick is still launching; this one skips the launch.\n")

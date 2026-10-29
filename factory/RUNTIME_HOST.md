@@ -37,8 +37,14 @@ setup, readiness and final identity. Setup and readiness retain their individual
 300-second maximums. The loopback client supplies an absolute same-host monotonic
 deadline and allows another 60 seconds for cleanup; expired queued requests cannot
 start with a fresh budget. Cancellation/deadline checks run between filesystem
-operations and before launching project code or returning success. A lost successful
-start response triggers cleanup of that newly started slot.
+operations and before launching project code or returning success. Readiness and
+final identity HTTP probes use nonblocking socket operations checked against that
+same deadline and cancellation event, including during trickled headers or bodies.
+Each HTTP response has a half-second total budget and a 64 KiB body limit; socket
+waits check cancellation at intervals of at most 50 ms without probe threads.
+A detected failure to deliver a successful start response triggers cleanup of
+that newly started slot. A successful socket write does not prove the caller
+received the response; undetected delivery loss is not an acknowledgement protocol.
 
 This is not a hard filesystem wall-clock bound: a blocked synchronous filesystem
 call cannot be interrupted by these checks, and cleanup may itself fail. The owner
@@ -110,11 +116,15 @@ revision selected by that delivery; do not obtain it from the old candidate root
 python factory/runtime_resource.py prepare --config /private/runtime.json --destination /private/candidate --expected-revision <delivered-sha>
 ```
 
-The portable Python command reads `include` from the same runtime configuration,
-invokes Git directly, and archives only those permitted committed application
-paths. Tracked evaluator, holdout and other repository files outside that list
-never enter the resource. The command records the source revision, tree, include
-list and resource digest in the owned root. It
+The portable Python command reads `include` from the same runtime configuration
+and materializes only those permitted paths directly from verified committed Git
+blobs. Git archive attributes cannot omit or transform selected source. Before
+replacing an owned resource, the command verifies the staged path set, bytes and
+POSIX modes; filename aliases on the destination filesystem fail closed. Colon
+components are refused for portable Windows path and alternate-stream safety.
+Tracked evaluator, holdout and other repository files outside that list never
+enter the resource. The command records the source revision, tree, include list
+and resource digest in the owned root. It
 refuses modified tracked source, a revision other than the helper's own checkout
 HEAD, forbidden/escaping/missing/linked includes, broad or relative destinations,
 and any existing directory it did not create.
@@ -323,6 +333,10 @@ termination are covered by the independent owner. Do not claim host-machine-loss
 recovery or hostile-process containment.
 
 ## Mutation evidence
+
+The generic mutation `apply` command requires an external disposable copy and
+refuses its own source checkout and Git-backed destinations; this accident guard
+is not a filesystem sandbox.
 
 ```text
 python harness/mutations/run.py score-runtime --result /private/native-return.json --candidate <attempt-identity>
