@@ -86,11 +86,14 @@ def group_has_live_members(pgid: int) -> bool:
             states = []
             for row in result.stdout.splitlines():
                 columns = row.split()
-                if (len(columns) != 2 or not columns[0].isdigit()
-                        or not columns[1][0].isascii() or not columns[1][0].isalpha()):
+                if len(columns) != 2 or not columns[0].isdigit():
                     raise ValueError('invalid process state')
-                if int(columns[0]) == pgid:
-                    states.append(columns[1][0])
+                if int(columns[0]) != pgid:
+                    continue
+                # macOS can report transient unknown states for unrelated groups.
+                if not columns[1][0].isascii() or not columns[1][0].isalpha():
+                    raise ValueError('invalid process state')
+                states.append(columns[1][0])
         if states:
             return any(state != 'Z' for state in states)
         # A process may exit during the scan. Missing rows alone are insufficient.

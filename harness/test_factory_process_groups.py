@@ -75,6 +75,13 @@ class GroupObservationTests(unittest.TestCase):
                     patch('runtime_process.subprocess.run', return_value=subprocess.CompletedProcess([], 0, output, '')):
                 self.assertEqual(runtime_process.group_has_live_members(432), expected)
 
+    def test_unrelated_unknown_ps_state_does_not_obscure_owned_group(self):
+        for output, expected in (('999 ?Es\n432 Z\n', False), ('999 ?E\n432 S\n', True)):
+            with self.subTest(output=output), patch.object(runtime_process.sys, 'platform', 'darwin'), \
+                    patch('runtime_process.os.killpg', return_value=None), \
+                    patch('runtime_process.subprocess.run', return_value=subprocess.CompletedProcess([], 0, output, '')):
+                self.assertEqual(runtime_process.group_has_live_members(432), expected)
+
     def test_failed_or_malformed_ps_remains_unknown(self):
         for error in (subprocess.CalledProcessError(1, ['/bin/ps'], stderr='failure'),
                       subprocess.TimeoutExpired(['/bin/ps'], 5)):
@@ -88,6 +95,7 @@ class GroupObservationTests(unittest.TestCase):
                 self.assertIs(inspect.call_args.kwargs['check'], True)
                 self.assertGreater(inspect.call_args.kwargs['timeout'], 0)
         for result in (subprocess.CompletedProcess([], 0, '432\n', ''),
+                       subprocess.CompletedProcess([], 0, '432 ?Es\n', ''),
                        subprocess.CompletedProcess([], 0, '', '')):
             with self.subTest(result=result), patch.object(runtime_process.sys, 'platform', 'darwin'), \
                     patch('runtime_process.os.killpg', return_value=None), \
