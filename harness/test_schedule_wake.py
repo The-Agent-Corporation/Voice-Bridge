@@ -33,6 +33,7 @@ class WakeAfterRefusal(unittest.TestCase):
     def test_admission_refusals_still_wake(self):
         for refused in ('launch_decision', 'runtime_binding_options', 'dispatch_bound_trigger'):
             for error in (ValueError('invalid policy'), KeyError('binding'), OSError('unavailable'),
+                          AttributeError('malformed gate'), RuntimeError('unexpected admission failure'),
                           subprocess.TimeoutExpired('helper', 180)):
                 with self.subTest(refused=refused, error=type(error).__name__), self.tick({}) as (root, mocks):
                     mocks[refused].side_effect = error
@@ -68,6 +69,21 @@ class WakeAfterRefusal(unittest.TestCase):
             self.assertEqual(consumer.schedule(root, ['fire']), 1)
             mocks['dispatch_bound_trigger'].assert_not_called()
             self.assertEqual(mocks['execute'].call_args.args[0], ['native', 'workflow', 'wake'])
+
+    def test_malformed_persisted_gate_still_wakes(self):
+        with self.tick({}) as (root, mocks):
+            (root / '.factory/gate.json').write_text('[]')
+            mocks['launch_decision'].side_effect = lambda *_: consumer.tick_state(root, last_launch=1)
+            self.assertEqual(consumer.schedule(root, ['fire']), 1)
+            mocks['dispatch_bound_trigger'].assert_not_called()
+            self.assertEqual(mocks['execute'].call_args.args[0], ['native', 'workflow', 'wake'])
+
+    def test_operator_interrupt_is_not_swallowed(self):
+        with self.tick({}) as (root, mocks):
+            mocks['launch_decision'].side_effect = KeyboardInterrupt
+            with self.assertRaises(KeyboardInterrupt):
+                consumer.schedule(root, ['fire'])
+            mocks['execute'].assert_not_called()
 
     def test_launch_lock_failure_still_wakes(self):
         with self.tick({}) as (root, mocks), patch.object(consumer, 'single_flight',

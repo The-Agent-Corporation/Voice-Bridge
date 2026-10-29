@@ -1156,8 +1156,11 @@ def schedule(root: Path, args: list[str]) -> int:
                                 else:
                                     fired = execute([*native, "trigger", "fire", "--config", str(config_path)], root,
                                                     capture=False, timeout=None, output=log).returncode
-                except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
-                    # Refused admissions must not block existing durable waits.
+                except Exception as error:
+                    # Admission and continuation are independent: even an unexpected
+                    # launch error must leave existing durable waits able to wake.
+                    # STOP, registry trust checks, wake failures and operator interrupts
+                    # remain outside this launch-only recovery boundary.
                     write(f"Launch refused: {error}\n")
                     fired = 1
             if log:
