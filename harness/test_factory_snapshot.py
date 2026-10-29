@@ -419,7 +419,10 @@ class SnapshotTests(unittest.TestCase):
         destination, config, revision, original, inode = self.replacement_fixture()
         replace = Path.replace
         failure = KeyboardInterrupt("synthetic post-install interruption")
+        rollback_attempts = []
         def interrupt_after_install(path, target):
+            if path.name == "previous":
+                rollback_attempts.append(path)
             result = replace(path, target)
             if path.parent == destination.parent and path.name.startswith(".factory-resource-"):
                 raise failure
@@ -437,7 +440,17 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(previous.stat().st_ino, inode)
         self.assertEqual({p.relative_to(previous): p.read_bytes()
                           for p in previous.rglob("*") if p.is_file()}, original)
-        self.assertIn(str(previous), "\n".join(raised.exception.__notes__))
+        self.assertEqual(rollback_attempts, [], "installed resources must not be rolled back")
+        self.assertIsNone(raised.exception.__cause__)
+        notes = "\n".join(raised.exception.__notes__)
+        self.assertIn(str(previous), notes)
+        self.assertIn(f"New resource is installed at {destination}", notes)
+        self.assertIn(f"Remove {backups[0]} after confirming", notes)
+        self.assertNotIn("restore it", notes)
+        with patch.object(runtime_resource, "delivery", return_value=(self.root, revision)):
+            binding = runtime_resource.prepare(destination, config, revision)
+        self.assertEqual(binding["source_revision"], revision)
+        self.assertTrue(previous.exists(), "a retry must preserve the earlier recovery backup")
 
     def test_failed_backup_cleanup_does_not_rollback_installed_resource(self):
         destination, config, revision, original, inode = self.replacement_fixture()

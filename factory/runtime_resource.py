@@ -246,6 +246,15 @@ def publish_resource(staging: Path, destination: Path) -> None:
         # Include cancellation after the first rename. Abrupt process/machine
         # loss still requires manual recovery; two renames are not an exchange.
         if previous is not None:
+            # A signal may arrive after rename completed but before it returned.
+            # Under the serial-preparation contract, the consumed staging path
+            # and installed destination distinguish this from a failed install.
+            if not staging.exists() and destination.exists() and previous.exists():
+                error.add_note(
+                    f"New resource is installed at {destination}; the previous generation "
+                    f"is retained at {previous}. Remove {backup} after confirming the "
+                    "installed resource. See factory/RUNTIME_HOST.md.")
+                raise
             try:
                 if previous.exists():
                     previous.replace(destination)
