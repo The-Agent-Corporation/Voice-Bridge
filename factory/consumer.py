@@ -279,14 +279,14 @@ def verify_scheduled_policy(root: Path, config_path: Path, schedule_data: dict) 
     if (not isinstance(launch, dict) or not isinstance(workflow, str)
             or launch.get("workflowName") != workflow):
         raise ValueError(reinstall)
+    inputs = schedule_data.get("inputs")
+    if not isinstance(inputs, dict):
+        raise ValueError("schedule.json requires an inputs object")
     if workflow not in MERGING_WORKFLOWS:
         return
     # Validate the declaration even when explicit schedule inputs override it,
     # matching install/direct-run behavior. Overrides remain authoritative.
     policy = harness_inputs(root, workflow)
-    inputs = schedule_data.get("inputs")
-    if not isinstance(inputs, dict):
-        raise ValueError("schedule.json requires an inputs object")
     effective = {key: (inputs[key] if isinstance(inputs[key], str) else json.dumps(inputs[key]))
                  if key in inputs else value for key, value in policy.items()}
     installed = launch.get("inputs")

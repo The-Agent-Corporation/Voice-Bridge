@@ -31,4 +31,4 @@ invalidate identity. `input_digest` separately records the pre-setup input.
 
 HTTP harness fixtures require POSIX `waitid`/`WNOWAIT` and refuse Windows before launching project code. Windows HTTP fixture execution remains unqualified; the separate runtime ProcessTree Job Object does not qualify HttpApp. Cleanup verifies that no live group members remain; unreaped zombies are already stopped, and unknown membership fails closed.
 
-Scheduled fire revalidates the current merge policy before admission. An invalid declaration or changed effective installed policy refuses the launch with a reinstall diagnostic; explicit schedule overrides retain their install-time meaning. Existing durable runs can still wake after that refusal.
+Scheduled fire revalidates the current merge policy before admission. Invalid declarations produce a policy-validation error and require fixing harness/harness.config.json; schedule install rejects invalid declarations too. A changed effective installed policy refuses launch with a reinstall diagnostic. Explicit schedule overrides retain their install-time meaning, and existing durable runs can still wake after either refusal.

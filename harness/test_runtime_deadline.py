@@ -2,6 +2,7 @@
 from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -13,6 +14,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "factory"))
 import runtime_host
+import runtime_process
 
 
 class RuntimeDeadlineTests(unittest.TestCase):
@@ -177,8 +179,11 @@ class RuntimeDeadlineTests(unittest.TestCase):
 
     def test_shared_deadline_stops_owned_setup_before_app_launch(self):
         clock = SimpleNamespace(monotonic=Mock(return_value=100), sleep=time.sleep)
-        self.manager.config["setup"] = [sys.executable, "-c", "import os,pathlib,time; "
-            "pathlib.Path(os.environ['FACTORY_RUNTIME_STATE'],'setup-started').write_text('ready'); time.sleep(10)"]
+        self.manager.config["setup"] = [sys.executable, "-c", "import json,os,pathlib,time; "
+            "marker=pathlib.Path(os.environ['FACTORY_RUNTIME_STATE'],'setup-started'); "
+            "pending=marker.with_suffix('.tmp'); "
+            "pending.write_text(json.dumps({'pid':os.getpid(),'pgid':os.getpgrp()})); "
+            "pending.replace(marker); time.sleep(60)"]
         trees = []
         constructor = runtime_host.ProcessTree
         def tracked(*args, **kwargs):
@@ -191,6 +196,11 @@ class RuntimeDeadlineTests(unittest.TestCase):
                 while not marker.exists() and time.monotonic() < limit:
                     time.sleep(.01)
                 self.assertTrue(marker.exists(), "synthetic setup did not start")
+                setup = json.loads(marker.read_text())
+                self.assertNotEqual(setup["pid"], tree.proc.pid)
+                self.assertEqual(setup["pgid"], tree.proc.pid)
+                self.assertEqual(os.getpgid(setup["pid"]), tree.proc.pid)
+                self.assertTrue(runtime_process.group_has_live_members(tree.proc.pid))
             except BaseException:
                 tree.close()
                 raise
@@ -204,6 +214,10 @@ class RuntimeDeadlineTests(unittest.TestCase):
                 self.manager.start({"slot": "test", "root": "candidate"}, deadline=160)
         self.assertEqual(len(trees), 1, "the app must not launch after setup consumes the shared budget")
         self.assertIsNotNone(trees[0].proc.returncode)
+        self.assertTrue(trees[0].closed)
+        # A stopped Linux zombie may still reserve a PID. Only observe the group
+        # after cleanup reaps its owner; never send a mutating signal here.
+        self.assertFalse(runtime_process.group_has_live_members(trees[0].proc.pid))
         self.assertEqual(self.manager.active, {})
 
     def test_expiry_during_final_identity_cannot_report_success(self):

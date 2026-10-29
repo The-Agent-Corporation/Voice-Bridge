@@ -205,6 +205,17 @@ class WakeAfterRefusal(unittest.TestCase):
             self.assertEqual(consumer.schedule(root, ['fire']), 0)
             mocks['dispatch_bound_trigger'].assert_called_once()
 
+    def test_nonmerging_malformed_inputs_refuse_before_admission_but_still_wake(self):
+        for inputs in ([], None, 'invalid', 42, True):
+            with self.subTest(inputs=inputs), self.tick({'workflow': 'archon-review'}) as (root, mocks):
+                (root / consumer.SCHEDULE).write_text(json.dumps({'workflow': 'archon-review', 'inputs': inputs}))
+                (root / 'harness/harness.config.json').unlink()
+                mocks['runtime_binding_options'].return_value = None
+                with patch.object(consumer, 'harness_inputs') as policy:
+                    output = self.assert_policy_refusal_wakes_without_admission(root, mocks)
+                policy.assert_not_called()
+                self.assertIn('schedule.json requires an inputs object', output)
+
     def test_changed_workflow_cannot_bypass_installed_merging_policy(self):
         with self.tick({}) as (root, mocks):
             (root / consumer.SCHEDULE).write_text(json.dumps({'workflow': 'archon-review', 'inputs': {}}))

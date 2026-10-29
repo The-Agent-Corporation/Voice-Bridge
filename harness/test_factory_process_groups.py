@@ -76,8 +76,18 @@ class GroupObservationTests(unittest.TestCase):
                 self.assertEqual(runtime_process.group_has_live_members(432), expected)
 
     def test_failed_or_malformed_ps_remains_unknown(self):
-        for result in (subprocess.CompletedProcess([], 1, '', 'failure'),
-                       subprocess.CompletedProcess([], 0, '432\n', ''),
+        for error in (subprocess.CalledProcessError(1, ['/bin/ps'], stderr='failure'),
+                      subprocess.TimeoutExpired(['/bin/ps'], 5)):
+            with self.subTest(error=type(error).__name__), \
+                    patch.object(runtime_process.sys, 'platform', 'darwin'), \
+                    patch('runtime_process.os.killpg', return_value=None), \
+                    patch('runtime_process.subprocess.run', side_effect=error) as inspect:
+                with self.assertRaisesRegex(RuntimeError, 'membership'):
+                    runtime_process.group_has_live_members(432)
+                inspect.assert_called_once()
+                self.assertIs(inspect.call_args.kwargs['check'], True)
+                self.assertGreater(inspect.call_args.kwargs['timeout'], 0)
+        for result in (subprocess.CompletedProcess([], 0, '432\n', ''),
                        subprocess.CompletedProcess([], 0, '', '')):
             with self.subTest(result=result), patch.object(runtime_process.sys, 'platform', 'darwin'), \
                     patch('runtime_process.os.killpg', return_value=None), \
