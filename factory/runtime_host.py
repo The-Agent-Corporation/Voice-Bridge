@@ -42,6 +42,33 @@ START_BUDGET_S = 610
 START_CLEANUP_HEADROOM_S = 60
 
 
+class RequestReader(io.RawIOBase):
+    """Bound the accepted request before the HTTP handler has parsed its headers."""
+    def __init__(self, connection, stopping):
+        super().__init__()
+        self.connection, self.stopping = connection, stopping
+        self.deadline = time.monotonic() + 2
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        # Read directly: socket.makefile's buffered reader cannot resume safely
+        # after a socket timeout. Short waits also observe parent cancellation.
+        while True:
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0 or self.stopping.is_set():
+                raise TimeoutError("runtime request read cancelled or timed out")
+            self.connection.settimeout(min(.05, remaining))
+            try:
+                count = self.connection.recv_into(buffer)
+            except TimeoutError:
+                continue
+            if self.stopping.is_set() or time.monotonic() >= self.deadline:
+                raise TimeoutError("runtime request read cancelled or timed out")
+            return count
+
+
 class ProbeReader(io.RawIOBase):
     """Let the standard HTTP parser read through cancellable socket operations."""
     def __init__(self, transport):
@@ -488,6 +515,11 @@ def serve(config):
     manager = Environments(config, stopping)
     token = secrets.token_urlsafe(32)
     class Handler(BaseHTTPRequestHandler):
+        def setup(self):
+            super().setup()
+            self.rfile.close()
+            self.rfile = io.BufferedReader(RequestReader(self.connection, stopping))
+
         def log_message(self, *args):
             pass
 
@@ -529,6 +561,7 @@ def serve(config):
                     status, result = 400, {"error": "runtime request refused; active environments cleaned"}
             payload = json.dumps(result).encode()
             try:
+                self.connection.settimeout(2)
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(payload)))

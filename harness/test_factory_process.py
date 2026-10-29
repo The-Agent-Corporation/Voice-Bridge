@@ -80,6 +80,25 @@ class ProcessOwnershipTests(unittest.TestCase):
             self.emergency_cleanup(tree)
             manager.close()
 
+    def test_owned_command_can_retain_stdout_and_stderr_in_private_log(self):
+        path = self.root / 'command.log'
+        manager = Environments({'version': 1, 'roots': {}}, threading.Event())
+        tree = None
+        try:
+            with path.open('xb') as output:
+                tree = ProcessTree([sys.executable, '-c',
+                    'import sys; print("ordinary-out", flush=True); print("ordinary-err", file=sys.stderr, flush=True)'],
+                    self.root, dict(os.environ), output=output)
+                manager.wait_exit(tree, 5)
+                self.assertEqual(tree.poll(), 0)
+                tree.close()
+                self.assertFalse(output.closed, 'the caller owns the log handle')
+            self.assertEqual(path.read_bytes(), b'ordinary-out\nordinary-err\n')
+        finally:
+            if tree is not None:
+                self.emergency_cleanup(tree)
+            manager.close()
+
     def test_reaped_owner_refuses_group_signals(self):
         tree = self.process('pass')
         tree.proc.wait(timeout=5)

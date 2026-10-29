@@ -1,9 +1,11 @@
 """Bounded startup and best-effort owned cleanup, using synthetic fixtures only."""
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from http.client import HTTPResponse
 import io
 import json
 import os
 from pathlib import Path
+import socket
 from socketserver import BaseRequestHandler, TCPServer
 import sys
 import tempfile
@@ -79,6 +81,149 @@ class RuntimeDeadlineTests(unittest.TestCase):
                 patch.object(manager, "close"), redirect_stdout(io.StringIO()):
             runtime_host.serve({})
         return observed
+
+    @contextmanager
+    def accepted_request(self, prefix, *, trickle):
+        """Real accepted socket and live owned process, with a disposable parent pipe."""
+        manager = runtime_host.Environments(self.manager.config, threading.Event())
+        directory = manager.base / "existing"
+        directory.mkdir()
+        item = {"directory": directory, "processes": []}
+        manager.active["existing"] = item
+        owner = runtime_process.ProcessTree([sys.executable, "-c", "import time; time.sleep(60)"],
+            self.root, {}, on_owner_created=item["processes"].append)
+        ready, accepted, parent_closed, sender_stop = (threading.Event() for _ in range(4))
+        state, failures, parent_threads = {}, [], []
+        thread_type = threading.Thread
+
+        class Server(runtime_host.HTTPServer):
+            def server_bind(server):
+                # Fixed loopback fixture: no DNS-dependent getfqdn in HTTPServer.
+                TCPServer.server_bind(server)
+                server.server_name, server.server_port = "127.0.0.1", server.server_address[1]
+
+            def get_request(server):
+                connection = super().get_request()
+                accepted.set()
+                return connection
+
+        def server_factory(*args):
+            server = Server(*args)
+            state["address"] = server.server_address
+            ready.set()
+            return server
+
+        def manager_factory(config, stopping):
+            manager.stopping = stopping
+            return manager
+
+        def parent_read(*args):
+            parent_closed.wait()
+            return b""
+
+        def parent_thread(*args, **kwargs):
+            thread = thread_type(*args, **kwargs)
+            parent_threads.append(thread)
+            return thread
+
+        def serve():
+            try:
+                runtime_host.serve({})
+            except BaseException as error:
+                failures.append(error)
+
+        worker = thread_type(target=serve)
+        client, sender = None, None
+        try:
+            with patch.object(runtime_host, "Environments", side_effect=manager_factory), \
+                    patch.object(runtime_host, "HTTPServer", side_effect=server_factory), \
+                    patch.object(runtime_host.os, "read", side_effect=parent_read), \
+                    patch.object(runtime_host.threading, "Thread", side_effect=parent_thread), \
+                    patch.object(runtime_host.secrets, "token_urlsafe", return_value="fixture"), \
+                    patch.object(runtime_host.signal, "signal"), redirect_stdout(io.StringIO()):
+                worker.start()
+                self.assertTrue(ready.wait(5), "owner did not begin listening")
+                client = socket.create_connection(state["address"], timeout=5)
+                client.sendall(prefix)
+                self.assertTrue(accepted.wait(5), "fixture connection was not accepted")
+
+                def send_trickle():
+                    while not sender_stop.wait(.02):
+                        try:
+                            client.sendall(b"x")
+                        except OSError:
+                            return
+
+                if trickle:
+                    sender = thread_type(target=send_trickle)
+                    sender.start()
+                yield client, parent_closed, worker, owner, manager, failures
+                parent_closed.set()
+                worker.join(5)
+        finally:
+            parent_closed.set()
+            sender_stop.set()
+            if client:
+                client.close()  # also unblocks the old implementation on test failure
+            if sender:
+                sender.join(5)
+                self.assertFalse(sender.is_alive(), "trickle fixture did not stop")
+            worker.join(5)
+            for thread in parent_threads:
+                thread.join(5)
+                self.assertFalse(thread.is_alive(), "parent-pipe fixture did not stop")
+            self.assertFalse(worker.is_alive(), "runtime request remained blocked")
+            manager.close()
+
+    def test_inbound_request_line_and_headers_have_total_deadline(self):
+        for prefix in (b"POST ", b"POST /identity HTTP/1.1\r\nX-Slow: "):
+            with self.subTest(prefix=prefix), self.accepted_request(prefix, trickle=True) as fixture:
+                client, parent_closed, worker, owner, manager, failures = fixture
+                client.settimeout(4)
+                # Continuing bytes must not refresh the request's total read budget.
+                try:
+                    closed = client.recv(1) == b""
+                except ConnectionResetError:
+                    closed = True
+                except TimeoutError:
+                    closed = False
+                self.assertTrue(closed, "trickled input exceeded the request deadline")
+                parent_closed.set()
+                worker.join(5)
+                self.assertFalse(worker.is_alive())
+                self.assertTrue(owner.closed)
+                self.assertEqual(manager.active, {})
+                self.assertEqual(failures, [])
+
+    def test_complete_authenticated_inbound_request_keeps_response_contract(self):
+        body = b'{"slot":"existing"}'
+        request = (b"POST /teardown HTTP/1.0\r\nAuthorization: Bearer fixture\r\n"
+                   b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+        with self.accepted_request(request, trickle=False) as fixture:
+            client, parent_closed, worker, owner, manager, failures = fixture
+            with HTTPResponse(client) as response:
+                response.begin()
+                self.assertEqual(response.status, 200)
+                self.assertTrue(json.loads(response.read())["stopped"])
+            parent_closed.set()
+            worker.join(5)
+            self.assertFalse(worker.is_alive())
+            self.assertTrue(owner.closed)
+            self.assertEqual(manager.active, {})
+            self.assertEqual(failures, [])
+
+    def test_parent_close_cancels_idle_and_partial_inbound_requests_and_cleans_owner(self):
+        for prefix in (b"", b"POST ", b"POST /identity HTTP/1.1\r\nX-Slow: "):
+            with self.subTest(prefix=prefix), self.accepted_request(prefix, trickle=bool(prefix)) as fixture:
+                client, parent_closed, worker, owner, manager, failures = fixture
+                parent_closed.set()
+                worker.join(3)
+                self.assertFalse(worker.is_alive(), "accepted request prevented parent cancellation")
+                self.assertTrue(owner.closed)
+                if os.name == "posix":
+                    self.assertFalse(runtime_process.group_has_live_members(owner.proc.pid))
+                self.assertEqual(manager.active, {})
+                self.assertEqual(failures, [])
 
     def test_teardown_attempts_each_process_and_retains_failed_slot_for_retry(self):
         good = Mock()

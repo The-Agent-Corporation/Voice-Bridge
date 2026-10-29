@@ -223,6 +223,9 @@ candidate string for the producer's `candidate_command`. The local control API
 uses POST `/setup`, `/start`, `/identity`, `/teardown` with these CLI fields as JSON
 and `Authorization: Bearer <private token>`; `/identity` returns full typed JSON.
 The control URL is IPv4 loopback only. Requests are bounded; redirects are refused.
+Accepted request lines, headers and bodies share one two-second read budget,
+including trickled input. Reads check parent cancellation at most every 50 ms,
+so a stalled client cannot indefinitely delay owned-process cleanup.
 
 For PR3227's external environment contract, set `environment.ownership` to
 `external`, map setup/start/teardown to the commands above, and set

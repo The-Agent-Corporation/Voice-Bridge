@@ -34,7 +34,10 @@ def _linux_group_states(pgid: int) -> list[str]:
         if not process.name.isdigit():
             continue
         try:
-            state, group = _stat_state_group((process / 'stat').read_text())
+            # Linux comm is arbitrary bytes, not necessarily UTF-8. Preserve
+            # those bytes while validating only the state and numeric fields.
+            state, group = _stat_state_group((process / 'stat').read_text(
+                encoding='utf-8', errors='surrogateescape'))
             if group != pgid:
                 continue
             states.append(state)
@@ -51,7 +54,8 @@ def _linux_group_states(pgid: int) -> list[str]:
                 raise RuntimeError('cannot verify process group membership')
             for task in tasks:
                 try:
-                    task_state, task_group = _stat_state_group((task / 'stat').read_text())
+                    task_state, task_group = _stat_state_group((task / 'stat').read_text(
+                        encoding='utf-8', errors='surrogateescape'))
                 except (FileNotFoundError, ProcessLookupError):
                     continue
                 if task_group == pgid:
@@ -107,7 +111,7 @@ def group_has_live_members(pgid: int) -> bool:
 
 
 class ProcessTree:
-    def __init__(self, argv, cwd, env, *, on_owner_created=None):
+    def __init__(self, argv, cwd, env, *, on_owner_created=None, output=None):
         if os.name != "nt" and (not callable(getattr(os, "waitid", None))
                                 or not hasattr(os, "WNOWAIT")):
             raise RuntimeError("owned runtime cleanup requires POSIX waitid/WNOWAIT support "
@@ -123,7 +127,9 @@ class ProcessTree:
                 on_owner_created(self)
             self.proc = subprocess.Popen(
                 [sys.executable, str(Path(__file__).resolve()), "worker"],
-                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdin=subprocess.PIPE,
+                stdout=output if output is not None else subprocess.DEVNULL,
+                stderr=subprocess.STDOUT if output is not None else subprocess.DEVNULL,
                 start_new_session=os.name != "nt", close_fds=True)
             if os.name == "nt":
                 import ctypes as c
