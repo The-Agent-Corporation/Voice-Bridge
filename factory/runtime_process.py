@@ -107,7 +107,7 @@ def group_has_live_members(pgid: int) -> bool:
 
 
 class ProcessTree:
-    def __init__(self, argv, cwd, env):
+    def __init__(self, argv, cwd, env, *, on_owner_created=None):
         if os.name != "nt" and (not callable(getattr(os, "waitid", None))
                                 or not hasattr(os, "WNOWAIT")):
             raise RuntimeError("owned runtime cleanup requires POSIX waitid/WNOWAIT support "
@@ -115,11 +115,16 @@ class ProcessTree:
         self.job = None
         self.closed = False
         self._reaped_by_cleanup = False
-        self.proc = subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve()), "worker"],
-            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=os.name != "nt", close_fds=True)
+        self.proc = None
         try:
+            # Register retryable ownership before any child can exist. A failed
+            # callback cannot leave an untracked process behind.
+            if on_owner_created is not None:
+                on_owner_created(self)
+            self.proc = subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve()), "worker"],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=os.name != "nt", close_fds=True)
             if os.name == "nt":
                 import ctypes as c
                 from ctypes import wintypes as w
@@ -151,7 +156,7 @@ class ProcessTree:
             self.proc.stdin.close()
         except BaseException as failure:
             try:
-                if os.name == "nt" and self.proc.poll() is None:
+                if os.name == "nt" and self.proc is not None and self.proc.poll() is None:
                     self.proc.kill()  # assignment may have failed before joining the job
                 self.close()
             except BaseException as cleanup_error:
@@ -182,7 +187,7 @@ class ProcessTree:
             failure = error
             raise
         finally:
-            if self.proc.stdin and not self.proc.stdin.closed:
+            if self.proc is not None and self.proc.stdin and not self.proc.stdin.closed:
                 try:
                     self.proc.stdin.close()
                 except BaseException as cleanup_error:
@@ -192,6 +197,9 @@ class ProcessTree:
 
     def _close_owned(self):
         if self.closed:
+            return
+        if self.proc is None:
+            self.closed = True
             return
         if self.job:
             import ctypes as c

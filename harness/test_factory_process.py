@@ -34,6 +34,38 @@ class ProcessOwnershipTests(unittest.TestCase):
             os.killpg(tree.proc.pid, signal.SIGKILL)
             tree.proc.wait(timeout=5)
 
+    def test_owner_registration_failure_never_spawns(self):
+        failure = OSError('fixture registration failed')
+        owners = []
+        def register(owner):
+            owners.append(owner)
+            self.assertIsNone(owner.proc)
+            self.assertIsNone(owner.job)
+            self.assertFalse(owner.closed)
+            self.assertFalse(owner._reaped_by_cleanup)
+            raise failure
+        with patch('runtime_process.subprocess.Popen') as spawn:
+            with self.assertRaises(OSError) as caught:
+                ProcessTree([sys.executable, '-c', 'pass'], self.root, dict(os.environ),
+                            on_owner_created=register)
+        self.assertIs(caught.exception, failure)
+        spawn.assert_not_called()
+        self.assertTrue(owners[0].closed)
+
+    def test_spawn_failure_closes_registered_empty_owner(self):
+        failure = OSError('fixture spawn failed')
+        owners = []
+        with patch('runtime_process.subprocess.Popen', side_effect=failure), \
+                patch('runtime_process.os.killpg', side_effect=AssertionError('no child exists')):
+            with self.assertRaises(OSError) as caught:
+                ProcessTree([sys.executable, '-c', 'pass'], self.root, dict(os.environ),
+                            on_owner_created=owners.append)
+            self.assertIs(caught.exception, failure)
+            self.assertEqual(len(owners), 1)
+            self.assertIsNone(owners[0].proc)
+            self.assertTrue(owners[0].closed)
+            owners[0].close()
+
     def test_wait_exit_preserves_group_owner_until_close(self):
         manager = Environments({'version': 1, 'roots': {}}, threading.Event())
         tree = self.process('raise SystemExit(7)')

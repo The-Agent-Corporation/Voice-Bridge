@@ -141,6 +141,60 @@ class RuntimeDeadlineTests(unittest.TestCase):
         self.assertNotIn("private diagnostic", diagnostic.getvalue())
         self.assertTrue(self.manager.teardown("test")["stopped"])
 
+    def test_failed_process_initialization_retains_ownership_until_cleanup_is_verified(self):
+        for phase in ("app", "setup"):
+            with self.subTest(phase=phase):
+                if phase == "setup":
+                    self.manager.config["setup"] = [sys.executable, "-c", "pass"]
+                failure = OSError("fixture stdin initialization failed")
+                spawned = []
+                popen = runtime_process.subprocess.Popen
+
+                class FailingInput:
+                    def __init__(self, stream):
+                        self.stream = stream
+
+                    @property
+                    def closed(self):
+                        return self.stream.closed
+
+                    def write(self, data):
+                        raise failure
+
+                    def close(self):
+                        self.stream.close()
+
+                def spawn(*args, **kwargs):
+                    process = popen(*args, **kwargs)
+                    process.stdin = FailingInput(process.stdin)
+                    spawned.append(process)
+                    return process
+
+                with patch.object(runtime_process.subprocess, "Popen", side_effect=spawn), \
+                        patch.object(runtime_process, "group_has_live_members",
+                                     side_effect=RuntimeError("fixture membership unavailable")) as observe:
+                    with self.assertRaises(OSError) as caught:
+                        self.manager.start({"slot": "test", "root": "candidate"})
+                    self.assertIs(caught.exception, failure)
+                    self.assertIn("test", self.manager.active)
+                    item = self.manager.active["test"]
+                    self.assertTrue(item["directory"].exists())
+                    self.assertEqual(len(item["processes"]), 1)
+                    owner = item["processes"][0]
+                    self.assertIs(owner.proc, spawned[0])
+                    self.assertEqual(len(spawned), 1, "initialization failure must stop further launches")
+                    self.assertFalse(owner.closed)
+                    self.assertTrue(owner._reaped_by_cleanup)
+                    self.assertEqual(observe.call_count, 2, "constructor and host must both try cleanup")
+                    self.assertTrue(any("Runtime process cleanup failed" in note for note in failure.__notes__))
+                    self.assertTrue(any("Runtime environment cleanup failed" in note for note in failure.__notes__))
+                # The real worker was reaped, but ownership must survive until
+                # observation can verify cleanup. The retry then removes its slot.
+                self.assertTrue(self.manager.teardown("test")["stopped"])
+                self.assertTrue(owner.closed)
+                self.assertFalse(item["directory"].exists())
+                self.assertNotIn("test", self.manager.active)
+
     def test_expired_queued_start_never_spawns(self):
         with patch.object(runtime_host, "ProcessTree", side_effect=AssertionError("expired request spawned")) as spawn:
             result = self.handler("/start", {"slot": "test", "root": "candidate"},

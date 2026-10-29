@@ -277,8 +277,8 @@ class Environments:
                 raise ValueError("timeout_s must be between 0 and 300")
             if cfg.get("setup"):
                 self.check_start(deadline)
-                setup = ProcessTree(command(cfg["setup"], variables), source, env)
-                item["processes"].append(setup)
+                setup = ProcessTree(command(cfg["setup"], variables), source, env,
+                                    on_owner_created=item["processes"].append)
                 if self.wait_exit(setup, timeout, deadline=deadline) != 0:
                     raise ValueError("project setup failed (output withheld)")
                 setup.close()
@@ -296,8 +296,8 @@ class Environments:
                 self.check_start(deadline)
                 path.chmod(stat.S_IREAD)
             self.check_start(deadline)
-            proc = ProcessTree(argv, source, env)
-            item["processes"].append(proc)
+            proc = ProcessTree(argv, source, env,
+                               on_owner_created=item["processes"].append)
             item.update(candidate=identity, digest=actual, proc=proc, shape=cfg["shape"],
                         target=f"http://127.0.0.1:{port}", original=before, binding=binding)
             if cfg["shape"] == "http":
