@@ -233,14 +233,34 @@ def harness_inputs(root: Path, name: str) -> dict:
     # so the project declares both once in its harness configuration.
     if name not in MERGING_WORKFLOWS:
         return {}
+    policy_file = "harness/harness.config.json"
+    requirement = (f"Merge policy required: {policy_file} must be a readable JSON object "
+                   "declaring required_checks and protected_paths as nonempty comma-separated "
+                   "strings (or explicit \"none\").")
     try:
-        config = json.loads((root / "harness/harness.config.json").read_text(encoding="utf-8-sig"))
+        config = json.loads((root / policy_file).read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
-        return {}
+        raise ValueError(requirement) from None
     if not isinstance(config, dict):
-        return {}
-    return {key: config[key] for key in MERGE_POLICY_KEYS
-            if isinstance(config.get(key), str) and config[key].strip()}
+        raise ValueError(requirement)
+    policy = {}
+    for key in MERGE_POLICY_KEYS:
+        value = config.get(key)
+        invalid = not isinstance(value, str) or not value.strip()
+        if not invalid:
+            # Match the native policy grammar; whitespace around list items is allowed.
+            items = [re.sub(r"^[\s\ufeff]+|[\s\ufeff]+$", "", item)
+                     for item in value.split(",")]
+            invalid = bool(re.search(r"[\x00-\x08\x0e-\x1f\x7f-\x9f]", value)) or any(
+                not item or re.search(r"[\x00-\x1f\x7f-\x9f]", item)
+                or (key == "required_checks" and len(items) > 1 and item.lower() == "none")
+                or (key == "protected_paths" and item == "/") for item in items)
+        if invalid:
+            label = "check names" if key == "required_checks" else "path patterns"
+            raise ValueError(f"Invalid merge policy: {policy_file} {key} must be a nonempty "
+                             f"comma-separated string of {label}, or explicit \"none\".")
+        policy[key] = value
+    return policy
 
 
 def workflow_defaults(root: Path, name: str) -> dict:
@@ -455,6 +475,8 @@ def _private_path(path: Path, *, directory: bool = False) -> None:
 
 def runtime_binding_options(root: Path, data: dict) -> dict | None:
     """Opt-in caller-owned scenarios; the pinned workflow remains unchanged."""
+    if not isinstance(data, dict):
+        raise ValueError("schedule.json must contain a JSON object")
     value = data.get("runtime_binding")
     if value is None:
         return None
@@ -583,6 +605,8 @@ def dispatch_bound_trigger(root: Path, settings: dict, source: Path, config_path
         raw = checked([sys.executable, str(helper), "create", "--project-root", str(root.resolve()),
                        "--output", str(invocation)], root)
         prepared = json.loads(raw)
+        if not isinstance(prepared, dict) or not isinstance(prepared.get("invocation"), str):
+            raise ValueError("Runtime binding helper returned an invalid invocation")
         uuid.UUID(prepared["invocation"])
         _private_path(invocation, directory=True)
         paths = {}
@@ -1098,8 +1122,6 @@ def schedule(root: Path, args: list[str]) -> int:
             return 0
         # Refuse redirects before intake as well as before global continuation.
         verify_registry_environment(root)
-        if action == "fire" and not config_path.is_file():
-            raise ValueError("No trigger binding. Run factory schedule install first")
         # A windowless timer tick (pythonw) has no console, so its output goes to a log.
         log = ((shared_root(root) / ".factory/schedule.log").open("a", encoding="utf-8")
                if windowless() else None)
@@ -1116,18 +1138,28 @@ def schedule(root: Path, args: list[str]) -> int:
             else:
                 # Ticks run in parallel (a long wake must not hold back the next launch), so
                 # each phase admits one tick at a time; a tick that finds a phase busy skips it.
-                with single_flight(shared_root(root) / ".factory/fire.lock") as held:
-                    if not held:
-                        write("Another tick is still launching; this one skips the launch.\n")
-                    elif launch_decision(root, settings, source, write):
-                        schedule_file = shared_root(root) / SCHEDULE
-                        data = json.loads(schedule_file.read_text(encoding="utf-8")) if schedule_file.exists() else {}
-                        options = runtime_binding_options(root, data)
-                        if options:
-                            fired = dispatch_bound_trigger(root, settings, source, config_path, options, write)
+                try:
+                    if not config_path.is_file():
+                        raise ValueError("No trigger binding. Run factory schedule install first")
+                    with single_flight(shared_root(root) / ".factory/fire.lock") as held:
+                        if not held:
+                            write("Another tick is still launching; this one skips the launch.\n")
                         else:
-                            fired = execute([*native, "trigger", "fire", "--config", str(config_path)], root,
-                                            capture=False, timeout=None, output=log).returncode
+                            schedule_file = shared_root(root) / SCHEDULE
+                            data = json.loads(schedule_file.read_text(encoding="utf-8")) if schedule_file.exists() else {}
+                            if not isinstance(data, dict):
+                                raise ValueError("schedule.json must contain a JSON object")
+                            if launch_decision(root, settings, source, write):
+                                options = runtime_binding_options(root, data)
+                                if options:
+                                    fired = dispatch_bound_trigger(root, settings, source, config_path, options, write)
+                                else:
+                                    fired = execute([*native, "trigger", "fire", "--config", str(config_path)], root,
+                                                    capture=False, timeout=None, output=log).returncode
+                except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
+                    # Refused admissions must not block existing durable waits.
+                    write(f"Launch refused: {error}\n")
+                    fired = 1
             if log:
                 log.flush()
             # Resume due durable waits (CI pauses, usage-limit resumes) in the same tick.

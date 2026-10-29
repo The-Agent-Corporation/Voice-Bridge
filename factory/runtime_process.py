@@ -16,6 +16,10 @@ from pathlib import Path
 
 class ProcessTree:
     def __init__(self, argv, cwd, env):
+        if os.name != "nt" and (not callable(getattr(os, "waitid", None))
+                                or not hasattr(os, "WNOWAIT")):
+            raise RuntimeError("owned runtime cleanup requires POSIX waitid/WNOWAIT support "
+                               "(on macOS, Python 3.13 or later)")
         self.job = None
         self.closed = False
         self.proc = subprocess.Popen(
@@ -52,11 +56,28 @@ class ProcessTree:
                     raise OSError("Windows job assignment failed")
             self.proc.stdin.write(json.dumps({"argv": argv, "cwd": str(cwd), "env": env}).encode() + b"\n")
             self.proc.stdin.close()
-        except BaseException:
-            if self.proc.poll() is None:
-                self.proc.kill()  # assignment may have failed before joining the job
-            self.close()
+        except BaseException as failure:
+            try:
+                if os.name == "nt" and self.proc.poll() is None:
+                    self.proc.kill()  # assignment may have failed before joining the job
+                self.close()
+            except BaseException as cleanup_error:
+                failure.add_note(f"Runtime process cleanup failed: {cleanup_error}")
             raise
+
+    def poll(self):
+        """Observe exit without releasing the POSIX process-group identity."""
+        if os.name == "nt" or self.closed:
+            return self.proc.poll()
+        if self.proc.returncode is not None:
+            raise RuntimeError("runtime process owner was reaped; refusing unreserved group cleanup")
+        try:
+            state = os.waitid(os.P_PID, self.proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except ChildProcessError:
+            raise RuntimeError("runtime process owner was reaped outside its cleanup") from None
+        if state is None:
+            return None
+        return state.si_status if state.si_code == os.CLD_EXITED else -state.si_status
 
     def close(self):
         if self.closed:
@@ -81,13 +102,31 @@ class ProcessTree:
             self.kernel.CloseHandle(self.job)
             self.job = None
         elif os.name != "nt":
+            self.poll()  # Refuse numeric group signals if another caller reaped it.
             try:
                 os.killpg(self.proc.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+            except PermissionError:
+                # macOS can return EPERM for an exited, unreaped leader alone.
+                # Only a later absence check can prove cleanup completed.
+                if self.poll() is None:
+                    raise
         elif self.proc.poll() is None:
             self.proc.kill()
         self.proc.wait(timeout=15)
+        if os.name != "nt":
+            deadline = time.monotonic() + 15
+            while True:
+                try:
+                    os.killpg(self.proc.pid, 0)
+                except ProcessLookupError:
+                    break
+                except PermissionError:
+                    pass
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("owned runtime process group did not exit; cleanup is unverified")
+                time.sleep(.02)
         if self.proc.stdin and not self.proc.stdin.closed:
             self.proc.stdin.close()
         self.closed = True

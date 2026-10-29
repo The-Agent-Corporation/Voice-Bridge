@@ -4,6 +4,11 @@ Factory can own ordinary application environments while Archon owns every workfl
 and coding agent. It never chooses a stage, retries an agent, evaluates a scenario,
 interprets workflow output to dispatch more work, or authorizes a merge.
 
+On macOS, use Python 3.13 or later for the runtime host and HTTP harness. Python
+3.13 added macOS support for [`os.waitid`](https://docs.python.org/3.13/library/os.html#os.waitid).
+POSIX cleanup requires `waitid` with `WNOWAIT` to retain the child identity until
+the final process-group signal; unsupported interpreters refuse before spawning.
+
 ## Foreground lifetime
 
 ```text
@@ -304,7 +309,7 @@ caller must supply the trusted native return; JSON alone is not a signed receipt
 No model exit code or synthetic `[PASS]` becomes mutation evidence. The `score` command
 remains limited to supplied ordinary check logs.
 
-Repository checks: `python bin/test_runtime_resource.py`, `python bin/test_runtime_host.py`, `python bin/test_consumer.py`,
-the installed selftests, `python bin/audit.py`, and `python bin/selfcheck-mutations.py`.
+Repository checks: `python3 harness/ci.py` and
+`python3 -m unittest discover -s harness -p 'test_*.py' -v`.
 Real subprocess fixtures verify local ownership; they do not establish live
 provider attribution or a final compatible source pin.

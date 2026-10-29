@@ -14,6 +14,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: "26"
@@ -22,4 +24,5 @@ jobs:
         with:
           python-version: "3.12"
       - run: npm ci
+      - run: python -m unittest discover -s harness -p 'test_*.py' -v
       - run: python harness/ci.py
