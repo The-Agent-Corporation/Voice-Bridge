@@ -19,6 +19,13 @@ fails closed. After this owner reaps its leader, cleanup retries only observe th
 group and never send another termination signal. A cleanup failure attempts the
 remaining owned processes and slots, retaining failed ownership records for retry.
 
+If cleanup cannot verify process-group membership, the host keeps the owner and
+environment directory and refuses to replace that slot. Restore reliable `/proc`
+or `/bin/ps` observation and retry `teardown` for the affected slot; restart that
+slot only after teardown succeeds. After reaping the leader, retries only observe
+membership and never signal the numeric group again. Restarting the host or
+discarding ownership records does not establish verified cleanup.
+
 ## Foreground lifetime
 
 ```text
