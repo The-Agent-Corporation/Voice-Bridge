@@ -233,6 +233,43 @@ def validate_destination(destination: Path, repository: Path) -> Path:
     return resolved
 
 
+def publish_resource(staging: Path, destination: Path) -> None:
+    """Install a validated generation, retaining the previous one until success."""
+    backup = (Path(tempfile.mkdtemp(prefix=".factory-resource-backup-", dir=destination.parent))
+              if destination.exists() else None)
+    previous = backup / "previous" if backup is not None else None
+    try:
+        if previous is not None:
+            destination.replace(previous)
+        staging.replace(destination)
+    except BaseException as error:
+        # Include cancellation after the first rename. Abrupt process/machine
+        # loss still requires manual recovery; two renames are not an exchange.
+        if previous is not None:
+            try:
+                if previous.exists():
+                    previous.replace(destination)
+            except BaseException as rollback_error:
+                error.add_note(
+                    f"Previous resource retained for recovery at {previous}; "
+                    "restore it to the configured destination before preparing again. "
+                    "See factory/RUNTIME_HOST.md.")
+                raise error from rollback_error
+            try:
+                backup.rmdir()
+            except OSError:
+                error.add_note(f"Empty resource backup directory could not be removed: {backup}")
+        raise
+    if backup is not None:
+        try:
+            remove_tree(backup)
+        except BaseException as error:
+            error.add_note(
+                f"New resource is installed at {destination}; previous backup cleanup "
+                f"is incomplete at {backup}. See factory/RUNTIME_HOST.md.")
+            raise
+
+
 def prepare(destination: Path, config: Path, expected_revision: str | None = None) -> dict:
     repository, actual_revision = delivery(expected_revision)
     destination = validate_destination(destination, repository)
@@ -261,13 +298,16 @@ def prepare(destination: Path, config: Path, expected_revision: str | None = Non
             "include": includes,
         }
         (staging / MARKER).write_text(json.dumps(mapping, indent=2) + "\n", encoding="utf-8")
-        if destination.exists():
-            remove_tree(destination)
-        staging.replace(destination)
+        publish_resource(staging, destination)
         return mapping
-    finally:
-        if staging.exists():
-            remove_tree(staging)
+    except BaseException as error:
+        try:
+            if staging.exists():
+                remove_tree(staging)
+        except BaseException:
+            # Do not hide the publication failure or its retained-backup note.
+            error.add_note(f"Resource staging cleanup is incomplete at {staging}")
+        raise
 
 
 def main(argv=None) -> int:
@@ -294,8 +334,10 @@ def main(argv=None) -> int:
         if args.mutation:
             command.extend(["--mutation", args.mutation])
         return subprocess.run(command, cwd=repository).returncode
-    except (OSError, ValueError, subprocess.SubprocessError):
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
         print("Runtime resource operation refused", file=sys.stderr)
+        for note in getattr(error, "__notes__", ()):
+            print(note, file=sys.stderr)
         return 1
 
 

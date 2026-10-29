@@ -85,6 +85,44 @@ class ScheduleInstallTests(unittest.TestCase):
                 ['systemctl', '--user', 'enable', '--now', 'archonfactory-project.timer']])
             self.assertIn('Wrote ', output.getvalue())
 
+    def test_interrupted_binding_write_preserves_previous_state_and_does_not_install(self):
+        for existing in (False, True):
+            with self.subTest(existing=existing), self.project() as (root, home, commands, _):
+                binding = root / consumer.TRIGGER
+                original = b'{"installed": "keep exact bytes"}\n'
+                if existing:
+                    binding.write_bytes(original)
+                real_open = Path.open
+
+                class InterruptedWrite:
+                    def __init__(self, stream):
+                        self.stream = stream
+                    def __enter__(self):
+                        return self
+                    def __exit__(self, *args):
+                        return self.stream.__exit__(*args)
+                    def __getattr__(self, name):
+                        return getattr(self.stream, name)
+                    def write(self, text):
+                        self.stream.write(text[:max(1, len(text) // 2)])
+                        self.stream.flush()
+                        raise OSError('interrupted binding write')
+
+                def interrupt(path, mode='r', *args, **kwargs):
+                    stream = real_open(path, mode, *args, **kwargs)
+                    if path.parent == binding.parent and mode in ('w', 'x'):
+                        return InterruptedWrite(stream)
+                    return stream
+
+                with patch.object(Path, 'open', interrupt), self.assertRaisesRegex(OSError, 'interrupted'):
+                    consumer.schedule(root, ['install', '--apply'])
+                self.assertEqual(binding.exists(), existing)
+                if existing:
+                    self.assertEqual(binding.read_bytes(), original)
+                self.assertEqual(list(binding.parent.glob('*.tmp')), [])
+                self.assertEqual(list(home.rglob('*')), [])
+                self.assertEqual(commands, [])
+
     def test_linux_unit_preserves_spaces_quotes_backslashes_and_expansion_characters(self):
         # Hand-checked systemd grammar: quoted words, C escaping, %% for specifiers,
         # ':' disables ExecStart dollar expansion; Environment never expands dollars.

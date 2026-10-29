@@ -138,6 +138,22 @@ and any existing directory it did not create.
 It never deletes an unowned directory. No `rm`, `find`, shell pipe or platform
 archive program is part of the normal path.
 
+Serialize preparation for each destination. Replacement first renames the old
+owned directory into a sibling `.factory-resource-backup-*/previous`, then installs
+the validated staging directory, and deletes the backup only after installation
+succeeds. A caught installation failure restores the old directory when possible;
+failed rollback retains it and reports its recovery path. These two renames are
+not an atomic exchange: readers can briefly see no destination, and abrupt process
+or machine loss can require manual recovery. Before preparing again after an
+interruption, inspect sibling backup directories. The backup marker's
+`resource_root` identifies the original destination; the backup is recovery data,
+not an active binding at its temporary path. With preparation stopped and the
+destination absent, restore that `previous` directory to its original path. If a
+destination already exists, verify its binding and bytes before choosing a
+generation or removing backups; do not overwrite it blindly. A failure while
+deleting the backup after installation leaves the new destination installed and
+reports incomplete backup cleanup.
+
 The helper and the workflow working directory must resolve to the same delivering
 Git checkout. An absolute helper path into an old checkout is refused even when
 `--expected-revision` is omitted. Automation should pass its trusted full SHA;

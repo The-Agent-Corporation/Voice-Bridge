@@ -183,6 +183,10 @@ def apply(dest: Path, d: dict) -> tuple[bool, str]:
         return False, "mutation must change a nonempty unique anchor"
     if not target.exists():
         return False, f"{d['file']} does not exist in the build copy"
+    # A separate path can still share its inode with a source checkout. Refuse
+    # hard-linked targets before opening them for mutation.
+    if target.stat().st_nlink > 1:
+        return False, "mutation target has hard links; use an independent disposable copy"
     body = target.read_text(encoding="utf-8")
     count = body.count(d["find"])
     if count == 0:

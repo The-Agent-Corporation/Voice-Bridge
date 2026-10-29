@@ -1,4 +1,6 @@
 """Synthetic directory-preservation and source-identity regressions."""
+from contextlib import redirect_stderr
+import io
 import json
 import os
 from pathlib import Path
@@ -293,6 +295,174 @@ class SnapshotTests(unittest.TestCase):
                     self.assertEqual((destination / runtime_resource.MARKER).read_bytes(), marker)
                     self.assertEqual(runtime_resource.resource_digest(destination), binding["resource_digest"])
                     self.assertEqual(list(destination.parent.glob(".factory-resource-*")), [])
+
+    def replacement_fixture(self):
+        revision, config = self.resource_fixture()
+        destination = self.root.parent / "prepared"
+        with patch.object(runtime_resource, "delivery", return_value=(self.root, revision)):
+            runtime_resource.prepare(destination, config, revision)
+        original = {path.relative_to(destination): path.read_bytes()
+                    for path in destination.rglob("*") if path.is_file()}
+        inode = destination.stat().st_ino
+        (self.root / "app.py").write_text("print('replacement candidate')\n")
+        self.git("add", "app.py")
+        self.git("commit", "-qm", "Synthetic replacement generation")
+        return destination, config, self.git("rev-parse", "HEAD"), original, inode
+
+    def assert_previous_resource(self, destination, original, inode):
+        self.assertTrue(destination.is_dir(), "previous owned directory must survive")
+        self.assertEqual(destination.stat().st_ino, inode)
+        self.assertEqual({path.relative_to(destination): path.read_bytes()
+                          for path in destination.rglob("*") if path.is_file()}, original)
+        self.assertTrue(runtime_resource.owned_destination(destination))
+
+    def test_failed_resource_install_restores_exact_previous_directory(self):
+        destination, config, revision, original, inode = self.replacement_fixture()
+        replace = Path.replace
+        for failure in (OSError("synthetic install failure"), KeyboardInterrupt("synthetic cancellation")):
+            with self.subTest(failure=type(failure).__name__):
+                def fail_install(path, target):
+                    if path.parent == destination.parent and path.name.startswith(".factory-resource-"):
+                        raise failure
+                    return replace(path, target)
+                with patch.object(runtime_resource, "delivery", return_value=(self.root, revision)), \
+                        patch.object(Path, "replace", fail_install):
+                    with self.assertRaises(type(failure)) as raised:
+                        runtime_resource.prepare(destination, config, revision)
+                self.assertIs(raised.exception, failure)
+                self.assert_previous_resource(destination, original, inode)
+                self.assertEqual(list(destination.parent.glob(".factory-resource-*")), [])
+
+    def test_failed_resource_rollback_retains_recoverable_previous_directory(self):
+        destination, config, revision, original, inode = self.replacement_fixture()
+        replace = Path.replace
+        install_error = OSError("synthetic install failure")
+        rollback_error = PermissionError("synthetic rollback failure")
+        def fail_install_and_restore(path, target):
+            if path.name == "previous":
+                raise rollback_error
+            if path.parent == destination.parent and path.name.startswith(".factory-resource-"):
+                raise install_error
+            return replace(path, target)
+        with patch.object(runtime_resource, "delivery", return_value=(self.root, revision)), \
+                patch.object(Path, "replace", fail_install_and_restore):
+            with self.assertRaises(OSError) as raised:
+                runtime_resource.prepare(destination, config, revision)
+        self.assertIs(raised.exception, install_error)
+        self.assertIs(raised.exception.__cause__, rollback_error)
+        backups = list(destination.parent.glob(".factory-resource-backup-*"))
+        self.assertEqual(len(backups), 1)
+        previous = backups[0] / "previous"
+        self.assertFalse(destination.exists())
+        self.assertEqual(previous.stat().st_ino, inode)
+        self.assertEqual({path.relative_to(previous): path.read_bytes()
+                          for path in previous.rglob("*") if path.is_file()}, original)
+        self.assertFalse(runtime_resource.owned_destination(previous), "backup is not an active binding")
+        self.assertIn(str(previous), "\n".join(raised.exception.__notes__))
+        self.assertEqual(list(destination.parent.glob(".factory-resource-*")), backups)
+        output = io.StringIO()
+        with patch.object(runtime_resource, "prepare", side_effect=raised.exception), redirect_stderr(output):
+            result = runtime_resource.main(["prepare", "--destination", str(destination),
+                                            "--config", str(config)])
+        self.assertEqual(result, 1)
+        self.assertIn(str(previous), output.getvalue())
+        self.assertNotIn("synthetic rollback failure", output.getvalue())
+        previous.replace(destination)
+        backups[0].rmdir()
+        self.assert_previous_resource(destination, original, inode)
+
+    def test_resource_backup_move_failure_or_interrupt_preserves_previous(self):
+        destination, config, revision, original, inode = self.replacement_fixture()
+        replace = Path.replace
+        for after_move in (False, True):
+            with self.subTest(after_move=after_move):
+                failure = KeyboardInterrupt("synthetic interruption") if after_move else OSError("synthetic backup failure")
+                def fail_backup(path, target):
+                    if path == destination:
+                        if after_move:
+                            replace(path, target)
+                        raise failure
+                    return replace(path, target)
+                with patch.object(runtime_resource, "delivery", return_value=(self.root, revision)), \
+                        patch.object(Path, "replace", fail_backup):
+                    with self.assertRaises(type(failure)) as raised:
+                        runtime_resource.prepare(destination, config, revision)
+                self.assertIs(raised.exception, failure)
+                self.assert_previous_resource(destination, original, inode)
+                self.assertEqual(list(destination.parent.glob(".factory-resource-*")), [])
+
+    def test_successful_resource_install_keeps_previous_until_new_generation_installed(self):
+        destination, config, revision, original, inode = self.replacement_fixture()
+        replace = Path.replace
+        checked_previous = []
+        def inspect_install(path, target):
+            if path.parent == destination.parent and path.name.startswith(".factory-resource-"):
+                backups = list(destination.parent.glob(".factory-resource-backup-*"))
+                self.assertEqual(len(backups), 1)
+                previous = backups[0] / "previous"
+                self.assertEqual(previous.stat().st_ino, inode)
+                self.assertEqual({p.relative_to(previous): p.read_bytes()
+                                  for p in previous.rglob("*") if p.is_file()}, original)
+                self.assertFalse(destination.exists())
+                checked_previous.append(previous)
+            return replace(path, target)
+        with patch.object(runtime_resource, "delivery", return_value=(self.root, revision)), \
+                patch.object(Path, "replace", inspect_install):
+            binding = runtime_resource.prepare(destination, config, revision)
+        self.assertEqual(len(checked_previous), 1)
+        self.assertEqual(binding["source_revision"], revision)
+        self.assertEqual((destination / "app.py").read_bytes(), (self.root / "app.py").read_bytes())
+        self.assertTrue(runtime_resource.owned_destination(destination))
+        self.assertEqual(list(destination.parent.glob(".factory-resource-*")), [])
+
+    def test_interruption_after_resource_install_retains_both_generations(self):
+        destination, config, revision, original, inode = self.replacement_fixture()
+        replace = Path.replace
+        failure = KeyboardInterrupt("synthetic post-install interruption")
+        def interrupt_after_install(path, target):
+            result = replace(path, target)
+            if path.parent == destination.parent and path.name.startswith(".factory-resource-"):
+                raise failure
+            return result
+        with patch.object(runtime_resource, "delivery", return_value=(self.root, revision)), \
+                patch.object(Path, "replace", interrupt_after_install):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                runtime_resource.prepare(destination, config, revision)
+        self.assertIs(raised.exception, failure)
+        self.assertEqual((destination / "app.py").read_bytes(), (self.root / "app.py").read_bytes())
+        self.assertTrue(runtime_resource.owned_destination(destination))
+        backups = list(destination.parent.glob(".factory-resource-backup-*"))
+        self.assertEqual(len(backups), 1)
+        previous = backups[0] / "previous"
+        self.assertEqual(previous.stat().st_ino, inode)
+        self.assertEqual({p.relative_to(previous): p.read_bytes()
+                          for p in previous.rglob("*") if p.is_file()}, original)
+        self.assertIn(str(previous), "\n".join(raised.exception.__notes__))
+
+    def test_failed_backup_cleanup_does_not_rollback_installed_resource(self):
+        destination, config, revision, original, inode = self.replacement_fixture()
+        remove = runtime_resource.remove_tree
+        failure = PermissionError("synthetic backup cleanup failure")
+        def fail_backup_cleanup(path):
+            if path.name.startswith(".factory-resource-backup-"):
+                raise failure
+            return remove(path)
+        with patch.object(runtime_resource, "delivery", return_value=(self.root, revision)), \
+                patch.object(runtime_resource, "remove_tree", fail_backup_cleanup):
+            with self.assertRaises(PermissionError) as raised:
+                runtime_resource.prepare(destination, config, revision)
+        self.assertIs(raised.exception, failure)
+        self.assertTrue(runtime_resource.owned_destination(destination))
+        self.assertEqual((destination / "app.py").read_bytes(), (self.root / "app.py").read_bytes())
+        marker = json.loads((destination / runtime_resource.MARKER).read_text())
+        self.assertEqual(marker["source_revision"], revision)
+        backups = list(destination.parent.glob(".factory-resource-backup-*"))
+        self.assertEqual(len(backups), 1)
+        previous = backups[0] / "previous"
+        self.assertEqual(previous.stat().st_ino, inode)
+        self.assertEqual({p.relative_to(previous): p.read_bytes()
+                          for p in previous.rglob("*") if p.is_file()}, original)
+        self.assertIn("New resource is installed", "\n".join(raised.exception.__notes__))
 
     def test_preparation_rejects_dangling_destination_and_ancestor_links(self):
         revision, config = self.resource_fixture()

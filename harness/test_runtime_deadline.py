@@ -90,11 +90,14 @@ class RuntimeDeadlineTests(unittest.TestCase):
         directory.mkdir()
         item = {"directory": directory, "processes": []}
         manager.active["existing"] = item
-        owner = runtime_process.ProcessTree([sys.executable, "-c", "import time; time.sleep(60)"],
-            self.root, {}, on_owner_created=item["processes"].append)
-        ready, accepted, parent_closed, sender_stop = (threading.Event() for _ in range(4))
+        ready, accepted, sender_stop = (threading.Event() for _ in range(3))
         state, failures, parent_threads = {}, [], []
         thread_type = threading.Thread
+        read_fd, write_fd = os.pipe()
+        parent_reader = os.fdopen(read_fd, "rb", buffering=0)
+        parent_writer = os.fdopen(write_fd, "wb", buffering=0)
+        fixture_sys = SimpleNamespace(stdin=parent_reader, stderr=sys.stderr,
+                                      executable=sys.executable)
 
         class Server(runtime_host.HTTPServer):
             def server_bind(server):
@@ -117,10 +120,6 @@ class RuntimeDeadlineTests(unittest.TestCase):
             manager.stopping = stopping
             return manager
 
-        def parent_read(*args):
-            parent_closed.wait()
-            return b""
-
         def parent_thread(*args, **kwargs):
             thread = thread_type(*args, **kwargs)
             parent_threads.append(thread)
@@ -135,9 +134,20 @@ class RuntimeDeadlineTests(unittest.TestCase):
         worker = thread_type(target=serve)
         client, sender = None, None
         try:
+            marker = directory / "child-ready"
+            owner = runtime_process.ProcessTree([sys.executable, "-c",
+                "from pathlib import Path; import sys,time; "
+                "Path(sys.argv[1]).write_text('ready'); time.sleep(60)", str(marker)],
+                self.root, {}, on_owner_created=item["processes"].append)
+            # This fixture represents an existing application, not a worker
+            # racing to fork its first child when parent cancellation arrives.
+            deadline = time.monotonic() + 5
+            while not marker.exists() or marker.read_text() != "ready":
+                self.assertLess(time.monotonic(), deadline, "owned child did not become ready")
+                time.sleep(.01)
             with patch.object(runtime_host, "Environments", side_effect=manager_factory), \
                     patch.object(runtime_host, "HTTPServer", side_effect=server_factory), \
-                    patch.object(runtime_host.os, "read", side_effect=parent_read), \
+                    patch.object(runtime_host, "sys", fixture_sys), \
                     patch.object(runtime_host.threading, "Thread", side_effect=parent_thread), \
                     patch.object(runtime_host.secrets, "token_urlsafe", return_value="fixture"), \
                     patch.object(runtime_host.signal, "signal"), redirect_stdout(io.StringIO()):
@@ -157,28 +167,32 @@ class RuntimeDeadlineTests(unittest.TestCase):
                 if trickle:
                     sender = thread_type(target=send_trickle)
                     sender.start()
-                yield client, parent_closed, worker, owner, manager, failures
-                parent_closed.set()
+                yield client, parent_writer.close, worker, owner, manager, failures
+                parent_writer.close()
                 worker.join(5)
         finally:
-            parent_closed.set()
+            parent_writer.close()
             sender_stop.set()
             if client:
                 client.close()  # also unblocks the old implementation on test failure
             if sender:
                 sender.join(5)
                 self.assertFalse(sender.is_alive(), "trickle fixture did not stop")
-            worker.join(5)
-            for thread in parent_threads:
-                thread.join(5)
-                self.assertFalse(thread.is_alive(), "parent-pipe fixture did not stop")
-            self.assertFalse(worker.is_alive(), "runtime request remained blocked")
-            manager.close()
+            try:
+                if worker.ident is not None:
+                    worker.join(5)
+                for thread in parent_threads:
+                    thread.join(5)
+                    self.assertFalse(thread.is_alive(), "parent-pipe fixture did not stop")
+                self.assertFalse(worker.is_alive(), "runtime request remained blocked")
+            finally:
+                parent_reader.close()
+                manager.close()
 
     def test_inbound_request_line_and_headers_have_total_deadline(self):
         for prefix in (b"POST ", b"POST /identity HTTP/1.1\r\nX-Slow: "):
             with self.subTest(prefix=prefix), self.accepted_request(prefix, trickle=True) as fixture:
-                client, parent_closed, worker, owner, manager, failures = fixture
+                client, close_parent, worker, owner, manager, failures = fixture
                 client.settimeout(4)
                 # Continuing bytes must not refresh the request's total read budget.
                 try:
@@ -188,42 +202,42 @@ class RuntimeDeadlineTests(unittest.TestCase):
                 except TimeoutError:
                     closed = False
                 self.assertTrue(closed, "trickled input exceeded the request deadline")
-                parent_closed.set()
+                close_parent()
                 worker.join(5)
                 self.assertFalse(worker.is_alive())
+                self.assertEqual(failures, [], f"server failed before owned cleanup: {failures!r}")
                 self.assertTrue(owner.closed)
                 self.assertEqual(manager.active, {})
-                self.assertEqual(failures, [])
 
     def test_complete_authenticated_inbound_request_keeps_response_contract(self):
         body = b'{"slot":"existing"}'
         request = (b"POST /teardown HTTP/1.0\r\nAuthorization: Bearer fixture\r\n"
                    b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
         with self.accepted_request(request, trickle=False) as fixture:
-            client, parent_closed, worker, owner, manager, failures = fixture
+            client, close_parent, worker, owner, manager, failures = fixture
             with HTTPResponse(client) as response:
                 response.begin()
                 self.assertEqual(response.status, 200)
                 self.assertTrue(json.loads(response.read())["stopped"])
-            parent_closed.set()
+            close_parent()
             worker.join(5)
             self.assertFalse(worker.is_alive())
+            self.assertEqual(failures, [], f"server failed before owned cleanup: {failures!r}")
             self.assertTrue(owner.closed)
             self.assertEqual(manager.active, {})
-            self.assertEqual(failures, [])
 
     def test_parent_close_cancels_idle_and_partial_inbound_requests_and_cleans_owner(self):
         for prefix in (b"", b"POST ", b"POST /identity HTTP/1.1\r\nX-Slow: "):
             with self.subTest(prefix=prefix), self.accepted_request(prefix, trickle=bool(prefix)) as fixture:
-                client, parent_closed, worker, owner, manager, failures = fixture
-                parent_closed.set()
+                client, close_parent, worker, owner, manager, failures = fixture
+                close_parent()
                 worker.join(3)
                 self.assertFalse(worker.is_alive(), "accepted request prevented parent cancellation")
+                self.assertEqual(failures, [], f"server failed before owned cleanup: {failures!r}")
                 self.assertTrue(owner.closed)
                 if os.name == "posix":
                     self.assertFalse(runtime_process.group_has_live_members(owner.proc.pid))
                 self.assertEqual(manager.active, {})
-                self.assertEqual(failures, [])
 
     def test_teardown_attempts_each_process_and_retains_failed_slot_for_retry(self):
         good = Mock()

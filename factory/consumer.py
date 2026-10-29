@@ -1136,7 +1136,7 @@ def schedule(root: Path, args: list[str]) -> int:
         binding_text = json.dumps(config, indent=2) + "\n"
         if apply:
             config_path.parent.mkdir(parents=True, exist_ok=True)
-            config_path.write_text(binding_text, encoding="utf-8")
+            _binding_write(config_path, config)
             print(f"Wrote {config_path} (Archon trigger binding for {config['binding']['launch']['workflowName']}).")
         else:
             print(f"Would write {config_path}:\n{binding_text}")

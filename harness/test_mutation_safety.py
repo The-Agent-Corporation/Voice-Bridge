@@ -1,5 +1,6 @@
 """Mutation evidence and writes must stay within disposable candidates."""
 import importlib.util
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -56,6 +57,30 @@ class MutationSafetyTests(unittest.TestCase):
                 'file': 'fixture.txt', 'find': 'original', 'replace': 'mutated'})
             self.assertTrue(injected, reason)
             self.assertEqual(target.read_text(), 'mutated')
+
+    def test_apply_refuses_hardlinked_candidate_without_changing_source_inode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source'
+            (source / 'harness/mutations').mkdir(parents=True)
+            (source / '.git').mkdir()
+            original = source / 'fixture.txt'
+            original.write_bytes(b'original')
+            candidate = root / 'candidate'
+            candidate.mkdir()
+            target = candidate / 'fixture.txt'
+            os.link(original, target)
+            self.assertTrue(original.samefile(target))
+            self.assertGreater(target.stat().st_nlink, 1)
+            from unittest.mock import patch
+            with patch.object(mutations, 'HERE', source / 'harness/mutations'):
+                injected, reason = mutations.apply(candidate, {
+                    'file': 'fixture.txt', 'find': 'original', 'replace': 'mutated'})
+            self.assertEqual(original.read_bytes(), b'original')
+            self.assertEqual(target.read_bytes(), b'original')
+            self.assertTrue(original.samefile(target))
+            self.assertFalse(injected)
+            self.assertIn('hard link', reason)
 
     def test_apply_refuses_nested_git_target_inside_disposable_candidate(self):
         with tempfile.TemporaryDirectory() as directory:
