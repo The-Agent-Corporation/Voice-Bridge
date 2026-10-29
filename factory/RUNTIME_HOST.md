@@ -8,6 +8,16 @@ On macOS, use Python 3.13 or later for the runtime host and HTTP harness. Python
 3.13 added macOS support for [`os.waitid`](https://docs.python.org/3.13/library/os.html#os.waitid).
 POSIX cleanup requires `waitid` with `WNOWAIT` to retain the child identity until
 the final process-group signal; unsupported interpreters refuse before spawning.
+The `harness/appproc.py` HTTP fixture is POSIX-only and refuses Windows before
+spawning. Its former `taskkill` path could not establish ownership of descendants
+after their leader exited. The runtime host's separate Windows Job Object owner
+does not qualify that HTTP harness path.
+
+POSIX cleanup verifies that no live group member remains. Zombie-only groups
+are stopped even when init has not reaped them; unreadable or uncertain membership
+fails closed. After this owner reaps its leader, cleanup retries only observe the
+group and never send another termination signal. A cleanup failure attempts the
+remaining owned processes and slots, retaining failed ownership records for retry.
 
 ## Foreground lifetime
 
@@ -21,6 +31,18 @@ for that foreground invocation, and closes the owner in `finally`. A pipe also
 detects abrupt consumer exit. The owner cancels readiness/setup waits, terminates
 its process trees, removes its temporary source/state directories, and exits.
 The consumer waits for that exit; failed cleanup fails the command.
+
+Startup has one cooperative 610-second budget across queueing, snapshot preparation,
+setup, readiness and final identity. Setup and readiness retain their individual
+300-second maximums. The loopback client supplies an absolute same-host monotonic
+deadline and allows another 60 seconds for cleanup; expired queued requests cannot
+start with a fresh budget. Cancellation/deadline checks run between filesystem
+operations and before launching project code or returning success. A lost successful
+start response triggers cleanup of that newly started slot.
+
+This is not a hard filesystem wall-clock bound: a blocked synchronous filesystem
+call cannot be interrupted by these checks, and cleanup may itself fail. The owner
+reports incomplete cleanup instead of success and keeps failed state for retry.
 
 `--runtime-host` cannot accompany `--detach`, `-d`, or `--resume`, including equals
 forms. Native durable ownership/terminal notification is not integrated. A paused

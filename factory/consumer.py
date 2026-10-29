@@ -249,6 +249,8 @@ def harness_inputs(root: Path, name: str) -> dict:
         invalid = not isinstance(value, str) or not value.strip()
         if not invalid:
             # Match the native policy grammar; whitespace around list items is allowed.
+            # Native path-policy treats mixed `none` as a literal path pattern;
+            # only required-check lists reserve it exclusively as a sentinel.
             items = [re.sub(r"^[\s\ufeff]+|[\s\ufeff]+$", "", item)
                      for item in value.split(",")]
             invalid = bool(re.search(r"[\x00-\x08\x0e-\x1f\x7f-\x9f]", value)) or any(
@@ -265,6 +267,31 @@ def harness_inputs(root: Path, name: str) -> dict:
 
 def workflow_defaults(root: Path, name: str) -> dict:
     return {**MANIFEST.get("default_inputs", {}).get(name, {}), **harness_inputs(root, name)}
+
+
+def verify_scheduled_policy(root: Path, config_path: Path, schedule_data: dict) -> None:
+    """Refuse stale installed merge inputs before changing admission state."""
+    reinstall = "Installed trigger policy is stale or malformed. Run factory schedule install again."
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    binding = config.get("binding") if isinstance(config, dict) else None
+    launch = binding.get("launch") if isinstance(binding, dict) else None
+    workflow = schedule_data.get("workflow", "archon-lifecycle")
+    if (not isinstance(launch, dict) or not isinstance(workflow, str)
+            or launch.get("workflowName") != workflow):
+        raise ValueError(reinstall)
+    if workflow not in MERGING_WORKFLOWS:
+        return
+    # Validate the declaration even when explicit schedule inputs override it,
+    # matching install/direct-run behavior. Overrides remain authoritative.
+    policy = harness_inputs(root, workflow)
+    inputs = schedule_data.get("inputs")
+    if not isinstance(inputs, dict):
+        raise ValueError("schedule.json requires an inputs object")
+    effective = {key: (inputs[key] if isinstance(inputs[key], str) else json.dumps(inputs[key]))
+                 if key in inputs else value for key, value in policy.items()}
+    installed = launch.get("inputs")
+    if not isinstance(installed, dict) or any(installed.get(key) != value for key, value in effective.items()):
+        raise ValueError(reinstall)
 
 
 def with_default_inputs(name: str, args: list[str], options: list[str], root: Path) -> list[str]:
@@ -946,6 +973,8 @@ def tick_state(root: Path, **updates) -> dict:
         state = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         state = {}
+    if not isinstance(state, dict):
+        raise ValueError(f".factory/gate.json must contain a JSON object (found {type(state).__name__})")
     if updates:
         state.update(updates)
         path.write_text(json.dumps(state) + "\n", encoding="utf-8")
@@ -1149,6 +1178,7 @@ def schedule(root: Path, args: list[str]) -> int:
                             data = json.loads(schedule_file.read_text(encoding="utf-8")) if schedule_file.exists() else {}
                             if not isinstance(data, dict):
                                 raise ValueError("schedule.json must contain a JSON object")
+                            verify_scheduled_policy(root, config_path, data)
                             if launch_decision(root, settings, source, write):
                                 options = runtime_binding_options(root, data)
                                 if options:
@@ -1161,7 +1191,7 @@ def schedule(root: Path, args: list[str]) -> int:
                     # launch error must leave existing durable waits able to wake.
                     # STOP, registry trust checks, wake failures and operator interrupts
                     # remain outside this launch-only recovery boundary.
-                    write(f"Launch refused: {error}\n")
+                    write(f"Launch phase error ({type(error).__name__}): {error}\n")
                     fired = 1
             if log:
                 log.flush()

@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import hmac
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -30,6 +31,12 @@ class NoRedirect(HTTPRedirectHandler):
 
 
 HTTP = build_opener(ProxyHandler({}), NoRedirect())
+# One cooperative budget includes queueing, preparation and both execution
+# phases. Blocking filesystem calls are checked between operations, not killed.
+START_BUDGET_S = 610
+START_CLEANUP_HEADROOM_S = 60
+
+
 def safe_path(root, relative):
     if (not isinstance(relative, str) or not relative or Path(relative).anchor
             or Path(relative).drive):
@@ -139,23 +146,50 @@ class Environments:
     def teardown(self, slot):
         item = self.active.get(slot)
         if item:
+            failures = []
             for proc in reversed(item["processes"]):
-                proc.close()
+                try:
+                    proc.close()
+                except Exception as error:
+                    failures.append(error)
+            if failures:
+                # Retain ownership and the directory until every process is
+                # confirmed stopped; a later teardown may retry failed cleanup.
+                raise ExceptionGroup("Runtime process cleanup incomplete", failures)
             remove_tree(item["directory"])
             del self.active[slot]
         return {"version": 1, "stopped": True}
 
-    def close(self):
+    def teardown_all(self):
+        failures = []
         for slot in list(self.active):
-            self.teardown(slot)
+            try:
+                self.teardown(slot)
+            except Exception as error:
+                failures.append(error)
+        if failures:
+            raise ExceptionGroup("Runtime environment cleanup incomplete", failures)
+
+    def close(self):
+        self.teardown_all()
         remove_tree(self.base)
 
-    def start(self, request):
+    def check_start(self, deadline):
+        if self.stopping.is_set() or time.monotonic() >= deadline:
+            raise ValueError("runtime startup cancelled or timed out")
+
+    def start(self, request, *, deadline=None):
+        limit = time.monotonic() + START_BUDGET_S
+        if deadline is not None and (not isinstance(deadline, (int, float)) or not math.isfinite(deadline)):
+            raise ValueError("invalid startup deadline")
+        deadline = min(deadline, limit) if deadline is not None else limit
+        self.check_start(deadline)
         slot = request.get("slot")
         if not isinstance(slot, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,80}", slot):
             raise ValueError("invalid slot")
         # Replacement is cleanup-first, including a malformed retry request.
         self.teardown(slot)
+        self.check_start(deadline)
         if set(request) - {"slot", "root", "mutation", "expected_source", "expected_revision"}:
             raise ValueError("unknown start fields; commands and paths cannot be supplied by callers")
         root = self.roots.get(request.get("root"))
@@ -171,12 +205,15 @@ class Environments:
                 raise ValueError("stale expected candidate revision")
             if resource_digest(root) != binding["resource_digest"]:
                 raise ValueError("prepared candidate resource changed")
+            self.check_start(deadline)
         cfg = self.config
         if cfg.get("shape") not in {"http", "cli", "library"}:
             raise ValueError("supported shapes: http, cli, library")
         directories = set()
         original = source_files(root, cfg["include"], directories=directories)
+        self.check_start(deadline)
         before = digest(original)
+        self.check_start(deadline)
         if request.get("expected_source", before) != before:
             raise ValueError("stale requested source")
         directory = self.base / secrets.token_hex(16)
@@ -189,13 +226,17 @@ class Environments:
             # Directory entries are part of the selected layout even when no
             # files below them contribute to the existing byte-only digest.
             for rel in sorted(directories):
+                self.check_start(deadline)
                 safe_path(source, rel).mkdir(parents=True, exist_ok=True)
             for rel, path in original.items():
+                self.check_start(deadline)
                 target = source / rel
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(path, target)
+                self.check_start(deadline)
             if tree_digest(source) != before or digest(source_files(root, cfg["include"])) != before:
                 raise ValueError("source changed during snapshot")
+            self.check_start(deadline)
             mutation = request.get("mutation")
             if mutation:
                 matches = [d for d in cfg.get("mutations", []) if d.get("id") == mutation]
@@ -208,6 +249,7 @@ class Environments:
                 if not find or find == replace or body.count(find) != 1:
                     raise ValueError("mutation requires a unique changing anchor")
                 target.write_bytes(body.replace(find, replace, 1))
+                self.check_start(deadline)
             for _ in range(100):
                 with socket.socket() as lease:
                     lease.bind(("127.0.0.1", 0))
@@ -234,40 +276,50 @@ class Environments:
             if not 0 < timeout <= 300:
                 raise ValueError("timeout_s must be between 0 and 300")
             if cfg.get("setup"):
+                self.check_start(deadline)
                 setup = ProcessTree(command(cfg["setup"], variables), source, env)
                 item["processes"].append(setup)
-                if self.wait_exit(setup, timeout) != 0:
+                if self.wait_exit(setup, timeout, deadline=deadline) != 0:
                     raise ValueError("project setup failed (output withheld)")
                 setup.close()
                 item["processes"].remove(setup)
+            self.check_start(deadline)
             selected = source_files(source, cfg["include"])
+            self.check_start(deadline)
             actual = digest(selected)
+            self.check_start(deadline)
             argv = command(cfg["command"], variables)
             identity = "factory-v1:" + hashlib.sha256(json.dumps(
                 {"source": actual, "argv": argv, "env": env}, sort_keys=True).encode()).hexdigest()
             env["FACTORY_RUNTIME_CANDIDATE"] = identity
             for path in selected.values():
+                self.check_start(deadline)
                 path.chmod(stat.S_IREAD)
+            self.check_start(deadline)
             proc = ProcessTree(argv, source, env)
             item["processes"].append(proc)
             item.update(candidate=identity, digest=actual, proc=proc, shape=cfg["shape"],
                         target=f"http://127.0.0.1:{port}", original=before, binding=binding)
             if cfg["shape"] == "http":
-                deadline = time.monotonic() + timeout
+                ready_deadline = min(deadline, time.monotonic() + timeout)
                 while True:
+                    self.check_start(ready_deadline)
                     if self.stopping.is_set() or proc.poll() is not None:
                         raise ValueError("app stopped before readiness")
                     try:
                         self.probe(item)
                         break
                     except (URLError, OSError, ValueError):
-                        if time.monotonic() >= deadline:
+                        if time.monotonic() >= ready_deadline:
                             raise ValueError("app readiness/identity refused") from None
                         self.stopping.wait(.05)
             else:
-                item["exit_code"] = self.wait_exit(proc, timeout)
+                item["exit_code"] = self.wait_exit(proc, timeout, deadline=deadline)
                 proc.close()  # includes descendants of finite commands
-            return self.identity(slot)
+            self.check_start(deadline)
+            result = self.identity(slot)
+            self.check_start(deadline)
+            return result
         except BaseException as failure:
             try:
                 self.teardown(slot)
@@ -275,12 +327,15 @@ class Environments:
                 failure.add_note(f"Runtime environment cleanup failed: {cleanup_error}")
             raise
 
-    def wait_exit(self, proc, timeout):
-        deadline = time.monotonic() + timeout
-        while (status := proc.poll()) is None:
-            if self.stopping.wait(.05) or time.monotonic() >= deadline:
-                raise ValueError("project command cancelled or timed out")
-        return status
+    def wait_exit(self, proc, timeout, *, deadline=None):
+        phase_deadline = time.monotonic() + timeout
+        deadline = min(deadline, phase_deadline) if deadline is not None else phase_deadline
+        while True:
+            self.check_start(deadline)
+            status = proc.poll()
+            if status is not None:
+                return status
+            self.stopping.wait(.05)
 
     def probe(self, item):
         if item["proc"].poll() is not None:
@@ -338,9 +393,15 @@ def serve(config):
                 data = json.loads(self.rfile.read(length))
                 if not isinstance(data, dict):
                     raise ValueError("request must be an object")
-                if self.path in {"/setup", "/start"}:
+                if self.path == "/start":
+                    # The local client uses the same host monotonic clock so
+                    # queueing cannot grant an abandoned request a fresh budget.
+                    raw_deadline = self.headers.get("X-Factory-Deadline")
+                    deadline = float(raw_deadline) if raw_deadline is not None else None
+                    result = manager.start(data, deadline=deadline)
+                elif self.path == "/setup":
                     # setup is a cleanup boundary; start performs provisioning atomically.
-                    result = manager.teardown(data["slot"]) if self.path == "/setup" else manager.start(data)
+                    result = manager.teardown(data["slot"])
                 elif self.path == "/teardown":
                     result = manager.teardown(data["slot"])
                 elif self.path == "/identity":
@@ -350,9 +411,12 @@ def serve(config):
                 status = 200
             except Exception:
                 # Never echo caller text, project output, paths or secrets on failure.
-                for slot in list(manager.active):
-                    manager.teardown(slot)
-                status, result = 400, {"error": "runtime request refused; active environments cleaned"}
+                try:
+                    manager.teardown_all()
+                except Exception:
+                    status, result = 500, {"error": "runtime request refused; cleanup incomplete"}
+                else:
+                    status, result = 400, {"error": "runtime request refused; active environments cleaned"}
             payload = json.dumps(result).encode()
             try:
                 self.send_response(status)
@@ -360,8 +424,13 @@ def serve(config):
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
                 self.wfile.write(payload)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+            except OSError:
+                if self.path == "/start" and status == 200:
+                    try:
+                        manager.teardown(data["slot"])
+                    except Exception:
+                        # Keep failed ownership records for an explicit retry.
+                        print("Runtime start response lost; cleanup incomplete", file=sys.stderr, flush=True)
 
     def parent_pipe():
         # Raw fd read: a daemon thread blocked in the buffered reader holds
@@ -421,11 +490,13 @@ def request(action, data, connection=None):
     # Environment is trusted, but credentials must never be sent to remote hosts.
     if not re.fullmatch(r"http://127\.0\.0\.1:[0-9]+", connection["url"]):
         raise ValueError("runtime control must be loopback")
-    req = Request(connection["url"] + "/" + action, data=json.dumps(data).encode(),
-                  headers={"Authorization": "Bearer " + connection["token"],
-                           "Content-Type": "application/json"})
-    # Start can spend 300 seconds on setup and another 300 on readiness.
-    with HTTP.open(req, timeout=620 if action == "start" else 310) as response:
+    headers = {"Authorization": "Bearer " + connection["token"], "Content-Type": "application/json"}
+    if action == "start":
+        headers["X-Factory-Deadline"] = str(time.monotonic() + START_BUDGET_S)
+    req = Request(connection["url"] + "/" + action, data=json.dumps(data).encode(), headers=headers)
+    # Leave the owner time to clean an expired startup before the client gives up.
+    timeout = START_BUDGET_S + START_CLEANUP_HEADROOM_S if action == "start" else 310
+    with HTTP.open(req, timeout=timeout) as response:
         return json.load(response)
 
 

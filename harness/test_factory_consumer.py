@@ -108,6 +108,11 @@ class MergePolicyTests(unittest.TestCase):
             'required_checks': ' NONE ', 'protected_paths': 'none',
         })
 
+    def test_mixed_none_protected_path_is_native_literal_pattern(self):
+        self.write_policy({**self.valid, 'protected_paths': 'none,harness/**'})
+        self.assertEqual(consumer.harness_inputs(self.root, 'archon-lifecycle')['protected_paths'],
+                         'none,harness/**')
+
     def test_nonmerging_workflows_do_not_require_policy(self):
         for contents in (None, '{bad json', '[]'):
             if contents is not None:

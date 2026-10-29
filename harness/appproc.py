@@ -32,6 +32,7 @@ The universal parts, kept in one place because getting them wrong is subtle:
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import shlex
@@ -47,6 +48,11 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+_PROCESS_SPEC = importlib.util.spec_from_file_location(
+    '_factory_http_runtime_process', ROOT / 'factory' / 'runtime_process.py')
+_PROCESS = importlib.util.module_from_spec(_PROCESS_SPEC)
+_PROCESS_SPEC.loader.exec_module(_PROCESS)
+group_has_live_members = _PROCESS.group_has_live_members
 
 
 class AppDidNotStart(RuntimeError):
@@ -106,11 +112,13 @@ class HttpApp:
         self.proc: subprocess.Popen | None = None
         self._output = None
         self._closed = False
+        self._reaped_by_cleanup = False
         self.env_overrides = env or {}
 
     def __enter__(self) -> "HttpApp":
-        if os.name != "nt" and (not callable(getattr(os, "waitid", None))
-                                or not hasattr(os, "WNOWAIT")):
+        if os.name == "nt":
+            raise AppDidNotStart("owned HTTP cleanup is unsupported on Windows")
+        if not callable(getattr(os, "waitid", None)) or not hasattr(os, "WNOWAIT"):
             raise AppDidNotStart("owned HTTP cleanup requires POSIX waitid/WNOWAIT support "
                                 "(on macOS, Python 3.13 or later)")
         cmd = (self.cfg.get("start") or "").replace("{port}", str(self.port))
@@ -126,6 +134,7 @@ class HttpApp:
         # removed on close, and only the bounded tail is exposed on startup failure.
         self.proc = None
         self._closed = False
+        self._reaped_by_cleanup = False
         self._output = tempfile.TemporaryFile()
         try:
             self.proc = subprocess.Popen(
@@ -142,29 +151,26 @@ class HttpApp:
         print(f"APP_STARTED port={self.port}", flush=True)
         return self
 
-    def __exit__(self, *exc) -> None:
+    def __exit__(self, exc_type=None, exc_value=None, traceback=None) -> None:
         # Port numbers are not ownership evidence. Only stop the process tree we
         # launched; a replacement started outside that tree belongs to its caller.
         if self._closed:
             return
         try:
-            if self.proc:
-                if os.name == "nt":
-                    if self.proc.poll() is None:
-                        subprocess.run(["taskkill", "/PID", str(self.proc.pid), "/T", "/F"],
-                                       capture_output=True, timeout=30, check=True)
-                    self.proc.wait(timeout=10)
-                else:
+            try:
+                if self.proc:
                     self._stop_owned_group()
-            self._closed = True
-        finally:
-            if self._output:
-                self._output.close()
-                self._output = None
+                self._closed = True
+            finally:
+                if self._output:
+                    self._output.close()
+                    self._output = None
+        except BaseException as cleanup_error:
+            if exc_value is None:
+                raise
+            exc_value.add_note(f"HTTP app cleanup failed: {cleanup_error}")
 
     def _exit_status(self) -> int | None:
-        if os.name == "nt":
-            return self.proc.poll()
         if self.proc.returncode is not None:
             raise RuntimeError("HTTP process owner was reaped; refusing unreserved group cleanup")
         try:
@@ -184,28 +190,25 @@ class HttpApp:
             pass
         except PermissionError:
             # macOS may report EPERM for an exited, unreaped leader alone.
-            # This is not cleanup proof; group absence is checked after reaping.
+            # This is not cleanup proof; live membership is checked after reaping.
             if self._exit_status() is None:
                 raise
 
     def _stop_owned_group(self) -> None:
-        self._signal_owned_group(signal.SIGTERM)
-        deadline = time.monotonic() + 10
-        while self._exit_status() is None and time.monotonic() < deadline:
-            time.sleep(.05)
-        self._signal_owned_group(signal.SIGKILL)
-        self.proc.wait(timeout=10)
+        if not self._reaped_by_cleanup:
+            self._signal_owned_group(signal.SIGTERM)
+            deadline = time.monotonic() + 10
+            while self._exit_status() is None and time.monotonic() < deadline:
+                time.sleep(.05)
+            self._signal_owned_group(signal.SIGKILL)
+            self.proc.wait(timeout=10)
+            self._reaped_by_cleanup = True
         # Queries after reaping may refuse success, but must never signal again.
         deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            try:
-                os.killpg(self.proc.pid, 0)
-            except ProcessLookupError:
-                return
-            except PermissionError:
-                pass
+        while group_has_live_members(self.proc.pid):
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Owned HTTP process group did not exit; cleanup is unverified")
             time.sleep(.05)
-        raise RuntimeError("Owned HTTP process group did not exit; cleanup is unverified")
 
     def _await_health(self) -> None:
         path = self.cfg.get("health_path", "/health")
@@ -217,9 +220,11 @@ class HttpApp:
             if exited is not None:
                 out = ""
                 if self._output:
-                    size = self._output.seek(0, os.SEEK_END)
-                    self._output.seek(max(0, size - 2500))
-                    out = self._output.read().decode("utf-8", errors="replace")
+                    descriptor = self._output.fileno()
+                    size = os.fstat(descriptor).st_size
+                    # Descendants share this open file description. Positional
+                    # reads must not move their next output write offset.
+                    out = os.pread(descriptor, 2500, max(0, size - 2500)).decode("utf-8", errors="replace")
                 raise AppDidNotStart(
                     f"the app exited with {exited} before answering:\n{out[-2500:]}"
                 )

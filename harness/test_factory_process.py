@@ -1,5 +1,6 @@
 """Real-process regressions for runtime group identity through final cleanup."""
 import json
+import io
 import os
 from pathlib import Path
 import signal
@@ -10,10 +11,12 @@ import tempfile
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'factory'))
 from runtime_process import ProcessTree
+import runtime_process
 from runtime_host import Environments
 
 
@@ -51,6 +54,86 @@ class ProcessOwnershipTests(unittest.TestCase):
         with patch('runtime_process.os.killpg', side_effect=AssertionError('unreserved group signaled')):
             with self.assertRaisesRegex(RuntimeError, 'reaped'):
                 tree.close()
+
+    def test_cleanup_retry_after_own_reap_only_observes_and_closes_stdin(self):
+        tree = self.process('pass')
+        tree.proc.stdin = io.BytesIO()
+        killpg = os.killpg
+        def owned_signal(pid, signum):
+            if signum and tree.proc.returncode is not None:
+                self.fail('cleanup retry signaled a released process group')
+            return killpg(pid, signum)
+        try:
+            with patch('runtime_process.os.killpg', side_effect=owned_signal), \
+                    patch('runtime_process.group_has_live_members', create=True,
+                          side_effect=[RuntimeError('membership unavailable'), False]):
+                with self.assertRaisesRegex(RuntimeError, 'membership unavailable'):
+                    tree.close()
+                self.assertTrue(tree.proc.stdin.closed)
+                self.assertIsNotNone(tree.proc.returncode)
+                self.assertEqual(tree.poll(), tree.proc.returncode)
+                self.assertFalse(tree.closed)
+                tree.close()
+                self.assertTrue(tree.closed)
+        finally:
+            self.emergency_cleanup(tree)
+
+    def test_live_members_time_out_then_retry_without_signaling(self):
+        tree = self.process('pass')
+        try:
+            ticks = iter((0, 16))
+            with patch('runtime_process.group_has_live_members', create=True, return_value=True), \
+                    patch.object(runtime_process, 'time', SimpleNamespace(
+                        monotonic=lambda: next(ticks), sleep=lambda _: None)):
+                with self.assertRaisesRegex(TimeoutError, 'group'):
+                    tree.close()
+            self.assertFalse(tree.closed)
+            with patch('runtime_process.group_has_live_members', create=True, return_value=False), \
+                    patch('runtime_process.os.killpg', side_effect=AssertionError('retry signaled')):
+                tree.close()
+            self.assertTrue(tree.closed)
+        finally:
+            self.emergency_cleanup(tree)
+
+    @unittest.skipUnless(sys.platform == 'linux', 'Linux subreaper zombie proof')
+    def test_real_zombie_only_group_is_cleaned_without_waiting_for_reaper(self):
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        previous = ctypes.c_int()
+        self.assertEqual(libc.prctl(37, ctypes.byref(previous), 0, 0, 0), 0)
+        self.assertEqual(libc.prctl(36, 1, 0, 0, 0), 0)
+        tree = None
+        descendant = None
+        marker = self.root / 'zombie-pid'
+        code = ("import os,pathlib; child=os.fork()\n"
+                "if child == 0: os._exit(0)\n"
+                f"pathlib.Path({str(marker)!r}).write_text(str(child))\n"
+                "os._exit(0)\n")
+        try:
+            tree = self.process(code)
+            deadline = time.monotonic() + 5
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(.01)
+            descendant = int(marker.read_text())
+            stat = Path(f'/proc/{descendant}/stat')
+            while time.monotonic() < deadline:
+                if tree.poll() is not None and stat.read_text().rsplit(')', 1)[1].split()[0] == 'Z':
+                    break
+                time.sleep(.01)
+            self.assertEqual(stat.read_text().rsplit(')', 1)[1].split()[0], 'Z')
+            os.killpg(tree.proc.pid, 0)
+            tree.close()
+            self.assertTrue(tree.closed)
+            os.killpg(tree.proc.pid, 0)  # The adopted zombie still reserves the group.
+            self.assertEqual(stat.read_text().rsplit(')', 1)[1].split()[0], 'Z')
+        finally:
+            try:
+                if tree:
+                    self.emergency_cleanup(tree)
+                if descendant is not None:
+                    os.waitpid(descendant, 0)
+            finally:
+                libc.prctl(36, previous.value, 0, 0, 0)
 
     def test_missing_waitid_refuses_before_spawning(self):
         with patch('runtime_process.os.waitid', None, create=True), \

@@ -1,6 +1,7 @@
 """A refused new admission must not block durable continuations."""
-from contextlib import contextmanager, ExitStack, nullcontext
+from contextlib import contextmanager, ExitStack, nullcontext, redirect_stderr
 import importlib.util
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -19,7 +20,16 @@ class WakeAfterRefusal(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder, ExitStack() as stack:
             root = Path(folder)
             (root / consumer.TRIGGER).parent.mkdir(parents=True, exist_ok=True)
-            (root / consumer.TRIGGER).write_text('{}')
+            policy = {'required_checks': 'ci', 'protected_paths': 'harness/**'}
+            (root / 'harness').mkdir()
+            (root / 'harness/harness.config.json').write_text(json.dumps(policy))
+            if isinstance(schedule_data, dict):
+                schedule_data = {'workflow': 'archon-lifecycle', 'inputs': {}, **schedule_data}
+            workflow = schedule_data.get('workflow') if isinstance(schedule_data, dict) else 'archon-lifecycle'
+            inputs = schedule_data.get('inputs', {}) if isinstance(schedule_data, dict) else {}
+            values = {**policy, **{k: v if isinstance(v, str) else json.dumps(v) for k, v in inputs.items()}}
+            (root / consumer.TRIGGER).write_text(json.dumps({'binding': {'launch': {
+                'workflowName': workflow, 'inputs': values}}}))
             (root / consumer.SCHEDULE).write_text(json.dumps(schedule_data))
             stack.enter_context(patch.multiple(consumer, read_settings=lambda _: {}, verify_source=lambda _: root,
                 shared_root=lambda _: root, cli=lambda *_: ['native'], archon_home=lambda: root,
@@ -58,6 +68,18 @@ class WakeAfterRefusal(unittest.TestCase):
                 self.assertEqual(mocks['execute'].call_count, 2)
                 self.assertEqual(mocks['execute'].call_args.args[0], ['native', 'workflow', 'wake'])
 
+    def test_uncertain_dispatch_is_not_reported_as_refused_and_still_wakes(self):
+        with self.tick({}) as (root, mocks):
+            mocks['dispatch_bound_trigger'].side_effect = ValueError(
+                'Runtime dispatch uncertain; no retry permitted. Inspect dispatch.json')
+            output = io.StringIO()
+            with redirect_stderr(output):
+                self.assertEqual(consumer.schedule(root, ['fire']), 1)
+            self.assertIn('Launch phase error (ValueError): Runtime dispatch uncertain; no retry permitted.',
+                          output.getvalue())
+            self.assertNotIn('Launch refused:', output.getvalue())
+            self.assertEqual(mocks['execute'].call_args.args[0], ['native', 'workflow', 'wake'])
+
     def test_wake_failure_is_not_hidden_by_successful_admission(self):
         with self.tick({}) as (root, mocks):
             mocks['execute'].return_value = subprocess.CompletedProcess([], 7)
@@ -74,7 +96,12 @@ class WakeAfterRefusal(unittest.TestCase):
         with self.tick({}) as (root, mocks):
             (root / '.factory/gate.json').write_text('[]')
             mocks['launch_decision'].side_effect = lambda *_: consumer.tick_state(root, last_launch=1)
-            self.assertEqual(consumer.schedule(root, ['fire']), 1)
+            output = io.StringIO()
+            with redirect_stderr(output):
+                self.assertEqual(consumer.schedule(root, ['fire']), 1)
+            self.assertIn('ValueError', output.getvalue())
+            self.assertIn('.factory/gate.json must contain a JSON object (found list)', output.getvalue())
+            self.assertEqual((root / '.factory/gate.json').read_text(), '[]')
             mocks['dispatch_bound_trigger'].assert_not_called()
             self.assertEqual(mocks['execute'].call_args.args[0], ['native', 'workflow', 'wake'])
 
@@ -104,6 +131,92 @@ class WakeAfterRefusal(unittest.TestCase):
         for data in ([], None, 'invalid', 42, True):
             with self.subTest(data=data), self.assertRaisesRegex(ValueError, 'JSON object'):
                 consumer.runtime_binding_options(Path('.'), data)
+
+    def assert_policy_refusal_wakes_without_admission(self, root, mocks):
+        output = io.StringIO()
+        with redirect_stderr(output):
+            self.assertEqual(consumer.schedule(root, ['fire']), 1)
+        mocks['launch_decision'].assert_not_called()
+        mocks['dispatch_bound_trigger'].assert_not_called()
+        self.assertEqual(mocks['execute'].call_count, 1)
+        self.assertEqual(mocks['execute'].call_args.args[0], ['native', 'workflow', 'wake'])
+        return output.getvalue()
+
+    def test_invalid_current_policy_refuses_both_dispatch_paths_but_wakes(self):
+        for bound in (True, False):
+            for contents in ('{invalid', '[]', '{"required_checks":"", "protected_paths":"none"}'):
+                with self.subTest(bound=bound, contents=contents), self.tick({}) as (root, mocks):
+                    mocks['runtime_binding_options'].return_value = {'helper': 'fixture'} if bound else None
+                    (root / 'harness/harness.config.json').write_text(contents)
+                    self.assertIn('merge policy', self.assert_policy_refusal_wakes_without_admission(
+                        root, mocks).lower())
+
+    def test_changed_effective_policy_refuses_before_admission_and_wakes(self):
+        for key, value in (('required_checks', 'ci,new-required'), ('protected_paths', 'harness/**,factory/**')):
+            for bound in (True, False):
+                with self.subTest(key=key, bound=bound), self.tick({}) as (root, mocks):
+                    mocks['runtime_binding_options'].return_value = {'helper': 'fixture'} if bound else None
+                    path = root / 'harness/harness.config.json'
+                    policy = json.loads(path.read_text())
+                    policy[key] = value
+                    path.write_text(json.dumps(policy))
+                    self.assertIn('schedule install', self.assert_policy_refusal_wakes_without_admission(root, mocks))
+
+    def test_explicit_schedule_overrides_remain_effective_after_valid_default_change(self):
+        with self.tick({'inputs': {'required_checks': 'none', 'protected_paths': 'explicit/**'}}) as (root, mocks):
+            (root / 'harness/harness.config.json').write_text(json.dumps({
+                'required_checks': 'new-default', 'protected_paths': 'new-default/**'}))
+            self.assertEqual(consumer.schedule(root, ['fire']), 0)
+            mocks['launch_decision'].assert_called_once()
+            mocks['dispatch_bound_trigger'].assert_called_once()
+            self.assertEqual(mocks['execute'].call_args.args[0], ['native', 'workflow', 'wake'])
+
+    def test_explicit_schedule_overrides_cannot_hide_invalid_current_policy(self):
+        with self.tick({'inputs': {'required_checks': 'none', 'protected_paths': 'none'}}) as (root, mocks):
+            (root / 'harness/harness.config.json').unlink()
+            self.assert_policy_refusal_wakes_without_admission(root, mocks)
+
+    def test_changed_override_requires_reinstall_before_dispatch(self):
+        with self.tick({'inputs': {'required_checks': 'none'}}) as (root, mocks):
+            schedule = json.loads((root / consumer.SCHEDULE).read_text())
+            schedule['inputs']['required_checks'] = 'ci'
+            (root / consumer.SCHEDULE).write_text(json.dumps(schedule))
+            self.assertIn('schedule install', self.assert_policy_refusal_wakes_without_admission(root, mocks))
+
+    def test_real_reinstalled_binding_accepts_current_policy_and_explicit_override(self):
+        for workflow in ('archon-lifecycle', 'archon-merge-queue'):
+            with self.subTest(workflow=workflow), self.tick({
+                    'workflow': workflow, 'inputs': {'required_checks': 'none'}}) as (root, mocks):
+                (root / 'harness/harness.config.json').write_text(json.dumps({
+                    'required_checks': 'new-default', 'protected_paths': 'new-protected/**'}))
+                with patch.multiple(consumer, discover=lambda *_: {workflow: root},
+                                    repository_slug=lambda _: 'owner/repository',
+                                    whoami=lambda *_: 'operator', base_branch=lambda *_: 'main'):
+                    config = consumer.trigger_config(root, {}, root, 600)
+                self.assertEqual(config['binding']['launch']['inputs']['required_checks'], 'none')
+                (root / consumer.TRIGGER).write_text(json.dumps(config))
+                self.assertEqual(consumer.schedule(root, ['fire']), 0)
+                mocks['dispatch_bound_trigger'].assert_called_once()
+                self.assertEqual(mocks['execute'].call_args.args[0], ['native', 'workflow', 'wake'])
+
+    def test_nonmerging_workflow_does_not_require_current_merge_policy(self):
+        with self.tick({'workflow': 'archon-review'}) as (root, mocks):
+            (root / 'harness/harness.config.json').unlink()
+            self.assertEqual(consumer.schedule(root, ['fire']), 0)
+            mocks['dispatch_bound_trigger'].assert_called_once()
+
+    def test_changed_workflow_cannot_bypass_installed_merging_policy(self):
+        with self.tick({}) as (root, mocks):
+            (root / consumer.SCHEDULE).write_text(json.dumps({'workflow': 'archon-review', 'inputs': {}}))
+            (root / 'harness/harness.config.json').unlink()
+            self.assertIn('schedule install', self.assert_policy_refusal_wakes_without_admission(root, mocks))
+
+    def test_malformed_installed_policy_refuses_and_wakes(self):
+        for binding in ({}, {'binding': []}, {'binding': {'launch': None}},
+                        {'binding': {'launch': {'workflowName': 'archon-lifecycle', 'inputs': {}}}}):
+            with self.subTest(binding=binding), self.tick({}) as (root, mocks):
+                (root / consumer.TRIGGER).write_text(json.dumps(binding))
+                self.assert_policy_refusal_wakes_without_admission(root, mocks)
 
 
 if __name__ == '__main__':
