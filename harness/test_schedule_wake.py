@@ -3,6 +3,7 @@ from contextlib import contextmanager, ExitStack, nullcontext, redirect_stderr
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -15,9 +16,19 @@ SPEC.loader.exec_module(consumer)
 
 
 class WakeAfterRefusal(unittest.TestCase):
+    def test_git_hook_environment_is_isolated_and_restored(self):
+        inherited = {'GIT_DIR': '/unrelated-hook.git', 'GIT_INDEX_FILE': '/unrelated-index'}
+        with patch.dict(os.environ, inherited):
+            with self.tick({}) as (root, mocks):
+                self.assertEqual(consumer.schedule(root, ['fire']), 0)
+                self.assertEqual(mocks['dispatch_bound_trigger'].call_count, 1)
+            self.assertEqual({key: os.environ[key] for key in inherited}, inherited)
+
     @contextmanager
     def tick(self, schedule_data=None):
         with tempfile.TemporaryDirectory() as folder, ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ,
+                {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}, clear=True))
             root = Path(folder)
             (root / consumer.TRIGGER).parent.mkdir(parents=True, exist_ok=True)
             policy = {'required_checks': 'ci', 'protected_paths': 'harness/**'}

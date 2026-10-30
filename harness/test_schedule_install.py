@@ -21,9 +21,19 @@ SPEC.loader.exec_module(consumer)
 
 
 class ScheduleInstallTests(unittest.TestCase):
+    def test_git_hook_environment_is_isolated_and_restored(self):
+        inherited = {'GIT_DIR': '/unrelated-hook.git', 'GIT_INDEX_FILE': '/unrelated-index'}
+        with patch.dict(os.environ, inherited):
+            with self.project() as (root, _, commands, __):
+                self.assertEqual(consumer.schedule(root, ['install']), 0)
+                self.assertEqual(commands, [])
+            self.assertEqual({key: os.environ[key] for key in inherited}, inherited)
+
     @contextmanager
     def project(self, platform='linux'):
         with tempfile.TemporaryDirectory(prefix='factory-install-') as folder, ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ,
+                {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}, clear=True))
             root = Path(folder) / 'project'
             root.mkdir()
             home = Path(folder) / 'home'
