@@ -123,8 +123,9 @@ def _admission_bytes(path: Path, *, private: bool = True) -> bytes:
 
 
 def _admission_json(path: Path) -> dict:
+    data = _admission_bytes(path)
     try:
-        value = json.loads(_admission_bytes(path))
+        value = json.loads(data)
     except (UnicodeError, ValueError) as error:
         raise ValueError("Shared admission deployment file is invalid") from error
     if not isinstance(value, dict):
@@ -1520,7 +1521,11 @@ def schedule(root: Path, args: list[str]) -> int:
                 log.close()
         return fired or woken
     if action == "remove":
-        plan = timer_commands(root, interval)
+        # Enrollment can bind a different worktree than the caller. Remove the
+        # same scheduler identity that installation selected on every platform.
+        timer_root = verified_timer_root(admission) if admission else root
+        plan = timer_commands(timer_root, interval, include_wake=not bool(admission),
+                              consumer_root=timer_root if admission else None)
         if "launchd" in plan:
             configure_launchd(root, plan, apply, remove=True)
             if apply:

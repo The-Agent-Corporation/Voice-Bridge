@@ -248,6 +248,17 @@ class SharedAdmissionTests(unittest.TestCase):
         self.write_private(self.marker, {'schema': 'factory-enrolled-v1', 'registry': str(self.registry_path), 'project': 'voice-bridge'})
         stack = ExitStack()
         self.addCleanup(stack.close)
+        # Keep the loaded wrapper's pins independent from checkout permissions
+        # and from the timer worktree, which tests deliberately mutate separately.
+        self.loaded_factory = self.base / 'loaded-factory'
+        self.loaded_factory.mkdir(mode=0o700)
+        self.loaded_factory.chmod(0o700)
+        for name in ('consumer.py', 'pack.json'):
+            destination = self.loaded_factory / name
+            destination.write_bytes((self.root / 'factory' / name).read_bytes())
+            destination.chmod(0o600)
+        stack.enter_context(patch.object(consumer, '__file__', str(self.loaded_factory / 'consumer.py')))
+        stack.enter_context(patch.object(consumer, 'HERE', self.loaded_factory))
         stack.enter_context(patch.object(consumer.Path, 'home', return_value=self.home))
         stack.enter_context(patch.object(consumer, 'default_admission_home', return_value=self.archon))
         environment = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
@@ -274,6 +285,21 @@ class SharedAdmissionTests(unittest.TestCase):
         self.assertFalse(Path(argv[6].split('=', 1)[1]).exists())
         self.assertEqual(argv[7:], [str(self.controller), '--config', str(self.config_path), 'schedule-tick', 'voice-bridge'])
         self.assertIsNone(self.execute.call_args.kwargs['timeout'])
+
+    def test_admission_checks_fixture_source_and_pack_and_refuses_their_mutation(self):
+        with patch.object(consumer, '_admission_bytes', wraps=consumer._admission_bytes) as read:
+            self.assertEqual(consumer.shared_admission(self.root)['project'], 'voice-bridge')
+        checked_paths = {call.args[0] for call in read.call_args_list}
+        for name in ('consumer.py', 'pack.json'):
+            path = self.loaded_factory / name
+            self.assertIn(path, checked_paths)
+            self.assertNotIn(Path(__file__).resolve().parents[1] / 'factory' / name, checked_paths)
+            original = path.read_bytes()
+            path.write_bytes(b'changed fixture source')
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'consumer or pack pin changed'):
+                consumer.shared_admission(self.root)
+            path.write_bytes(original)
+        self.execute.assert_not_called()
 
     def test_sibling_import_shadows_fail_closed(self):
         for filename in ('controls.pyc', 'controls.abi3.so', 'controls.pyd'):
@@ -331,7 +357,42 @@ class SharedAdmissionTests(unittest.TestCase):
                     patch('sys.stderr', new=io.StringIO()) as error:
                 self.assertEqual(consumer.main(['schedule', 'fire']), 1)
             self.assertIn('Factory refused:', error.getvalue())
+            self.assertIn('POSIX ownership checks; no native fallback', error.getvalue())
             self.assertNotIn('Traceback', error.getvalue())
+        self.execute.assert_not_called()
+
+    def test_admission_json_decode_failure_does_not_expose_private_contents(self):
+        for data in (b'{"secret":"do-not-echo",', b'\xffdo-not-echo'):
+            self.registry_path.write_bytes(data)
+            with self.subTest(data=data), self.assertRaisesRegex(
+                    ValueError, '^Shared admission deployment file is invalid$'):
+                consumer._admission_json(self.registry_path)
+
+    def test_enrolled_timer_removal_matches_install_from_another_worktree(self):
+        caller = self.base / 'other-worktree'
+        caller.mkdir()
+        for platform in ('linux', 'darwin'):
+            with self.subTest(platform=platform), ExitStack() as stack:
+                stack.enter_context(patch.object(consumer.sys, 'platform', platform))
+                stack.enter_context(patch.object(consumer, 'shared_root', return_value=self.root))
+                stack.enter_context(patch.multiple(consumer, read_settings=lambda _: {},
+                    verify_source=lambda _: self.base, cli=lambda *_: ['native']))
+                configure = stack.enter_context(patch.object(consumer, 'configure_launchd'))
+                output = stack.enter_context(redirect_stdout(io.StringIO()))
+                self.assertEqual(consumer.schedule(caller, ['install']), 0)
+                if platform == 'linux':
+                    installed_timer = next(line.rsplit(' ', 1)[-1] for line in output.getvalue().splitlines()
+                        if line.startswith('Run to enable: systemctl --user enable'))
+                    output.truncate(0)
+                    output.seek(0)
+                    self.assertEqual(consumer.schedule(caller, ['remove']), 0)
+                    self.assertIn('disable --now ' + installed_timer, output.getvalue())
+                    self.assertNotIn('other-worktree.timer', output.getvalue())
+                else:
+                    installed_jobs = set(configure.call_args.args[1]['launchd'])
+                    self.assertEqual(consumer.schedule(caller, ['remove']), 0)
+                    self.assertEqual(set(configure.call_args.args[1]['launchd']), installed_jobs)
+                    self.assertTrue(configure.call_args.kwargs['remove'])
         self.execute.assert_not_called()
 
     def test_unenrolled_host_without_getuid_keeps_native_read_only_path(self):

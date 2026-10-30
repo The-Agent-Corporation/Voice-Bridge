@@ -33,6 +33,7 @@ class WakeAfterRefusal(unittest.TestCase):
             (root / consumer.SCHEDULE).write_text(json.dumps(schedule_data))
             stack.enter_context(patch.multiple(consumer, read_settings=lambda _: {}, verify_source=lambda _: root,
                 shared_root=lambda _: root, cli=lambda *_: ['native'], archon_home=lambda: root,
+                default_admission_home=lambda: root,
                 verify_registry_environment=lambda _: None, windowless=lambda: False,
                 single_flight=lambda _: nullcontext(True), wake_allowed=lambda *_: True))
             mocks = {name: stack.enter_context(patch.object(consumer, name, return_value=value))
