@@ -1523,7 +1523,9 @@ def schedule(root: Path, args: list[str]) -> int:
     if action == "remove":
         # Enrollment can bind a different worktree than the caller. Remove the
         # same scheduler identity that installation selected on every platform.
-        timer_root = verified_timer_root(admission) if admission else root
+        # Cleanup derives only the scheduler identity from trusted admission;
+        # it never executes the enrolled target or installs its changed files.
+        timer_root = Path(admission["consumer_root"]) if admission else root
         plan = timer_commands(timer_root, interval, include_wake=not bool(admission),
                               consumer_root=timer_root if admission else None)
         if "launchd" in plan:

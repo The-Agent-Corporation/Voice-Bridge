@@ -28,7 +28,8 @@ class WakeAfterRefusal(unittest.TestCase):
     def tick(self, schedule_data=None):
         with tempfile.TemporaryDirectory() as folder, ExitStack() as stack:
             stack.enter_context(patch.dict(os.environ,
-                {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}, clear=True))
+                {key: value for key, value in os.environ.items() if not key.startswith('GIT_')
+                 and key not in {'DATABASE_URL', 'ARCHON_DOCKER', 'WORKSPACE_PATH'}}, clear=True))
             root = Path(folder)
             (root / consumer.TRIGGER).parent.mkdir(parents=True, exist_ok=True)
             policy = {'required_checks': 'ci', 'protected_paths': 'harness/**'}

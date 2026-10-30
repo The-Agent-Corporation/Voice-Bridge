@@ -33,7 +33,8 @@ class ScheduleInstallTests(unittest.TestCase):
     def project(self, platform='linux'):
         with tempfile.TemporaryDirectory(prefix='factory-install-') as folder, ExitStack() as stack:
             stack.enter_context(patch.dict(os.environ,
-                {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}, clear=True))
+                {key: value for key, value in os.environ.items() if not key.startswith('GIT_')
+                 and key not in {'DATABASE_URL', 'ARCHON_DOCKER', 'WORKSPACE_PATH'}}, clear=True))
             root = Path(folder) / 'project'
             root.mkdir()
             home = Path(folder) / 'home'

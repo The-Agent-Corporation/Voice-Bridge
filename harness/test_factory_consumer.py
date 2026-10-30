@@ -261,7 +261,8 @@ class SharedAdmissionTests(unittest.TestCase):
         stack.enter_context(patch.object(consumer, 'HERE', self.loaded_factory))
         stack.enter_context(patch.object(consumer.Path, 'home', return_value=self.home))
         stack.enter_context(patch.object(consumer, 'default_admission_home', return_value=self.archon))
-        environment = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+        environment = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')
+                       and key not in {'DATABASE_URL', 'ARCHON_DOCKER', 'WORKSPACE_PATH'}}
         stack.enter_context(patch.dict(os.environ, {**environment, 'ARCHON_HOME': str(self.archon)}, clear=True))
         stack.enter_context(patch.object(consumer, 'shared_root', side_effect=lambda path, **_: Path(path)))
         self.execute = stack.enter_context(patch.object(consumer, 'execute', return_value=subprocess.CompletedProcess([], 0)))
@@ -285,6 +286,13 @@ class SharedAdmissionTests(unittest.TestCase):
         self.assertFalse(Path(argv[6].split('=', 1)[1]).exists())
         self.assertEqual(argv[7:], [str(self.controller), '--config', str(self.config_path), 'schedule-tick', 'voice-bridge'])
         self.assertIsNone(self.execute.call_args.kwargs['timeout'])
+
+    def test_registry_redirect_environment_still_refuses_before_dispatch(self):
+        for key in ('DATABASE_URL', 'ARCHON_DOCKER', 'WORKSPACE_PATH'):
+            with self.subTest(key=key), patch.dict(os.environ, {key: 'unrelated-fixture'}), \
+                    self.assertRaisesRegex(ValueError, key + ' selects an unsupported registry environment'):
+                consumer.schedule(self.root, ['fire'])
+        self.execute.assert_not_called()
 
     def test_admission_checks_fixture_source_and_pack_and_refuses_their_mutation(self):
         with patch.object(consumer, '_admission_bytes', wraps=consumer._admission_bytes) as read:
@@ -393,6 +401,32 @@ class SharedAdmissionTests(unittest.TestCase):
                     self.assertEqual(consumer.schedule(caller, ['remove']), 0)
                     self.assertEqual(set(configure.call_args.args[1]['launchd']), installed_jobs)
                     self.assertTrue(configure.call_args.kwargs['remove'])
+        self.execute.assert_not_called()
+
+    def test_enrolled_timer_removal_uses_trusted_identity_when_target_pins_changed(self):
+        # The executing wrapper is independently verified from loaded_factory.
+        # Cleanup must not execute or require the damaged timer target's files.
+        for platform in ('linux', 'darwin'):
+            for name in ('consumer.py', 'pack.json'):
+                target = self.root / 'factory' / name
+                original = target.read_bytes()
+                target.write_bytes(b'changed target: never execute this')
+                try:
+                    with self.subTest(platform=platform, name=name), ExitStack() as stack:
+                        stack.enter_context(patch.object(consumer.sys, 'platform', platform))
+                        stack.enter_context(patch.multiple(consumer, read_settings=lambda _: {},
+                            verify_source=lambda _: self.base, cli=lambda *_: ['native']))
+                        configure = stack.enter_context(patch.object(consumer, 'configure_launchd'))
+                        output = stack.enter_context(redirect_stdout(io.StringIO()))
+                        with self.assertRaisesRegex(ValueError, 'timer.*pin'):
+                            consumer.schedule(self.root, ['install'])
+                        self.assertEqual(consumer.schedule(self.root, ['remove']), 0)
+                        if platform == 'linux':
+                            self.assertIn('systemctl --user disable --now archonfactory-project.timer', output.getvalue())
+                        else:
+                            self.assertTrue(configure.call_args.kwargs['remove'])
+                finally:
+                    target.write_bytes(original)
         self.execute.assert_not_called()
 
     def test_unenrolled_host_without_getuid_keeps_native_read_only_path(self):
