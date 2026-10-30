@@ -233,7 +233,9 @@ def shared_admission(root: Path) -> dict | None:
             if hashlib.sha256(_admission_bytes(controller.parent / name, private=False)).hexdigest() != expected:
                 raise ValueError("Shared controller module pin changed")
         found.append({"controller": str(controller), "config": str(config_path), "project": entry["project"],
-                      "grant": project.get("schedule"), "registry": str(path)})
+                      "grant": project.get("schedule"), "registry": str(path),
+                      "consumer_root": project["consumer_root"],
+                      "consumer_sha256": entry["consumer_sha256"], "pack_sha256": entry["pack_sha256"]})
     if len(found) > 1 or (marker and not found):
         raise ValueError("Shared admission registry is missing or ambiguous; no native fallback")
     return found[0] if found else None
@@ -942,7 +944,16 @@ def _systemd_word(value: str) -> str:
     return json.dumps(value.replace("%", "%%"), ensure_ascii=False)
 
 
-def timer_commands(root: Path, interval: int, *, include_wake: bool = True) -> dict:
+def verified_timer_root(admission: dict) -> Path:
+    root = Path(admission["consumer_root"])
+    for name, key in (("consumer.py", "consumer_sha256"), ("pack.json", "pack_sha256")):
+        if hashlib.sha256(_admission_bytes(root / "factory" / name, private=False)).hexdigest() != admission[key]:
+            raise ValueError("Enrolled timer consumer or pack pin changed")
+    return root
+
+
+def timer_commands(root: Path, interval: int, *, include_wake: bool = True,
+                   consumer_root: Path | None = None) -> dict:
     """Host schedulers invoke the consumer so STOP/PAUSE are checked before Archon."""
     fire = [sys.executable, str(root / "factory/consumer.py"), "schedule", "fire"]
     name = "ArchonFactory-" + re.sub(r"[^A-Za-z0-9-]", "-", root.name)
@@ -960,6 +971,7 @@ def timer_commands(root: Path, interval: int, *, include_wake: bool = True) -> d
                 "remove": [["schtasks", "/Delete", "/TN", name, "/F"]]}
     if sys.platform == "darwin":
         root = shared_root(root)
+        execution_root = consumer_root if consumer_root is not None else root
         identity = hashlib.sha256(str(root).encode()).hexdigest()
         directory = Path.home() / "Library/LaunchAgents"
         domain = f"gui/{os.getuid()}"
@@ -971,9 +983,9 @@ def timer_commands(root: Path, interval: int, *, include_wake: bool = True) -> d
             path = directory / f"{label}.plist"
             jobs[path] = plistlib.dumps({
                 "Label": label,
-                "ProgramArguments": [sys.executable, str(root / "factory/consumer.py"),
+                "ProgramArguments": [sys.executable, str(execution_root / "factory/consumer.py"),
                                      "schedule", action],
-                "WorkingDirectory": str(root),
+                "WorkingDirectory": str(execution_root),
                 "EnvironmentVariables": {"ARCHON_HOME": str(archon_home().resolve()),
                                          "PATH": os.environ.get("PATH", "")},
                 "StartInterval": seconds, "RunAtLoad": False,
@@ -1333,19 +1345,27 @@ def schedule(root: Path, args: list[str]) -> int:
         if action == "wake":
             raise ValueError("Enrolled global wake is withheld pending exact shared continuation admission")
         shared = shared_root(root)
-        if action == "fire":
-            for marker in (".factory/STOP", PAUSE):
-                if (shared / marker).exists() or (shared / marker).is_symlink():
-                    print("Scheduled launch withheld by local STOP/PAUSE.", file=sys.stderr)
-                    return 0
-            if (shared / SCHEDULE_INSTALL_PENDING).exists():
-                raise ValueError("Schedule installation is incomplete; shared launch withheld")
-        verify_registry_environment(root)
-        if shared_admission(root) != admission:
-            raise ValueError("Shared admission binding changed before dispatch")
-        with tempfile.TemporaryDirectory(prefix="factory-controller-cache-") as cache:
-            return execute(shared_command(admission, "schedule-tick" if action == "fire" else "status", cache),
-                           root, capture=False, timeout=None).returncode
+        lock = single_flight(shared / ".factory/fire.lock") if action == "fire" else contextlib.nullcontext(True)
+        with lock as held:
+            if not held:
+                print("Shared launch withheld: another launch or installation owns the fire lock.", file=sys.stderr)
+                return 0
+            # Installation uses this same common-root lock. Keep it until the
+            # controller returns, and check durable guards after fresh binding reads.
+            verify_registry_environment(root)
+            if shared_admission(root) != admission:
+                raise ValueError("Shared admission binding changed before dispatch")
+            if action == "fire":
+                for marker in (".factory/STOP", PAUSE):
+                    if (shared / marker).exists() or (shared / marker).is_symlink():
+                        print("Scheduled launch withheld by local STOP/PAUSE.", file=sys.stderr)
+                        return 0
+                pending = shared / SCHEDULE_INSTALL_PENDING
+                if pending.exists() or pending.is_symlink():
+                    raise ValueError("Schedule installation is incomplete; shared launch withheld")
+            with tempfile.TemporaryDirectory(prefix="factory-controller-cache-") as cache:
+                return execute(shared_command(admission, "schedule-tick" if action == "fire" else "status", cache),
+                               root, capture=False, timeout=None).returncode
     apply = "--apply" in flags
     interval = 300
     if "--interval" in flags:
@@ -1385,7 +1405,8 @@ def schedule(root: Path, args: list[str]) -> int:
             if not isinstance(local_schedule, dict) or type(local_schedule.get("parallel", 1)) is not int or local_schedule.get("parallel", 1) != 1:
                 raise ValueError("Enrolled schedules require exactly one project slot")
             config = None
-            plan = timer_commands(root, interval, include_wake=False)
+            timer_root = verified_timer_root(admission)
+            plan = timer_commands(timer_root, interval, include_wake=False, consumer_root=timer_root)
         else:
             config = trigger_config(root, settings, source, interval)
             plan = timer_commands(root, interval)
@@ -1393,6 +1414,7 @@ def schedule(root: Path, args: list[str]) -> int:
             if admission:
                 if shared_admission(root) != admission:
                     raise ValueError("Shared admission binding changed during timer installation")
+                verified_timer_root(admission)
                 print(f"Timer uses factoryctl schedule-tick {admission['project']}; existing STOP/PAUSE are preserved. No global wake.")
             else:
                 binding_text = json.dumps(config, indent=2) + "\n"

@@ -219,6 +219,9 @@ class SharedAdmissionTests(unittest.TestCase):
         for path in (self.root, self.root / '.factory', self.home, self.archon, self.controller_dir):
             path.mkdir(mode=0o700)
         self.controller = self.controller_dir / 'factoryctl.py'
+        (self.root / 'factory').mkdir()
+        (self.root / 'factory/consumer.py').write_bytes(Path(consumer.__file__).read_bytes())
+        (self.root / 'factory/pack.json').write_bytes((consumer.HERE / 'pack.json').read_bytes())
         self.controller.write_text('# controller fixture\n')
         (self.controller_dir / 'controls.py').write_text('# dependency fixture\n')
         self.config_path = self.controller_dir / 'controls-config.json'
@@ -526,6 +529,57 @@ class SharedAdmissionTests(unittest.TestCase):
         with patch.multiple(consumer, read_settings=lambda _: {}, verify_source=lambda _: self.base,
                             cli=lambda *_: ['native']), self.assertRaisesRegex(ValueError, 'exactly one project slot'):
             consumer.schedule(self.root, ['install', '--apply'])
+        self.execute.assert_not_called()
+
+    def test_enrolled_mac_timer_uses_verified_worktree_consumer_not_common_checkout(self):
+        common = self.base / 'main-checkout'
+        (common / '.factory').mkdir(parents=True)
+        (common / 'factory').mkdir()
+        (common / 'factory/consumer.py').write_text('unchecked legacy consumer')
+        self.registry['projects'][str(common)] = self.registry['projects'].pop(str(self.root))
+        self.save_config()
+        with patch.object(consumer, 'shared_root', return_value=common), \
+                patch.multiple(consumer, read_settings=lambda _: {}, verify_source=lambda _: self.base, cli=lambda *_: ['native']), \
+                patch.object(consumer.sys, 'platform', 'darwin'), patch.object(consumer, 'configure_launchd') as configure, redirect_stdout(io.StringIO()):
+            self.assertEqual(consumer.schedule(self.root, ['install']), 0)
+        job = plistlib.loads(next(iter(configure.call_args.args[1]['launchd'].values())).encode())
+        self.assertEqual(job['ProgramArguments'][1], str(self.root / 'factory/consumer.py'))
+        self.assertEqual(job['WorkingDirectory'], str(self.root))
+        self.assertEqual(job['StandardOutPath'], str(common / '.factory/schedule.log'))
+        self.assertIn(hashlib.sha256(str(common).encode()).hexdigest(), job['Label'])
+
+    def test_enrolled_install_hashes_exact_timer_consumer_and_pack_on_every_platform(self):
+        for platform in ('darwin', 'linux', 'win32'):
+            for name in ('consumer.py', 'pack.json'):
+                path = self.root / 'factory' / name
+                original = path.read_bytes()
+                path.write_bytes(b'unchecked scheduled file')
+                with self.subTest(platform=platform, name=name), \
+                        patch.multiple(consumer, read_settings=lambda _: {}, verify_source=lambda _: self.base, cli=lambda *_: ['native']), \
+                        patch.object(consumer.sys, 'platform', platform), \
+                        self.assertRaisesRegex(ValueError, 'timer.*pin'):
+                    consumer.schedule(self.root, ['install'])
+                path.write_bytes(original)
+        self.execute.assert_not_called()
+
+    def test_enrolled_fire_cannot_dispatch_while_install_owns_shared_lock(self):
+        with consumer.single_flight(self.root / '.factory/fire.lock') as held:
+            self.assertTrue(held)
+            self.assertEqual(consumer.schedule(self.root, ['fire']), 0)
+        self.execute.assert_not_called()
+
+    def test_enrolled_fire_holds_shared_lock_through_dispatch_and_rechecks_pending(self):
+        def dispatch(*args, **kwargs):
+            with consumer.single_flight(self.root / '.factory/fire.lock') as held:
+                self.assertFalse(held, 'installation must not overlap shared dispatch')
+            return subprocess.CompletedProcess([], 0)
+        self.execute.side_effect = dispatch
+        self.assertEqual(consumer.schedule(self.root, ['fire']), 0)
+        self.execute.reset_mock()
+        with patch.object(consumer, 'verify_registry_environment',
+                          side_effect=lambda _: (self.root / consumer.SCHEDULE_INSTALL_PENDING).write_text('{}')):
+            with self.assertRaisesRegex(ValueError, 'installation is incomplete'):
+                consumer.schedule(self.root, ['fire'])
         self.execute.assert_not_called()
 
 

@@ -241,7 +241,10 @@ class HttpOwnershipTests(unittest.TestCase):
         command = self.script("import os,time\nfrom pathlib import Path\n"
             "child=os.fork()\n"
             "if child == 0: os._exit(0)\n"
-            f"Path({str(pid_file)!r}).write_text(str(child))\n"
+            # Publish only complete PID text; existence is the reader's signal.
+            f"pending=Path({str(pid_file.with_suffix('.pending'))!r})\n"
+            "pending.write_text(str(child))\n"
+            f"pending.replace({str(pid_file)!r})\n"
             "time.sleep(60)\n")
         app = HttpApp({'http': {'start': command}})
         try:
