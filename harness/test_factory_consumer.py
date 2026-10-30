@@ -376,6 +376,33 @@ class SharedAdmissionTests(unittest.TestCase):
                     ValueError, '^Shared admission deployment file is invalid$'):
                 consumer._admission_json(self.registry_path)
 
+    def test_enrolled_launchd_changes_preserve_home_wide_legacy_wake_job(self):
+        for action in ('install', 'remove'):
+            with self.subTest(action=action), ExitStack() as stack:
+                stack.enter_context(patch.object(consumer.sys, 'platform', 'darwin'))
+                stack.enter_context(patch.multiple(consumer, read_settings=lambda _: {},
+                    verify_source=lambda _: self.base, cli=lambda *_: ['native']))
+                stack.enter_context(redirect_stdout(io.StringIO()))
+                directory = self.home / 'Library/LaunchAgents'
+                directory.mkdir(parents=True, exist_ok=True)
+                unrelated = directory / 'com.archon.trigger.workflow-wake-unrelated.plist'
+                original = plistlib.dumps({'Label': unrelated.stem,
+                    'ProgramArguments': ['native', 'workflow', 'wake'],
+                    'EnvironmentVariables': {'ARCHON_HOME': str(self.archon)}})
+                unrelated.write_bytes(original)
+                plan = consumer.timer_commands(self.root, 600, include_wake=False,
+                                               consumer_root=self.root)
+                for path, body in plan['launchd'].items():
+                    path.write_text(body)
+                self.execute.reset_mock()
+                self.assertEqual(consumer.schedule(self.root, [action, '--apply']), 0)
+                self.assertTrue(unrelated.is_file(), 'Project timer changes removed a home-wide wake job')
+                self.assertEqual(unrelated.read_bytes(), original)
+                self.assertFalse(any(any(unrelated.stem in str(arg) for arg in call.args[0])
+                                     for call in self.execute.call_args_list))
+                for path in plan['launchd']:
+                    self.assertEqual(path.exists(), action == 'install')
+
     def test_enrolled_timer_removal_matches_install_from_another_worktree(self):
         caller = self.base / 'other-worktree'
         caller.mkdir()

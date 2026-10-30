@@ -1058,10 +1058,13 @@ def remove_launchd_job(path: Path, root: Path) -> None:
     path.unlink(missing_ok=True)
 
 
-def configure_launchd(root: Path, plan: dict, apply: bool, *, remove: bool = False) -> None:
-    # Remove all previous jobs before registering any replacement. An already unloaded
-    # job still has its plist deleted so it cannot return after the next login.
-    paths = list(dict.fromkeys([*legacy_launchd_jobs(root), *plan.get("retire", []), *plan["launchd"]]))
+def configure_launchd(root: Path, plan: dict, apply: bool, *, remove: bool = False,
+                      migrate_legacy: bool = True) -> None:
+    # Enrolled project operations own only the jobs in their exact plan. Home-wide
+    # legacy wake migration belongs to the separately authorized installation cutover.
+    # Preserve the existing migration behavior for unenrolled native schedules.
+    legacy = legacy_launchd_jobs(root) if migrate_legacy else []
+    paths = list(dict.fromkeys([*legacy, *plan.get("retire", []), *plan["launchd"]]))
     for path in paths:
         print(f"{'Removing' if apply else 'Would remove'} launchd job: {path}")
         if apply:
@@ -1435,7 +1438,7 @@ def schedule(root: Path, args: list[str]) -> int:
                       "No default branch is known locally, so every launch asks the remote for it. "
                       "Run `git remote set-head origin --auto` or set base_branch in schedule.json.")
             if "launchd" in plan:
-                configure_launchd(root, plan, apply)
+                configure_launchd(root, plan, apply, migrate_legacy=not bool(admission))
                 return 0
             for task_file, body in plan.get("task_xml", {}).items():
                 print(f"--- {task_file}\n{body}")
@@ -1529,7 +1532,7 @@ def schedule(root: Path, args: list[str]) -> int:
         plan = timer_commands(timer_root, interval, include_wake=not bool(admission),
                               consumer_root=timer_root if admission else None)
         if "launchd" in plan:
-            configure_launchd(root, plan, apply, remove=True)
+            configure_launchd(root, plan, apply, remove=True, migrate_legacy=not bool(admission))
             if apply:
                 config_path.unlink(missing_ok=True)
             return 0
