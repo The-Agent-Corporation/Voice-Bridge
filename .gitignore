@@ -21,3 +21,5 @@ secrets.json
 credentials.json
 node_modules/
 dist/
+.factory/shared-admission.json
+.factory/schedule-install-pending.json
