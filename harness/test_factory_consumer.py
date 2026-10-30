@@ -1,5 +1,6 @@
 """Merging launches require an explicit, valid project merge policy."""
 import importlib.util
+import importlib.machinery
 from contextlib import ExitStack, closing, redirect_stdout
 import hashlib
 import io
@@ -176,6 +177,36 @@ class MergePolicyTests(unittest.TestCase):
                 consumer.trigger_config(self.root, {}, self.root, 600)
 
 
+class LocalBrakeEnvironmentTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix='factory-brake-')
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.environment = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+        subprocess.run(['git', 'init', '-q', str(self.root)], env=self.environment, check=True)
+
+    def test_main_local_brakes_allow_benign_git_environment(self):
+        environment = {**self.environment, 'GIT_ASKPASS': '/unused-helper',
+                       'GIT_EDITOR': '/unused-editor', 'GIT_AUTHOR_NAME': 'Fixture'}
+        with patch.dict(os.environ, environment, clear=True), patch.object(consumer.Path, 'cwd', return_value=self.root), redirect_stdout(io.StringIO()):
+            self.assertEqual(consumer.main(['halt']), 0)
+            self.assertEqual(consumer.main(['pause']), 0)
+        self.assertTrue((self.root / '.factory/STOP').is_file())
+        self.assertTrue((self.root / '.factory/PAUSE').is_file())
+
+    def test_brakes_and_admission_still_reject_repository_redirects(self):
+        for key, value in {'GIT_DIR': str(self.root / '.git'), 'GIT_WORK_TREE': str(self.root),
+                           'GIT_CONFIG_COUNT': '0', 'GIT_CONFIG_PARAMETERS': ''}.items():
+            with self.subTest(key=key), patch.dict(os.environ, {**self.environment, key: value}, clear=True), patch.object(consumer.Path, 'cwd', return_value=self.root):
+                self.assertEqual(consumer.main(['halt']), 1)
+                self.assertEqual(consumer.main(['pause']), 1)
+        with patch.dict(os.environ, {**self.environment, 'GIT_ASKPASS': '/unused-helper'}, clear=True):
+            with self.assertRaisesRegex(ValueError, 'Git environment redirects'):
+                consumer.project_root()
+        self.assertFalse((self.root / '.factory/STOP').exists())
+        self.assertFalse((self.root / '.factory/PAUSE').exists())
+
+
 class SharedAdmissionTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='factory-shared-')
@@ -211,8 +242,9 @@ class SharedAdmissionTests(unittest.TestCase):
         self.addCleanup(stack.close)
         stack.enter_context(patch.object(consumer.Path, 'home', return_value=self.home))
         stack.enter_context(patch.object(consumer, 'default_admission_home', return_value=self.archon))
-        stack.enter_context(patch.dict(os.environ, {'ARCHON_HOME': str(self.archon)}))
-        stack.enter_context(patch.object(consumer, 'shared_root', side_effect=lambda path: Path(path)))
+        environment = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+        stack.enter_context(patch.dict(os.environ, {**environment, 'ARCHON_HOME': str(self.archon)}, clear=True))
+        stack.enter_context(patch.object(consumer, 'shared_root', side_effect=lambda path, **_: Path(path)))
         self.execute = stack.enter_context(patch.object(consumer, 'execute', return_value=subprocess.CompletedProcess([], 0)))
 
     def write_private(self, path, value):
@@ -248,6 +280,50 @@ class SharedAdmissionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'import shadow'):
             consumer.schedule(self.root, ['fire'])
         self.execute.assert_not_called()
+
+    def test_extension_package_shadows_fail_closed_for_each_pinned_module(self):
+        for module in ('factoryctl', 'controls'):
+            package = self.controller_dir / module
+            package.mkdir()
+            for suffix in importlib.machinery.EXTENSION_SUFFIXES:
+                shadow = package / ('__init__' + suffix)
+                shadow.write_bytes(b'inert fixture: never load this extension')
+                with self.subTest(module=module, suffix=suffix), self.assertRaisesRegex(ValueError, 'import shadow'):
+                    consumer.schedule(self.root, ['fire'])
+                shadow.unlink()
+            package.rmdir()
+        self.execute.assert_not_called()
+
+    def test_exact_mapping_does_not_probe_broken_unrelated_repository(self):
+        unrelated = self.base / 'unrelated-nonrepository'
+        unrelated.mkdir()
+        self.config['projects']['unrelated'] = {'registered_root': str(unrelated)}
+        self.save_config()
+        def roots(path, **_):
+            if Path(path) == unrelated:
+                raise ValueError('unrelated repository unavailable')
+            return Path(path)
+        with patch.object(consumer, 'shared_root', side_effect=roots):
+            self.assertEqual(consumer.shared_admission(self.root)['project'], 'voice-bridge')
+            # Missing mapping must still inspect potential aliases and fail closed.
+            self.registry['projects'].clear()
+            self.save_config()
+            with self.assertRaises(ValueError):
+                consumer.shared_admission(self.root)
+
+    def test_controller_directory_links_fail_closed_before_import(self):
+        target = self.base / 'outside-package'
+        target.mkdir()
+        link = self.controller_dir / 'controls'
+        try:
+            link.symlink_to(target, target_is_directory=True)
+        except OSError as error:
+            self.skipTest(f'Directory symlink creation unavailable: {error}')
+        with self.assertRaisesRegex(ValueError, 'import shadow'):
+            consumer.shared_admission(self.root)
+        target.rmdir()
+        with self.assertRaisesRegex(ValueError, 'import shadow'):
+            consumer.shared_admission(self.root)
 
     def test_typed_controller_executes_pinned_source_not_unchecked_bytecode(self):
         module = self.controller_dir / 'controls.py'

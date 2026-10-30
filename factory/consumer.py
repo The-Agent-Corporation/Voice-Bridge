@@ -4,6 +4,7 @@ from __future__ import annotations
 import calendar
 import contextlib
 import hashlib
+import importlib.machinery
 import json
 import os
 import platform
@@ -61,19 +62,26 @@ def checked(argv: list[str], cwd: Path, timeout: int = 180) -> str:
     return result.stdout
 
 
-def verify_git_environment() -> None:
+def verify_git_environment(*, local_brake: bool = False) -> None:
     harmless = {"GIT_PAGER", "GIT_TERMINAL_PROMPT", "GIT_OPTIONAL_LOCKS"}
+    if local_brake:
+        # These do not affect rev-parse repository discovery. Admission keeps
+        # its stricter allowlist; unknown and repository/config overrides refuse.
+        harmless |= {"GIT_ASKPASS", "GIT_EDITOR", "GIT_SEQUENCE_EDITOR",
+                     "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_DATE",
+                     "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "GIT_COMMITTER_DATE",
+                     "GIT_SSH", "GIT_SSH_COMMAND", "GIT_SSH_VARIANT", "GIT_SSL_CAINFO"}
     if any(key.startswith("GIT_") and key not in harmless for key in os.environ):
         raise ValueError("Git environment redirects are unsupported; project identity must be authoritative")
 
 
-def project_root() -> Path:
-    verify_git_environment()
+def project_root(*, local_brake: bool = False) -> Path:
+    verify_git_environment(local_brake=local_brake)
     return Path(checked(["git", "rev-parse", "--show-toplevel"], Path.cwd()).strip()).resolve()
 
 
-def shared_root(root: Path) -> Path:
-    verify_git_environment()
+def shared_root(root: Path, *, local_brake: bool = False) -> Path:
+    verify_git_environment(local_brake=local_brake)
     common = checked(["git", "rev-parse", "--git-common-dir"], root).strip()
     return (root / common).resolve().parent
 
@@ -172,17 +180,20 @@ def shared_admission(root: Path) -> dict | None:
                 raise ValueError()
         except (ValueError, TypeError, KeyError) as error:
             raise ValueError("Invalid shared admission deployment config") from error
-        known = False
-        for value in projects.values():
-            if not isinstance(value, dict):
-                continue
-            for key in ("registered_root", "consumer_root"):
-                candidate = value.get(key)
-                if isinstance(candidate, str) and (candidate == str(shared) or
-                        (Path(candidate).is_dir() and shared_root(Path(candidate)) == shared)):
-                    known = True
         entry = registry["projects"].get(str(shared))
         if entry is None:
+            # Exact mappings are independently validated below. Probe other
+            # configured roots only to detect a missing enrolled mapping; any
+            # unavailable potential alias still refuses rather than falling back.
+            known = False
+            for value in projects.values():
+                if not isinstance(value, dict):
+                    continue
+                for key in ("registered_root", "consumer_root"):
+                    candidate = value.get(key)
+                    if isinstance(candidate, str) and (candidate == str(shared) or
+                            (Path(candidate).is_dir() and shared_root(Path(candidate)) == shared)):
+                        known = True
             if known or (marker and marker["registry"] == str(path)):
                 raise ValueError("Enrolled project mapping is missing; no native fallback")
             continue
@@ -212,8 +223,9 @@ def shared_admission(root: Path) -> dict | None:
                 set(pins) != {item.name for item in controller.parent.glob("*.py")} or controller.name not in pins):
             raise ValueError("Shared controller module inventory changed")
         for item in controller.parent.iterdir():
-            if (item.suffix in {".pyc", ".so", ".pyd"} or
-                    (item.is_dir() and ((item / "__init__.py").exists() or (item / "__init__.pyc").exists()))):
+            if (item.is_symlink() or item.suffix in {".pyc", ".so", ".pyd"} or
+                    (item.is_dir() and any((item / ("__init__" + suffix)).exists()
+                                          for suffix in importlib.machinery.all_suffixes()))):
                 raise ValueError("Shared controller has an unpinned import shadow")
         for name, expected in pins.items():
             if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\.py", name) or not isinstance(expected, str) or not re.fullmatch(r"[a-f0-9]{64}", expected):
@@ -506,7 +518,8 @@ def invoke(root: Path, action: str, args: list[str]) -> int:
     if action not in {"run", "list", "get", "status", "runs", "abandon", "approve", "reject", "respond",
                       "cancel", "resume", "doctor", "halt", "unhalt", "pause", "unpause"}:
         raise ValueError(f"Unknown command '{action}'. Run factory --help for the commands.")
-    stop = shared_root(root) / ".factory/STOP"
+    common_root = shared_root(root, local_brake=True) if action in {"halt", "pause"} else shared_root(root)
+    stop = common_root / ".factory/STOP"
     if action in {"halt", "unhalt"}:
         if args:
             raise ValueError(f"{action} takes no arguments. Cancel an active run by its run ID.")
@@ -523,7 +536,7 @@ def invoke(root: Path, action: str, args: list[str]) -> int:
         # timer instead strands it; halt blocks its continuation by design.
         if args:
             raise ValueError(f"{action} takes no arguments")
-        pause = shared_root(root) / PAUSE
+        pause = common_root / PAUSE
         if action == "pause":
             pause.parent.mkdir(parents=True, exist_ok=True)
             pause.write_text("Operator paused scheduled launches.\n", encoding="utf-8")
@@ -1515,7 +1528,8 @@ def main(argv: list[str] | None = None) -> int:
               "These wrappers do not sandbox raw Archon CLI/API access.")
         return 0
     try:
-        return invoke(project_root(), args[0], args[1:])
+        root = project_root(local_brake=True) if args[0] in {"halt", "pause"} else project_root()
+        return invoke(root, args[0], args[1:])
     except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
         print(f"Factory refused: {error}", file=sys.stderr)
         for note in getattr(error, "__notes__", []):
