@@ -308,11 +308,35 @@ class SharedAdmissionTests(unittest.TestCase):
             return Path(path)
         with patch.object(consumer, 'shared_root', side_effect=roots):
             self.assertEqual(consumer.shared_admission(self.root)['project'], 'voice-bridge')
-            # Missing mapping must still inspect potential aliases and fail closed.
+            # Once an alias proves enrollment, report the missing mapping rather
+            # than probing unrelated repositories and replacing the refusal cause.
             self.registry['projects'].clear()
             self.save_config()
-            with self.assertRaises(ValueError):
+            with self.assertRaisesRegex(ValueError, 'Enrolled project mapping is missing; no native fallback'):
                 consumer.shared_admission(self.root)
+
+    def test_enrolled_host_without_getuid_refuses_cleanly_without_dispatch(self):
+        with patch.object(consumer.os, 'getuid'):
+            del consumer.os.getuid
+            with self.assertRaisesRegex(ValueError, 'POSIX.*no native fallback'):
+                consumer._admission_bytes(self.registry_path)
+            with patch.object(consumer, 'project_root', return_value=self.root), \
+                    patch('sys.stderr', new=io.StringIO()) as error:
+                self.assertEqual(consumer.main(['schedule', 'fire']), 1)
+            self.assertIn('Factory refused:', error.getvalue())
+            self.assertNotIn('Traceback', error.getvalue())
+        self.execute.assert_not_called()
+
+    def test_unenrolled_host_without_getuid_keeps_native_read_only_path(self):
+        self.marker.unlink()
+        self.registry_path.unlink()
+        with patch.object(consumer.os, 'getuid'):
+            del consumer.os.getuid
+            self.assertIsNone(consumer.shared_admission(self.root))
+            with patch.multiple(consumer, read_settings=lambda _: {}, verify_source=lambda _: self.base,
+                                cli=lambda *_: ['native-read']):
+                self.assertEqual(consumer.invoke(self.root, 'get', ['exact-run']), 0)
+        self.assertIn('exact-run', self.execute.call_args.args[0])
 
     def test_controller_directory_links_fail_closed_before_import(self):
         target = self.base / 'outside-package'

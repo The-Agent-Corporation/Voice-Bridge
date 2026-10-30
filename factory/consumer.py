@@ -99,6 +99,8 @@ def read_settings(root: Path) -> dict:
 
 def _admission_bytes(path: Path, *, private: bool = True) -> bytes:
     """Read canonical deployment-owned files without following redirects."""
+    if not hasattr(os, "getuid"):
+        raise ValueError("Shared admission requires POSIX ownership checks; no native fallback")
     if not path.is_absolute() or path.resolve() != path:
         raise ValueError("Shared admission requires canonical paths")
     for parent in path.parents:
@@ -194,6 +196,9 @@ def shared_admission(root: Path) -> dict | None:
                     if isinstance(candidate, str) and (candidate == str(shared) or
                             (Path(candidate).is_dir() and shared_root(Path(candidate)) == shared)):
                         known = True
+                        break
+                if known:
+                    break
             if known or (marker and marker["registry"] == str(path)):
                 raise ValueError("Enrolled project mapping is missing; no native fallback")
             continue
