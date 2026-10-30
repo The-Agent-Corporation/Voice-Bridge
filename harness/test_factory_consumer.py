@@ -218,12 +218,17 @@ class SharedAdmissionTests(unittest.TestCase):
         self.controller_dir = self.base / 'controller'
         for path in (self.root, self.root / '.factory', self.home, self.archon, self.controller_dir):
             path.mkdir(mode=0o700)
+            path.chmod(0o700)
         self.controller = self.controller_dir / 'factoryctl.py'
-        (self.root / 'factory').mkdir()
+        (self.root / 'factory').mkdir(mode=0o700)
+        (self.root / 'factory').chmod(0o700)
         (self.root / 'factory/consumer.py').write_bytes(Path(consumer.__file__).read_bytes())
         (self.root / 'factory/pack.json').write_bytes((consumer.HERE / 'pack.json').read_bytes())
         self.controller.write_text('# controller fixture\n')
         (self.controller_dir / 'controls.py').write_text('# dependency fixture\n')
+        for path in (self.root / 'factory/consumer.py', self.root / 'factory/pack.json',
+                     self.controller, self.controller_dir / 'controls.py'):
+            path.chmod(0o600)
         self.config_path = self.controller_dir / 'controls-config.json'
         self.registry_path = self.archon / consumer.ADMISSION_REGISTRY
         self.config = {'archon_home': str(self.archon), 'projects': {'voice-bridge': {
@@ -316,7 +321,9 @@ class SharedAdmissionTests(unittest.TestCase):
                 consumer.shared_admission(self.root)
 
     def test_enrolled_host_without_getuid_refuses_cleanly_without_dispatch(self):
-        with patch.object(consumer.os, 'getuid'):
+        with patch.object(consumer.os, 'getuid', create=True) as getuid, ExitStack() as cleanup:
+            # patch must find its placeholder when it removes a created attribute.
+            cleanup.callback(setattr, consumer.os, 'getuid', getuid)
             del consumer.os.getuid
             with self.assertRaisesRegex(ValueError, 'POSIX.*no native fallback'):
                 consumer._admission_bytes(self.registry_path)
@@ -330,7 +337,8 @@ class SharedAdmissionTests(unittest.TestCase):
     def test_unenrolled_host_without_getuid_keeps_native_read_only_path(self):
         self.marker.unlink()
         self.registry_path.unlink()
-        with patch.object(consumer.os, 'getuid'):
+        with patch.object(consumer.os, 'getuid', create=True) as getuid, ExitStack() as cleanup:
+            cleanup.callback(setattr, consumer.os, 'getuid', getuid)
             del consumer.os.getuid
             self.assertIsNone(consumer.shared_admission(self.root))
             with patch.multiple(consumer, read_settings=lambda _: {}, verify_source=lambda _: self.base,
