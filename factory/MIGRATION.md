@@ -1,5 +1,62 @@
 # Upgrading the factory
 
+## Projects enrolled in shared Port / Archon admission
+
+Use the installed operator guide and its configured `factoryctl.py` path. Port
+and authorized agents use the same shared admission engine:
+
+```text
+Port / factoryctl -> shared policy and capacity ledger -> native Archon run
+```
+
+For enrolled projects:
+
+1. Pause new intake through the controller before an upgrade. Preserve existing
+   STOP/PAUSE files, command receipts, runtime input paths and native ownership
+   records. Pausing intake does not cancel an existing run.
+2. Adopt reviewed source through the operator's installation procedure. Consumer,
+   pack, source and controller pins must agree. Do not run the unenrolled `init`
+   procedure below to overwrite an enrolled consumer or edit pins to silence a
+   failed check.
+3. Preview `schedule install` before applying an authorized timer change. An
+   enrolled installation targets the verified consumer checkout and installs
+   intake firing only; it does not install a home-wide native wake job or remove
+   unrelated legacy jobs. `schedule remove` uses the trusted enrollment identity
+   to remove that project's planned jobs, including when target files drift.
+4. Verify project/run status, qualification evidence and the intended work item
+   before enabling intake. Use the controller's `resume-intake`; enrolled
+   consumer `unpause` refuses. The controller removes the shared PAUSE file only
+   after its policy checks pass. Human approvals remain separate decisions.
+5. For uncertain commands, inspect the original receipt and reconcile the same
+   request ID. Do not submit a replacement Start, regenerate continuation inputs,
+   approve an old gate, or delete an interrupted dispatch journal to clear a hold.
+
+Consumer home-wide wake is withheld when any project in that Archon home is
+shared-enrolled, including wake requests from unenrolled co-tenants. Governed
+continuations use the installed controller. This is a deliberate conservative
+boundary; do not keep or create a legacy wake job to bypass it.
+
+Rollback order matters: disable the exact enrolled intake timers first, preserve
+journals and owned-run evidence, then restore the reviewed consumer/source and
+matching private pins together. Restoring old consumer code while its timer is
+still enabled can bypass shared admission. A code-only rollback is insufficient.
+Keep intake held until the restored configuration is verified; do not re-enable
+legacy native timers for a project that remains enrolled.
+
+Enrollment and installation-pending files under `.factory/` are private operator
+state, never repository configuration. Keep their owner-only permissions and do
+not commit them. Current shared admission requires POSIX ownership checks;
+Windows refuses safely. A custom home without an account-default enrollment
+anchor, missing passwd entries and historical Linux timer migration require
+separate qualification. Factory wrappers do not confine an operator who can run
+raw Archon commands.
+
+## Unenrolled installations
+
+The remaining instructions apply only to projects without shared enrollment.
+Their two-job native-wake migration and consumer `unpause` do not apply to enrolled
+projects.
+
 Upgrade an installed factory by pulling the factory repository and rerunning
 `python <factory>/bin/factory.py init` from the application repository.
 
@@ -41,7 +98,7 @@ to bypass a failed install. STOP and PAUSE remain unchanged. This protection req
 the updated consumer: legacy native timers and direct native commands bypass it and
 must follow the supervised migration procedure below.
 
-## Scheduled policy refusals
+### Scheduled policy refusals
 
 A merging workflow (including `archon-lifecycle`) needs valid explicit
 `required_checks` and `protected_paths` declarations in `harness/harness.config.json`.
@@ -52,7 +109,7 @@ current effective policy. Unchanged valid policies continue to admit launches.
 Windowless timers report refusals in `.factory/schedule.log` and exit nonzero;
 `status` lists native triggers and is not proof of current policy readiness.
 
-## macOS timer migration
+### macOS timer migration
 
 1. Run `python factory/consumer.py halt` before upgrading the installed consumer.
    Older native timers bypassed this marker; unload their exact LaunchAgent before doing
@@ -93,7 +150,7 @@ in its user-scope Archon env file, and no project-scope Archon env file. This ga
 did not affect that observed pilot configuration; install the corrected consumer
 before adding any project-specific registry configuration.
 
-## Per-invocation runtime scenarios
+### Per-invocation runtime scenarios
 
 A lifecycle schedule can opt into caller-owned bindings with a `runtime_binding`
 object in `.factory/schedule.json`:

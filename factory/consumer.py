@@ -4,6 +4,7 @@ from __future__ import annotations
 import calendar
 import contextlib
 import hashlib
+import importlib.machinery
 import json
 import os
 import platform
@@ -11,8 +12,10 @@ import plistlib
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -24,6 +27,8 @@ ENTRY = "packages/cli/src/cli.ts"
 SCHEDULE = ".factory/schedule.json"
 TRIGGER = ".factory/trigger.json"
 PAUSE = ".factory/PAUSE"
+ADMISSION_MARKER = ".factory/shared-admission.json"
+ADMISSION_REGISTRY = "factory-controller.json"
 # The shared workflows that carry a merge gate and accept a declared required-check policy.
 MERGING_WORKFLOWS = {"archon-lifecycle", "archon-merge-queue"}
 
@@ -57,11 +62,26 @@ def checked(argv: list[str], cwd: Path, timeout: int = 180) -> str:
     return result.stdout
 
 
-def project_root() -> Path:
+def verify_git_environment(*, local_brake: bool = False) -> None:
+    harmless = {"GIT_PAGER", "GIT_TERMINAL_PROMPT", "GIT_OPTIONAL_LOCKS"}
+    if local_brake:
+        # These do not affect rev-parse repository discovery. Admission keeps
+        # its stricter allowlist; unknown and repository/config overrides refuse.
+        harmless |= {"GIT_ASKPASS", "GIT_EDITOR", "GIT_SEQUENCE_EDITOR",
+                     "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_DATE",
+                     "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "GIT_COMMITTER_DATE",
+                     "GIT_SSH", "GIT_SSH_COMMAND", "GIT_SSH_VARIANT", "GIT_SSL_CAINFO"}
+    if any(key.startswith("GIT_") and key not in harmless for key in os.environ):
+        raise ValueError("Git environment redirects are unsupported; project identity must be authoritative")
+
+
+def project_root(*, local_brake: bool = False) -> Path:
+    verify_git_environment(local_brake=local_brake)
     return Path(checked(["git", "rev-parse", "--show-toplevel"], Path.cwd()).strip()).resolve()
 
 
-def shared_root(root: Path) -> Path:
+def shared_root(root: Path, *, local_brake: bool = False) -> Path:
+    verify_git_environment(local_brake=local_brake)
     common = checked(["git", "rev-parse", "--git-common-dir"], root).strip()
     return (root / common).resolve().parent
 
@@ -75,6 +95,165 @@ def read_settings(root: Path) -> dict:
     if not isinstance(settings, dict):
         raise ValueError(f"Invalid consumer settings: {path}")
     return settings
+
+
+def _admission_bytes(path: Path, *, private: bool = True) -> bytes:
+    """Read canonical deployment-owned files without following redirects."""
+    if not hasattr(os, "getuid"):
+        raise ValueError("Shared admission requires POSIX ownership checks; no native fallback")
+    if not path.is_absolute() or path.resolve() != path:
+        raise ValueError("Shared admission requires canonical paths")
+    for parent in path.parents:
+        if parent.is_symlink():
+            raise ValueError("Shared admission path contains a symlink")
+        info = parent.stat()
+        sticky_root = info.st_uid == 0 and bool(info.st_mode & stat.S_ISVTX)
+        if info.st_uid not in {0, os.getuid()} or (info.st_mode & 0o022 and not sticky_root):
+            raise ValueError("Shared admission parent directory is not owner-controlled")
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.getuid()
+                or info.st_mode & (0o077 if private else 0o022)):
+            raise ValueError("Shared admission requires owner-controlled files")
+        data = stream.read(2 * 1024 * 1024 + 1)
+    if len(data) > 2 * 1024 * 1024:
+        raise ValueError("Shared admission file exceeds its size bound")
+    return data
+
+
+def _admission_json(path: Path) -> dict:
+    data = _admission_bytes(path)
+    try:
+        value = json.loads(data)
+    except (UnicodeError, ValueError) as error:
+        raise ValueError("Shared admission deployment file is invalid") from error
+    if not isinstance(value, dict):
+        raise ValueError("Shared admission deployment file must be an object")
+    return value
+
+
+def default_admission_home() -> Path:
+    # HOME and ARCHON_HOME are caller environment, not an enrollment opt-out.
+    if hasattr(os, "getuid"):
+        import pwd
+        return Path(pwd.getpwuid(os.getuid()).pw_dir).resolve() / ".archon"
+    return Path.home().resolve() / ".archon"
+
+
+def shared_admission(root: Path) -> dict | None:
+    """Enforce enrolled wrappers; raw Archon CLI/API remains outside this boundary.
+
+    The private home registry is authoritative. A second project marker keeps
+    a missing registry fail-closed; a matching registry also enforces enrollment
+    when the marker is missing. Changing ARCHON_HOME cannot hide the default
+    registry. Neither caller arguments nor project schedule flags select a controller.
+    """
+    verify_git_environment()
+    shared = shared_root(root)
+    marker_path = shared / ADMISSION_MARKER
+    marker = None
+    paths = {default_admission_home() / ADMISSION_REGISTRY,
+             archon_home() / ADMISSION_REGISTRY}
+    if marker_path.exists() or marker_path.is_symlink():
+        marker = _admission_json(marker_path)
+        if (set(marker) != {"schema", "registry", "project"} or marker["schema"] != "factory-enrolled-v1"
+                or not isinstance(marker["registry"], str) or not isinstance(marker["project"], str)):
+            raise ValueError("Invalid shared admission enrollment marker")
+        paths.add(Path(marker["registry"]))
+        if not Path(marker["registry"]).exists():
+            raise ValueError("Enrolled controller registry is missing; no native fallback")
+    found = []
+    for path in sorted(paths):
+        if not path.exists() and not path.is_symlink():
+            continue
+        registry = _admission_json(path)
+        if (set(registry) != {"schema", "controller", "config", "config_sha256", "controller_files", "projects"}
+                or registry["schema"] != "factory-controller-v1" or not isinstance(registry["projects"], dict)
+                or not all(isinstance(registry[key], str) and registry[key] for key in ("controller", "config", "config_sha256"))):
+            raise ValueError("Invalid shared admission controller registry")
+        config_path = Path(registry["config"])
+        config_bytes = _admission_bytes(config_path)
+        if hashlib.sha256(config_bytes).hexdigest() != registry["config_sha256"]:
+            raise ValueError("Shared admission deployment config pin changed")
+        try:
+            config = json.loads(config_bytes)
+            projects = config["projects"]
+            if not isinstance(projects, dict):
+                raise ValueError()
+        except (ValueError, TypeError, KeyError) as error:
+            raise ValueError("Invalid shared admission deployment config") from error
+        entry = registry["projects"].get(str(shared))
+        if entry is None:
+            # Exact mappings are independently validated below. Probe other
+            # configured roots only to detect a missing enrolled mapping; any
+            # unavailable potential alias still refuses rather than falling back.
+            known = False
+            for value in projects.values():
+                if not isinstance(value, dict):
+                    continue
+                for key in ("registered_root", "consumer_root"):
+                    candidate = value.get(key)
+                    if isinstance(candidate, str) and (candidate == str(shared) or
+                            (Path(candidate).is_dir() and shared_root(Path(candidate)) == shared)):
+                        known = True
+                        break
+                if known:
+                    break
+            if known or (marker and marker["registry"] == str(path)):
+                raise ValueError("Enrolled project mapping is missing; no native fallback")
+            continue
+        if (not isinstance(entry, dict) or set(entry) != {"project", "source_root", "source_revision", "consumer_sha256", "pack_sha256"}
+                or not isinstance(entry["project"], str) or entry["project"] not in projects):
+            raise ValueError("Invalid enrolled project mapping")
+        if marker and (marker["registry"] != str(path) or marker["project"] != entry["project"]):
+            raise ValueError("Shared admission enrollment conflicts with registry")
+        project = projects[entry["project"]]
+        if (not isinstance(project, dict) or project.get("identifier") != entry["project"] or
+                any(project.get(key) != entry[key] for key in ("source_root", "source_revision", "consumer_sha256", "pack_sha256")) or
+                any(not isinstance(project.get(key), str) for key in ("registered_root", "consumer_root")) or
+                any(shared_root(Path(project[key])) != shared for key in ("registered_root", "consumer_root"))):
+            raise ValueError("Shared admission project identity or source pins changed")
+        if (hashlib.sha256(_admission_bytes(Path(__file__).resolve(), private=False)).hexdigest() != entry["consumer_sha256"] or
+                hashlib.sha256(_admission_bytes(HERE / "pack.json", private=False)).hexdigest() != entry["pack_sha256"]):
+            raise ValueError("Enrolled consumer or pack pin changed")
+        home_value = config.get("archon_home", str(Path.home() / ".archon"))
+        if not isinstance(home_value, str):
+            raise ValueError("Invalid shared admission Archon home")
+        configured_home = Path(home_value).expanduser().resolve()
+        if path != configured_home / ADMISSION_REGISTRY or archon_home() != configured_home:
+            raise ValueError("Shared admission Archon home changed; no native fallback")
+        controller = Path(registry["controller"])
+        pins = registry["controller_files"]
+        if (controller.name != "factoryctl.py" or not isinstance(pins, dict) or
+                set(pins) != {item.name for item in controller.parent.glob("*.py")} or controller.name not in pins):
+            raise ValueError("Shared controller module inventory changed")
+        for item in controller.parent.iterdir():
+            if (item.is_symlink() or item.suffix in {".pyc", ".so", ".pyd"} or
+                    (item.is_dir() and any((item / ("__init__" + suffix)).exists()
+                                          for suffix in importlib.machinery.all_suffixes()))):
+                raise ValueError("Shared controller has an unpinned import shadow")
+        for name, expected in pins.items():
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\.py", name) or not isinstance(expected, str) or not re.fullmatch(r"[a-f0-9]{64}", expected):
+                raise ValueError("Invalid shared controller module pin")
+            if hashlib.sha256(_admission_bytes(controller.parent / name, private=False)).hexdigest() != expected:
+                raise ValueError("Shared controller module pin changed")
+        found.append({"controller": str(controller), "config": str(config_path), "project": entry["project"],
+                      "grant": project.get("schedule"), "registry": str(path),
+                      "consumer_root": project["consumer_root"],
+                      "consumer_sha256": entry["consumer_sha256"], "pack_sha256": entry["pack_sha256"]})
+    if len(found) > 1 or (marker and not found):
+        raise ValueError("Shared admission registry is missing or ambiguous; no native fallback")
+    return found[0] if found else None
+
+
+def shared_command(binding: dict, command: str, cache: str, *args: str) -> list[str]:
+    # The controller uses stdlib and pinned local sources only. Ignore site and
+    # environment hooks; an empty private cache plus -B prevents stale bytecode
+    # from substituting for the source bytes whose digests were verified.
+    return [sys.executable, "-E", "-s", "-S", "-B", "-X", f"pycache_prefix={cache}",
+            binding["controller"], "--config", binding["config"],
+            command, binding["project"], *args]
 
 
 def verify_source(settings: dict) -> Path:
@@ -310,6 +489,18 @@ def with_default_inputs(name: str, args: list[str], options: list[str], root: Pa
 
 def invoke(root: Path, action: str, args: list[str]) -> int:
     args = list(args)
+    binding = None if action in {"halt", "pause"} else shared_admission(root)
+    if binding:
+        verify_registry_environment(root)
+    if binding and action in {"run", "resume", "cancel", "abandon", "unpause", "approve", "reject", "respond"}:
+        if action in {"approve", "reject", "respond"}:
+            raise ValueError("Enrolled human-gate continuation is withheld until shared capacity admission is supported. "
+                             f"Keep the gate pending; inspect with factoryctl run {binding['project']} RUN_ID. "
+                             "A human decision cannot bypass admission.")
+        command = {"run": "start", "resume": "resume-run", "cancel": "cancel", "abandon": "abandon-run", "unpause": "resume-intake"}[action]
+        target = " ISSUE_URL" if action == "run" else ("" if action == "unpause" else " RUN_ID")
+        raise ValueError(f"Enrolled execution requires factoryctl {command} {binding['project']}{target} "
+                         "--request-id STABLE_ID --authorization-ref USER_INSTRUCTION; no native fallback")
     runtime_config = None
     options = args[:args.index("--")] if "--" in args else args[:]
     runtime_flags = [a for a in options if a.split("=", 1)[0] == "--runtime-host"]
@@ -335,7 +526,8 @@ def invoke(root: Path, action: str, args: list[str]) -> int:
     if action not in {"run", "list", "get", "status", "runs", "abandon", "approve", "reject", "respond",
                       "cancel", "resume", "doctor", "halt", "unhalt", "pause", "unpause"}:
         raise ValueError(f"Unknown command '{action}'. Run factory --help for the commands.")
-    stop = shared_root(root) / ".factory/STOP"
+    common_root = shared_root(root, local_brake=True) if action in {"halt", "pause"} else shared_root(root)
+    stop = common_root / ".factory/STOP"
     if action in {"halt", "unhalt"}:
         if args:
             raise ValueError(f"{action} takes no arguments. Cancel an active run by its run ID.")
@@ -352,13 +544,13 @@ def invoke(root: Path, action: str, args: list[str]) -> int:
         # timer instead strands it; halt blocks its continuation by design.
         if args:
             raise ValueError(f"{action} takes no arguments")
-        pause = shared_root(root) / PAUSE
+        pause = common_root / PAUSE
         if action == "pause":
             pause.parent.mkdir(parents=True, exist_ok=True)
-            pause.write_text("Operator paused scheduled launches; wakes continue.\n", encoding="utf-8")
+            pause.write_text("Operator paused scheduled launches.\n", encoding="utf-8")
         else:
             pause.unlink(missing_ok=True)
-        print("Scheduled launches " + ("paused. The timer still wakes active runs; explicit runs still launch."
+        print("Scheduled launches " + ("paused. Active runs remain unchanged."
                                        if action == "pause" else "resumed."))
         return 0
     for arg in args:
@@ -597,6 +789,8 @@ def _binding_receipt(raw: str, config: dict) -> dict:
 def dispatch_bound_trigger(root: Path, settings: dict, source: Path, config_path: Path,
                            options: dict, write) -> int:
     """Called under fire.lock. Never replay a dispatch with an unknown outcome."""
+    if shared_admission(root):
+        raise ValueError("Enrolled runtime dispatch requires factoryctl schedule-tick; no native fallback")
     directory = Path(options["invocation_root"])
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     _private_path(directory, directory=True)
@@ -756,7 +950,16 @@ def _systemd_word(value: str) -> str:
     return json.dumps(value.replace("%", "%%"), ensure_ascii=False)
 
 
-def timer_commands(root: Path, interval: int) -> dict:
+def verified_timer_root(admission: dict) -> Path:
+    root = Path(admission["consumer_root"])
+    for name, key in (("consumer.py", "consumer_sha256"), ("pack.json", "pack_sha256")):
+        if hashlib.sha256(_admission_bytes(root / "factory" / name, private=False)).hexdigest() != admission[key]:
+            raise ValueError("Enrolled timer consumer or pack pin changed")
+    return root
+
+
+def timer_commands(root: Path, interval: int, *, include_wake: bool = True,
+                   consumer_root: Path | None = None) -> dict:
     """Host schedulers invoke the consumer so STOP/PAUSE are checked before Archon."""
     fire = [sys.executable, str(root / "factory/consumer.py"), "schedule", "fire"]
     name = "ArchonFactory-" + re.sub(r"[^A-Za-z0-9-]", "-", root.name)
@@ -774,20 +977,21 @@ def timer_commands(root: Path, interval: int) -> dict:
                 "remove": [["schtasks", "/Delete", "/TN", name, "/F"]]}
     if sys.platform == "darwin":
         root = shared_root(root)
+        execution_root = consumer_root if consumer_root is not None else root
         identity = hashlib.sha256(str(root).encode()).hexdigest()
         directory = Path.home() / "Library/LaunchAgents"
         domain = f"gui/{os.getuid()}"
         jobs = {}
         # A separate wake keeps CI continuations responsive while a fire is running.
         # Both paths check STOP; wake intentionally ignores PAUSE. No run at install.
-        for action, seconds in (("fire", interval), ("wake", 60)):
+        for action, seconds in ((("fire", interval), ("wake", 60)) if include_wake else (("fire", interval),)):
             label = f"com.archon.factory.{identity}.{action}"
             path = directory / f"{label}.plist"
             jobs[path] = plistlib.dumps({
                 "Label": label,
-                "ProgramArguments": [sys.executable, str(root / "factory/consumer.py"),
+                "ProgramArguments": [sys.executable, str(execution_root / "factory/consumer.py"),
                                      "schedule", action],
-                "WorkingDirectory": str(root),
+                "WorkingDirectory": str(execution_root),
                 "EnvironmentVariables": {"ARCHON_HOME": str(archon_home().resolve()),
                                          "PATH": os.environ.get("PATH", "")},
                 "StartInterval": seconds, "RunAtLoad": False,
@@ -795,6 +999,7 @@ def timer_commands(root: Path, interval: int) -> dict:
                 "StandardErrorPath": str(root / ".factory/schedule.log"),
             }, sort_keys=True).decode()
         return {"launchd": jobs,
+                "retire": [] if include_wake else [directory / f"com.archon.factory.{identity}.wake.plist"],
                 "install": [["/bin/launchctl", "bootstrap", domain, str(path)] for path in jobs],
                 "remove": [["/bin/launchctl", "bootout", f"{domain}/{path.stem}"] for path in jobs]}
     unit = name.lower()
@@ -853,10 +1058,13 @@ def remove_launchd_job(path: Path, root: Path) -> None:
     path.unlink(missing_ok=True)
 
 
-def configure_launchd(root: Path, plan: dict, apply: bool, *, remove: bool = False) -> None:
-    # Remove all previous jobs before registering any replacement. An already unloaded
-    # job still has its plist deleted so it cannot return after the next login.
-    paths = list(dict.fromkeys([*legacy_launchd_jobs(root), *plan["launchd"]]))
+def configure_launchd(root: Path, plan: dict, apply: bool, *, remove: bool = False,
+                      migrate_legacy: bool = True) -> None:
+    # Enrolled project operations own only the jobs in their exact plan. Home-wide
+    # legacy wake migration belongs to the separately authorized installation cutover.
+    # Preserve the existing migration behavior for unenrolled native schedules.
+    legacy = legacy_launchd_jobs(root) if migrate_legacy else []
+    paths = list(dict.fromkeys([*legacy, *plan.get("retire", []), *plan["launchd"]]))
     for path in paths:
         print(f"{'Removing' if apply else 'Would remove'} launchd job: {path}")
         if apply:
@@ -975,6 +1183,9 @@ def wake_allowed(root: Path, source: Path, write) -> bool:
         if shared_root(root) not in roots:
             raise ValueError("this project is absent from the registry")
         for registered_root in sorted(roots):
+            if shared_admission(registered_root):
+                write("Global wake withheld: enrolled roots require exact shared continuation admission.\n")
+                return False
             if (registered_root / ".factory/STOP").exists():
                 write(f"Global wake withheld: STOP is set in {registered_root}.\n")
                 return False
@@ -986,6 +1197,9 @@ def wake_allowed(root: Path, source: Path, write) -> bool:
 def sweep_stuck(root: Path, settings: dict, source: Path, runs: list[dict], write) -> set[str]:
     """Abandon runs whose launch failed before they started. Such a run stays `pending`
     with its slot held until someone abandons it; its launch log ends in the error."""
+    if shared_admission(root):
+        write("Automatic abandonment withheld: inspect the exact run with factoryctl.\n")
+        return set()
     swept = set()
     for run in runs:
         if run.get("status") != "pending" or not isinstance(run.get("id"), str):
@@ -1133,6 +1347,34 @@ def launch_decision(root: Path, settings: dict, source: Path, write) -> bool:
 def schedule(root: Path, args: list[str]) -> int:
     action = args[0] if args else ""
     flags = args[1:]
+    admission = shared_admission(root)
+    if admission and action in {"fire", "wake", "status"}:
+        if flags:
+            raise ValueError("Enrolled schedule operations accept no native arguments or target")
+        if action == "wake":
+            raise ValueError("Enrolled global wake is withheld pending exact shared continuation admission")
+        shared = shared_root(root)
+        lock = single_flight(shared / ".factory/fire.lock") if action == "fire" else contextlib.nullcontext(True)
+        with lock as held:
+            if not held:
+                print("Shared launch withheld: another launch or installation owns the fire lock.", file=sys.stderr)
+                return 0
+            # Installation uses this same common-root lock. Keep it until the
+            # controller returns, and check durable guards after fresh binding reads.
+            verify_registry_environment(root)
+            if shared_admission(root) != admission:
+                raise ValueError("Shared admission binding changed before dispatch")
+            if action == "fire":
+                for marker in (".factory/STOP", PAUSE):
+                    if (shared / marker).exists() or (shared / marker).is_symlink():
+                        print("Scheduled launch withheld by local STOP/PAUSE.", file=sys.stderr)
+                        return 0
+                pending = shared / SCHEDULE_INSTALL_PENDING
+                if pending.exists() or pending.is_symlink():
+                    raise ValueError("Schedule installation is incomplete; shared launch withheld")
+            with tempfile.TemporaryDirectory(prefix="factory-controller-cache-") as cache:
+                return execute(shared_command(admission, "schedule-tick" if action == "fire" else "status", cache),
+                               root, capture=False, timeout=None).returncode
     apply = "--apply" in flags
     interval = 300
     if "--interval" in flags:
@@ -1159,22 +1401,44 @@ def schedule(root: Path, args: list[str]) -> int:
         print("Exact native receipt reconciled; no launch was repeated.")
         return 0
     if action == "install":
-        config = trigger_config(root, settings, source, interval)
-        plan = timer_commands(root, interval)
+        if admission:
+            grant = admission["grant"]
+            if (not isinstance(grant, dict) or type(grant.get("interval_seconds")) is not int
+                    or not 60 <= grant["interval_seconds"] <= 86400):
+                raise ValueError("Enrolled timer requires its deployment-owned schedule grant")
+            if "--interval" in flags and interval != grant["interval_seconds"]:
+                raise ValueError("Enrolled timer interval is owned by its schedule grant")
+            interval = grant["interval_seconds"]
+            schedule_path = shared_root(root) / SCHEDULE
+            local_schedule = json.loads(schedule_path.read_text()) if schedule_path.exists() else {}
+            if not isinstance(local_schedule, dict) or type(local_schedule.get("parallel", 1)) is not int or local_schedule.get("parallel", 1) != 1:
+                raise ValueError("Enrolled schedules require exactly one project slot")
+            config = None
+            timer_root = verified_timer_root(admission)
+            plan = timer_commands(timer_root, interval, include_wake=False, consumer_root=timer_root)
+        else:
+            config = trigger_config(root, settings, source, interval)
+            plan = timer_commands(root, interval)
         with schedule_install_guard(root, apply):
-            binding_text = json.dumps(config, indent=2) + "\n"
-            if apply:
-                config_path.parent.mkdir(parents=True, exist_ok=True)
-                _binding_write(config_path, config)
-                print(f"Wrote {config_path} (Archon trigger binding for {config['binding']['launch']['workflowName']}).")
+            if admission:
+                if shared_admission(root) != admission:
+                    raise ValueError("Shared admission binding changed during timer installation")
+                verified_timer_root(admission)
+                print(f"Timer uses factoryctl schedule-tick {admission['project']}; existing STOP/PAUSE are preserved. No global wake.")
             else:
-                print(f"Would write {config_path}:\n{binding_text}")
-            base = config["binding"]["launch"]["isolation"].get("baseOverride")
-            print(f"Laps start from {base}." if base else
-                  "No default branch is known locally, so every launch asks the remote for it. "
-                  "Run `git remote set-head origin --auto` or set base_branch in schedule.json.")
+                binding_text = json.dumps(config, indent=2) + "\n"
+                if apply:
+                    config_path.parent.mkdir(parents=True, exist_ok=True)
+                    _binding_write(config_path, config)
+                    print(f"Wrote {config_path} (Archon trigger binding for {config['binding']['launch']['workflowName']}).")
+                else:
+                    print(f"Would write {config_path}:\n{binding_text}")
+                base = config["binding"]["launch"]["isolation"].get("baseOverride")
+                print(f"Laps start from {base}." if base else
+                      "No default branch is known locally, so every launch asks the remote for it. "
+                      "Run `git remote set-head origin --auto` or set base_branch in schedule.json.")
             if "launchd" in plan:
-                configure_launchd(root, plan, apply)
+                configure_launchd(root, plan, apply, migrate_legacy=not bool(admission))
                 return 0
             for task_file, body in plan.get("task_xml", {}).items():
                 print(f"--- {task_file}\n{body}")
@@ -1260,9 +1524,15 @@ def schedule(root: Path, args: list[str]) -> int:
                 log.close()
         return fired or woken
     if action == "remove":
-        plan = timer_commands(root, interval)
+        # Enrollment can bind a different worktree than the caller. Remove the
+        # same scheduler identity that installation selected on every platform.
+        # Cleanup derives only the scheduler identity from trusted admission;
+        # it never executes the enrolled target or installs its changed files.
+        timer_root = Path(admission["consumer_root"]) if admission else root
+        plan = timer_commands(timer_root, interval, include_wake=not bool(admission),
+                              consumer_root=timer_root if admission else None)
         if "launchd" in plan:
-            configure_launchd(root, plan, apply, remove=True)
+            configure_launchd(root, plan, apply, remove=True, migrate_legacy=not bool(admission))
             if apply:
                 config_path.unlink(missing_ok=True)
             return 0
@@ -1289,10 +1559,14 @@ def main(argv: list[str] | None = None) -> int:
               "factory list | doctor | status | runs | get <run-id>\n"
               "factory approve | reject | respond | cancel | resume | abandon <run-id>\n"
               "factory halt | unhalt (local launch brake only)\n"
-              "factory pause | unpause (stop scheduled launches; the timer keeps waking active runs)")
+              "factory pause | unpause (stop/resume scheduled launches)\n"
+              "Enrolled projects: schedule fire uses the shared controller; manual launches use factoryctl.\n"
+              "Enrolled global wake and human-gate continuation remain withheld pending exact shared admission.\n"
+              "These wrappers do not sandbox raw Archon CLI/API access.")
         return 0
     try:
-        return invoke(project_root(), args[0], args[1:])
+        root = project_root(local_brake=True) if args[0] in {"halt", "pause"} else project_root()
+        return invoke(root, args[0], args[1:])
     except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
         print(f"Factory refused: {error}", file=sys.stderr)
         for note in getattr(error, "__notes__", []):

@@ -21,9 +21,20 @@ SPEC.loader.exec_module(consumer)
 
 
 class ScheduleInstallTests(unittest.TestCase):
+    def test_git_hook_environment_is_isolated_and_restored(self):
+        inherited = {'GIT_DIR': '/unrelated-hook.git', 'GIT_INDEX_FILE': '/unrelated-index'}
+        with patch.dict(os.environ, inherited):
+            with self.project() as (root, _, commands, __):
+                self.assertEqual(consumer.schedule(root, ['install']), 0)
+                self.assertEqual(commands, [])
+            self.assertEqual({key: os.environ[key] for key in inherited}, inherited)
+
     @contextmanager
     def project(self, platform='linux'):
         with tempfile.TemporaryDirectory(prefix='factory-install-') as folder, ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ,
+                {key: value for key, value in os.environ.items() if not key.startswith('GIT_')
+                 and key not in {'DATABASE_URL', 'ARCHON_DOCKER', 'WORKSPACE_PATH'}}, clear=True))
             root = Path(folder) / 'project'
             root.mkdir()
             home = Path(folder) / 'home'
@@ -39,6 +50,7 @@ class ScheduleInstallTests(unittest.TestCase):
             stack.enter_context(patch.multiple(consumer, read_settings=lambda _: {},
                 verify_source=lambda _: root, shared_root=lambda _: root,
                 cli=lambda *_: ['native'], archon_home=lambda: home,
+                default_admission_home=lambda: home,
                 discover=lambda *_: {'archon-lifecycle': root},
                 repository_slug=lambda _: 'owner/repository', whoami=lambda *_: 'operator',
                 base_branch=lambda *_: 'main'))

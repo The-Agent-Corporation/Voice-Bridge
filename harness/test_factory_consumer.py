@@ -1,7 +1,16 @@
 """Merging launches require an explicit, valid project merge policy."""
 import importlib.util
+import importlib.machinery
+from contextlib import ExitStack, closing, redirect_stdout
+import hashlib
+import io
 import json
+import os
+import plistlib
+import py_compile
 from pathlib import Path
+import sqlite3
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -166,6 +175,566 @@ class MergePolicyTests(unittest.TestCase):
                                    base_branch=lambda *_: 'main'), \
                     self.assertRaisesRegex(ValueError, 'required_checks'):
                 consumer.trigger_config(self.root, {}, self.root, 600)
+
+
+class LocalBrakeEnvironmentTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix='factory-brake-')
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.environment = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+        subprocess.run(['git', 'init', '-q', str(self.root)], env=self.environment, check=True)
+
+    def test_main_local_brakes_allow_benign_git_environment(self):
+        environment = {**self.environment, 'GIT_ASKPASS': '/unused-helper',
+                       'GIT_EDITOR': '/unused-editor', 'GIT_AUTHOR_NAME': 'Fixture'}
+        with patch.dict(os.environ, environment, clear=True), patch.object(consumer.Path, 'cwd', return_value=self.root), redirect_stdout(io.StringIO()):
+            self.assertEqual(consumer.main(['halt']), 0)
+            self.assertEqual(consumer.main(['pause']), 0)
+        self.assertTrue((self.root / '.factory/STOP').is_file())
+        self.assertTrue((self.root / '.factory/PAUSE').is_file())
+
+    def test_brakes_and_admission_still_reject_repository_redirects(self):
+        for key, value in {'GIT_DIR': str(self.root / '.git'), 'GIT_WORK_TREE': str(self.root),
+                           'GIT_CONFIG_COUNT': '0', 'GIT_CONFIG_PARAMETERS': ''}.items():
+            with self.subTest(key=key), patch.dict(os.environ, {**self.environment, key: value}, clear=True), patch.object(consumer.Path, 'cwd', return_value=self.root):
+                self.assertEqual(consumer.main(['halt']), 1)
+                self.assertEqual(consumer.main(['pause']), 1)
+        with patch.dict(os.environ, {**self.environment, 'GIT_ASKPASS': '/unused-helper'}, clear=True):
+            with self.assertRaisesRegex(ValueError, 'Git environment redirects'):
+                consumer.project_root()
+        self.assertFalse((self.root / '.factory/STOP').exists())
+        self.assertFalse((self.root / '.factory/PAUSE').exists())
+
+
+class SharedAdmissionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='factory-shared-')
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name).resolve()
+        self.root = self.base / 'project'
+        self.home = self.base / 'home'
+        self.archon = self.home / '.archon'
+        self.controller_dir = self.base / 'controller'
+        for path in (self.root, self.root / '.factory', self.home, self.archon, self.controller_dir):
+            path.mkdir(mode=0o700)
+            path.chmod(0o700)
+        self.controller = self.controller_dir / 'factoryctl.py'
+        (self.root / 'factory').mkdir(mode=0o700)
+        (self.root / 'factory').chmod(0o700)
+        (self.root / 'factory/consumer.py').write_bytes(Path(consumer.__file__).read_bytes())
+        (self.root / 'factory/pack.json').write_bytes((consumer.HERE / 'pack.json').read_bytes())
+        self.controller.write_text('# controller fixture\n')
+        (self.controller_dir / 'controls.py').write_text('# dependency fixture\n')
+        for path in (self.root / 'factory/consumer.py', self.root / 'factory/pack.json',
+                     self.controller, self.controller_dir / 'controls.py'):
+            path.chmod(0o600)
+        self.config_path = self.controller_dir / 'controls-config.json'
+        self.registry_path = self.archon / consumer.ADMISSION_REGISTRY
+        self.config = {'archon_home': str(self.archon), 'projects': {'voice-bridge': {
+            'identifier': 'voice-bridge', 'registered_root': str(self.root), 'consumer_root': str(self.root),
+            'source_root': str(self.base / ('a' * 40)), 'source_revision': 'a' * 40,
+            'consumer_sha256': hashlib.sha256(Path(consumer.__file__).read_bytes()).hexdigest(),
+            'pack_sha256': hashlib.sha256((consumer.HERE / 'pack.json').read_bytes()).hexdigest(),
+            'schedule': {'interval_seconds': 600}}}}
+        project = self.config['projects']['voice-bridge']
+        self.registry = {'schema': 'factory-controller-v1', 'controller': str(self.controller),
+            'config': str(self.config_path), 'config_sha256': '',
+            'controller_files': {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in self.controller_dir.glob('*.py')},
+            'projects': {str(self.root): {'project': 'voice-bridge', **{key: project[key] for key in
+                ('source_root', 'source_revision', 'consumer_sha256', 'pack_sha256')}}}}
+        self.save_config()
+        self.marker = self.root / consumer.ADMISSION_MARKER
+        self.write_private(self.marker, {'schema': 'factory-enrolled-v1', 'registry': str(self.registry_path), 'project': 'voice-bridge'})
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        # Keep the loaded wrapper's pins independent from checkout permissions
+        # and from the timer worktree, which tests deliberately mutate separately.
+        self.loaded_factory = self.base / 'loaded-factory'
+        self.loaded_factory.mkdir(mode=0o700)
+        self.loaded_factory.chmod(0o700)
+        for name in ('consumer.py', 'pack.json'):
+            destination = self.loaded_factory / name
+            destination.write_bytes((self.root / 'factory' / name).read_bytes())
+            destination.chmod(0o600)
+        stack.enter_context(patch.object(consumer, '__file__', str(self.loaded_factory / 'consumer.py')))
+        stack.enter_context(patch.object(consumer, 'HERE', self.loaded_factory))
+        stack.enter_context(patch.object(consumer.Path, 'home', return_value=self.home))
+        stack.enter_context(patch.object(consumer, 'default_admission_home', return_value=self.archon))
+        environment = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')
+                       and key not in {'DATABASE_URL', 'ARCHON_DOCKER', 'WORKSPACE_PATH'}}
+        stack.enter_context(patch.dict(os.environ, {**environment, 'ARCHON_HOME': str(self.archon)}, clear=True))
+        stack.enter_context(patch.object(consumer, 'shared_root', side_effect=lambda path, **_: Path(path)))
+        self.execute = stack.enter_context(patch.object(consumer, 'execute', return_value=subprocess.CompletedProcess([], 0)))
+
+    def write_private(self, path, value):
+        path.write_text(json.dumps(value))
+        path.chmod(0o600)
+
+    def save_config(self):
+        self.write_private(self.config_path, self.config)
+        self.registry['config_sha256'] = hashlib.sha256(self.config_path.read_bytes()).hexdigest()
+        self.write_private(self.registry_path, self.registry)
+
+    def test_fire_uses_only_pinned_typed_controller_without_native_fallback(self):
+        self.execute.return_value = subprocess.CompletedProcess([], 7)
+        self.assertEqual(consumer.schedule(self.root, ['fire']), 7)
+        self.assertEqual(self.execute.call_count, 1)
+        argv = self.execute.call_args.args[0]
+        self.assertEqual(argv[:6], [consumer.sys.executable, '-E', '-s', '-S', '-B', '-X'])
+        self.assertTrue(argv[6].startswith('pycache_prefix='))
+        self.assertFalse(Path(argv[6].split('=', 1)[1]).exists())
+        self.assertEqual(argv[7:], [str(self.controller), '--config', str(self.config_path), 'schedule-tick', 'voice-bridge'])
+        self.assertIsNone(self.execute.call_args.kwargs['timeout'])
+
+    def test_registry_redirect_environment_still_refuses_before_dispatch(self):
+        for key in ('DATABASE_URL', 'ARCHON_DOCKER', 'WORKSPACE_PATH'):
+            with self.subTest(key=key), patch.dict(os.environ, {key: 'unrelated-fixture'}), \
+                    self.assertRaisesRegex(ValueError, key + ' selects an unsupported registry environment'):
+                consumer.schedule(self.root, ['fire'])
+        self.execute.assert_not_called()
+
+    def test_admission_checks_fixture_source_and_pack_and_refuses_their_mutation(self):
+        with patch.object(consumer, '_admission_bytes', wraps=consumer._admission_bytes) as read:
+            self.assertEqual(consumer.shared_admission(self.root)['project'], 'voice-bridge')
+        checked_paths = {call.args[0] for call in read.call_args_list}
+        for name in ('consumer.py', 'pack.json'):
+            path = self.loaded_factory / name
+            self.assertIn(path, checked_paths)
+            self.assertNotIn(Path(__file__).resolve().parents[1] / 'factory' / name, checked_paths)
+            original = path.read_bytes()
+            path.write_bytes(b'changed fixture source')
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'consumer or pack pin changed'):
+                consumer.shared_admission(self.root)
+            path.write_bytes(original)
+        self.execute.assert_not_called()
+
+    def test_sibling_import_shadows_fail_closed(self):
+        for filename in ('controls.pyc', 'controls.abi3.so', 'controls.pyd'):
+            shadow = self.controller_dir / filename
+            shadow.write_bytes(b'unpinned executable')
+            with self.subTest(filename=filename), self.assertRaisesRegex(ValueError, 'import shadow'):
+                consumer.schedule(self.root, ['fire'])
+            shadow.unlink()
+        package = self.controller_dir / 'controls'
+        package.mkdir()
+        (package / '__init__.py').write_text('raise RuntimeError("not pinned")')
+        with self.assertRaisesRegex(ValueError, 'import shadow'):
+            consumer.schedule(self.root, ['fire'])
+        self.execute.assert_not_called()
+
+    def test_extension_package_shadows_fail_closed_for_each_pinned_module(self):
+        for module in ('factoryctl', 'controls'):
+            package = self.controller_dir / module
+            package.mkdir()
+            for suffix in importlib.machinery.EXTENSION_SUFFIXES:
+                shadow = package / ('__init__' + suffix)
+                shadow.write_bytes(b'inert fixture: never load this extension')
+                with self.subTest(module=module, suffix=suffix), self.assertRaisesRegex(ValueError, 'import shadow'):
+                    consumer.schedule(self.root, ['fire'])
+                shadow.unlink()
+            package.rmdir()
+        self.execute.assert_not_called()
+
+    def test_exact_mapping_does_not_probe_broken_unrelated_repository(self):
+        unrelated = self.base / 'unrelated-nonrepository'
+        unrelated.mkdir()
+        self.config['projects']['unrelated'] = {'registered_root': str(unrelated)}
+        self.save_config()
+        def roots(path, **_):
+            if Path(path) == unrelated:
+                raise ValueError('unrelated repository unavailable')
+            return Path(path)
+        with patch.object(consumer, 'shared_root', side_effect=roots):
+            self.assertEqual(consumer.shared_admission(self.root)['project'], 'voice-bridge')
+            # Once an alias proves enrollment, report the missing mapping rather
+            # than probing unrelated repositories and replacing the refusal cause.
+            self.registry['projects'].clear()
+            self.save_config()
+            with self.assertRaisesRegex(ValueError, 'Enrolled project mapping is missing; no native fallback'):
+                consumer.shared_admission(self.root)
+
+    def test_enrolled_host_without_getuid_refuses_cleanly_without_dispatch(self):
+        with patch.object(consumer.os, 'getuid', create=True) as getuid, ExitStack() as cleanup:
+            # patch must find its placeholder when it removes a created attribute.
+            cleanup.callback(setattr, consumer.os, 'getuid', getuid)
+            del consumer.os.getuid
+            with self.assertRaisesRegex(ValueError, 'POSIX.*no native fallback'):
+                consumer._admission_bytes(self.registry_path)
+            with patch.object(consumer, 'project_root', return_value=self.root), \
+                    patch('sys.stderr', new=io.StringIO()) as error:
+                self.assertEqual(consumer.main(['schedule', 'fire']), 1)
+            self.assertIn('Factory refused:', error.getvalue())
+            self.assertIn('POSIX ownership checks; no native fallback', error.getvalue())
+            self.assertNotIn('Traceback', error.getvalue())
+        self.execute.assert_not_called()
+
+    def test_admission_json_decode_failure_does_not_expose_private_contents(self):
+        for data in (b'{"secret":"do-not-echo",', b'\xffdo-not-echo'):
+            self.registry_path.write_bytes(data)
+            with self.subTest(data=data), self.assertRaisesRegex(
+                    ValueError, '^Shared admission deployment file is invalid$'):
+                consumer._admission_json(self.registry_path)
+
+    def test_enrolled_launchd_changes_preserve_home_wide_legacy_wake_job(self):
+        for action in ('install', 'remove'):
+            with self.subTest(action=action), ExitStack() as stack:
+                stack.enter_context(patch.object(consumer.sys, 'platform', 'darwin'))
+                stack.enter_context(patch.multiple(consumer, read_settings=lambda _: {},
+                    verify_source=lambda _: self.base, cli=lambda *_: ['native']))
+                stack.enter_context(redirect_stdout(io.StringIO()))
+                directory = self.home / 'Library/LaunchAgents'
+                directory.mkdir(parents=True, exist_ok=True)
+                unrelated = directory / 'com.archon.trigger.workflow-wake-unrelated.plist'
+                original = plistlib.dumps({'Label': unrelated.stem,
+                    'ProgramArguments': ['native', 'workflow', 'wake'],
+                    'EnvironmentVariables': {'ARCHON_HOME': str(self.archon)}})
+                unrelated.write_bytes(original)
+                plan = consumer.timer_commands(self.root, 600, include_wake=False,
+                                               consumer_root=self.root)
+                for path, body in plan['launchd'].items():
+                    path.write_text(body)
+                self.execute.reset_mock()
+                self.assertEqual(consumer.schedule(self.root, [action, '--apply']), 0)
+                self.assertTrue(unrelated.is_file(), 'Project timer changes removed a home-wide wake job')
+                self.assertEqual(unrelated.read_bytes(), original)
+                self.assertFalse(any(any(unrelated.stem in str(arg) for arg in call.args[0])
+                                     for call in self.execute.call_args_list))
+                for path in plan['launchd']:
+                    self.assertEqual(path.exists(), action == 'install')
+
+    def test_enrolled_timer_removal_matches_install_from_another_worktree(self):
+        caller = self.base / 'other-worktree'
+        caller.mkdir()
+        for platform in ('linux', 'darwin'):
+            with self.subTest(platform=platform), ExitStack() as stack:
+                stack.enter_context(patch.object(consumer.sys, 'platform', platform))
+                stack.enter_context(patch.object(consumer, 'shared_root', return_value=self.root))
+                stack.enter_context(patch.multiple(consumer, read_settings=lambda _: {},
+                    verify_source=lambda _: self.base, cli=lambda *_: ['native']))
+                configure = stack.enter_context(patch.object(consumer, 'configure_launchd'))
+                output = stack.enter_context(redirect_stdout(io.StringIO()))
+                self.assertEqual(consumer.schedule(caller, ['install']), 0)
+                if platform == 'linux':
+                    installed_timer = next(line.rsplit(' ', 1)[-1] for line in output.getvalue().splitlines()
+                        if line.startswith('Run to enable: systemctl --user enable'))
+                    output.truncate(0)
+                    output.seek(0)
+                    self.assertEqual(consumer.schedule(caller, ['remove']), 0)
+                    self.assertIn('disable --now ' + installed_timer, output.getvalue())
+                    self.assertNotIn('other-worktree.timer', output.getvalue())
+                else:
+                    installed_jobs = set(configure.call_args.args[1]['launchd'])
+                    self.assertEqual(consumer.schedule(caller, ['remove']), 0)
+                    self.assertEqual(set(configure.call_args.args[1]['launchd']), installed_jobs)
+                    self.assertTrue(configure.call_args.kwargs['remove'])
+        self.execute.assert_not_called()
+
+    def test_enrolled_timer_removal_uses_trusted_identity_when_target_pins_changed(self):
+        # The executing wrapper is independently verified from loaded_factory.
+        # Cleanup must not execute or require the damaged timer target's files.
+        for platform in ('linux', 'darwin'):
+            for name in ('consumer.py', 'pack.json'):
+                target = self.root / 'factory' / name
+                original = target.read_bytes()
+                target.write_bytes(b'changed target: never execute this')
+                try:
+                    with self.subTest(platform=platform, name=name), ExitStack() as stack:
+                        stack.enter_context(patch.object(consumer.sys, 'platform', platform))
+                        stack.enter_context(patch.multiple(consumer, read_settings=lambda _: {},
+                            verify_source=lambda _: self.base, cli=lambda *_: ['native']))
+                        configure = stack.enter_context(patch.object(consumer, 'configure_launchd'))
+                        output = stack.enter_context(redirect_stdout(io.StringIO()))
+                        with self.assertRaisesRegex(ValueError, 'timer.*pin'):
+                            consumer.schedule(self.root, ['install'])
+                        self.assertEqual(consumer.schedule(self.root, ['remove']), 0)
+                        if platform == 'linux':
+                            self.assertIn('systemctl --user disable --now archonfactory-project.timer', output.getvalue())
+                        else:
+                            self.assertTrue(configure.call_args.kwargs['remove'])
+                finally:
+                    target.write_bytes(original)
+        self.execute.assert_not_called()
+
+    def test_unenrolled_host_without_getuid_keeps_native_read_only_path(self):
+        self.marker.unlink()
+        self.registry_path.unlink()
+        with patch.object(consumer.os, 'getuid', create=True) as getuid, ExitStack() as cleanup:
+            cleanup.callback(setattr, consumer.os, 'getuid', getuid)
+            del consumer.os.getuid
+            self.assertIsNone(consumer.shared_admission(self.root))
+            with patch.multiple(consumer, read_settings=lambda _: {}, verify_source=lambda _: self.base,
+                                cli=lambda *_: ['native-read']):
+                self.assertEqual(consumer.invoke(self.root, 'get', ['exact-run']), 0)
+        self.assertIn('exact-run', self.execute.call_args.args[0])
+
+    def test_controller_directory_links_fail_closed_before_import(self):
+        target = self.base / 'outside-package'
+        target.mkdir()
+        link = self.controller_dir / 'controls'
+        try:
+            link.symlink_to(target, target_is_directory=True)
+        except OSError as error:
+            self.skipTest(f'Directory symlink creation unavailable: {error}')
+        with self.assertRaisesRegex(ValueError, 'import shadow'):
+            consumer.shared_admission(self.root)
+        target.rmdir()
+        with self.assertRaisesRegex(ValueError, 'import shadow'):
+            consumer.shared_admission(self.root)
+
+    def test_typed_controller_executes_pinned_source_not_unchecked_bytecode(self):
+        module = self.controller_dir / 'controls.py'
+        module.write_text("VALUE = 'stale-bytecode'\n")
+        py_compile.compile(str(module), doraise=True, invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)
+        module.write_text("VALUE = 'pinned-source'\n")
+        self.controller.write_text('import controls\nprint(controls.VALUE)\n')
+        self.registry['controller_files'] = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                                             for path in self.controller_dir.glob('*.py')}
+        self.save_config()
+        old = subprocess.run([consumer.sys.executable, '-E', '-s', str(self.controller)],
+                             capture_output=True, text=True, check=True)
+        self.assertEqual(old.stdout.strip(), 'stale-bytecode')
+        observed = []
+        def execute(argv, cwd, **kwargs):
+            cache = Path(argv[6].split('=', 1)[1])
+            self.assertEqual(cache.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(list(cache.iterdir()), [])
+            result = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, check=True)
+            observed.append(result.stdout.strip())
+            return result
+        self.execute.side_effect = execute
+        self.assertEqual(consumer.schedule(self.root, ['fire']), 0)
+        self.assertEqual(observed, ['pinned-source'])
+
+    def test_enrolled_mutations_refuse_native_passthrough_including_runtime_host(self):
+        cases = [('run', ['archon-lifecycle']), ('run', ['archon-lifecycle', '--resume']),
+                 ('run', ['archon-lifecycle', '--runtime-host', '/unused']), ('resume', ['run-id']),
+                 ('cancel', ['run-id']), ('abandon', ['run-id']), ('unpause', []),
+                 ('approve', ['run-id']), ('reject', ['run-id']), ('respond', ['run-id', 'approve'])]
+        for action, args in cases:
+            with self.subTest(action=action, args=args), self.assertRaisesRegex(ValueError, 'factoryctl|shared capacity'):
+                consumer.invoke(self.root, action, args)
+        self.execute.assert_not_called()
+
+    def test_missing_registry_or_known_project_mapping_never_falls_back(self):
+        self.registry_path.unlink()
+        with self.assertRaisesRegex(ValueError, 'registry is missing'):
+            consumer.schedule(self.root, ['fire'])
+        self.marker.unlink()
+        self.registry['projects'] = {}
+        self.write_private(self.registry_path, self.registry)
+        with self.assertRaisesRegex(ValueError, 'mapping is missing'):
+            consumer.invoke(self.root, 'run', ['archon-lifecycle'])
+        self.execute.assert_not_called()
+
+    def test_registry_enforces_enrollment_without_marker_or_with_home_override(self):
+        self.marker.unlink()
+        with self.assertRaisesRegex(ValueError, 'factoryctl start'):
+            consumer.invoke(self.root, 'run', ['archon-lifecycle'])
+        with patch.dict(os.environ, {'ARCHON_HOME': str(self.base / 'other-home')}):
+            with self.assertRaisesRegex(ValueError, 'Archon home changed'):
+                consumer.schedule(self.root, ['fire'])
+        self.execute.assert_not_called()
+
+    def test_changed_controller_dependency_or_extra_module_fails_closed(self):
+        dependency = self.controller_dir / 'controls.py'
+        original = dependency.read_bytes()
+        dependency.write_text('# changed dependency')
+        with self.assertRaisesRegex(ValueError, 'module pin changed'):
+            consumer.schedule(self.root, ['fire'])
+        dependency.write_bytes(original)
+        (self.controller_dir / 'new_module.py').write_text('# unexpected module')
+        with self.assertRaisesRegex(ValueError, 'module inventory changed'):
+            consumer.schedule(self.root, ['fire'])
+        self.execute.assert_not_called()
+
+    def test_config_source_consumer_and_pack_pins_are_bound(self):
+        self.config_path.write_text('{"private":"do-not-echo"}')
+        with self.assertRaisesRegex(ValueError, 'config pin changed') as error:
+            consumer.schedule(self.root, ['fire'])
+        self.assertNotIn('do-not-echo', str(error.exception))
+        self.save_config()
+        self.config['projects']['voice-bridge']['source_revision'] = 'b' * 40
+        self.save_config()
+        with self.assertRaisesRegex(ValueError, 'identity or source pins changed'):
+            consumer.schedule(self.root, ['fire'])
+        self.registry['projects'][str(self.root)]['source_revision'] = 'b' * 40
+        self.config['projects']['voice-bridge']['consumer_sha256'] = 'f' * 64
+        self.registry['projects'][str(self.root)]['consumer_sha256'] = 'f' * 64
+        self.save_config()
+        with self.assertRaisesRegex(ValueError, 'consumer or pack pin changed'):
+            consumer.schedule(self.root, ['fire'])
+        self.execute.assert_not_called()
+
+    def test_registry_requires_private_canonical_files(self):
+        self.registry_path.chmod(0o644)
+        with self.assertRaises(ValueError):
+            consumer.schedule(self.root, ['fire'])
+        self.registry_path.chmod(0o600)
+        self.marker.unlink()
+        self.marker.symlink_to(self.registry_path)
+        with self.assertRaises(ValueError):
+            consumer.schedule(self.root, ['fire'])
+        self.execute.assert_not_called()
+
+    def test_stop_pause_preserved_and_brakes_work_with_broken_registry(self):
+        for name in ('.factory/STOP', consumer.PAUSE):
+            path = self.root / name
+            path.write_text('existing owner brake')
+            self.assertEqual(consumer.schedule(self.root, ['fire']), 0)
+            self.assertEqual(path.read_text(), 'existing owner brake')
+            path.unlink()
+        self.registry_path.unlink()
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(consumer.invoke(self.root, 'halt', []), 0)
+            self.assertEqual(consumer.invoke(self.root, 'pause', []), 0)
+        self.assertTrue((self.root / '.factory/STOP').exists())
+        self.assertTrue((self.root / consumer.PAUSE).exists())
+        self.execute.assert_not_called()
+
+    def test_enrolled_read_only_get_preserves_pinned_native_inspection(self):
+        with patch.multiple(consumer, read_settings=lambda _: {}, verify_source=lambda _: self.base,
+                            cli=lambda *_: ['native-read']):
+            self.assertEqual(consumer.invoke(self.root, 'get', ['exact-run']), 0)
+        self.assertEqual(self.execute.call_args.args[0], ['native-read', 'workflow', 'get', '--cwd', str(self.root), 'exact-run'])
+
+    def test_enrolled_wake_sweep_and_direct_bound_dispatch_are_withheld(self):
+        with self.assertRaisesRegex(ValueError, 'wake is withheld'):
+            consumer.schedule(self.root, ['wake'])
+        self.assertEqual(consumer.sweep_stuck(self.root, {}, self.base, [{'id': 'stale', 'status': 'pending'}], lambda _: None), set())
+        with self.assertRaisesRegex(ValueError, 'schedule-tick'):
+            consumer.dispatch_bound_trigger(self.root, {}, self.base, self.root / 'unused', {}, lambda _: None)
+        self.execute.assert_not_called()
+
+    def test_unenrolled_global_wake_cannot_resume_enrolled_roots(self):
+        other = self.base / 'unenrolled'
+        other.mkdir()
+        with closing(sqlite3.connect(self.archon / 'archon.db')) as db:
+            db.execute('CREATE TABLE remote_agent_codebases(default_cwd TEXT)')
+            db.executemany('INSERT INTO remote_agent_codebases VALUES(?)', [(str(self.root),), (str(other),)])
+            db.commit()
+        self.assertFalse(consumer.wake_allowed(other, self.base, lambda _: None))
+        self.execute.assert_not_called()
+
+    def test_enrolled_fire_rejects_native_flags_or_supplied_target(self):
+        for flags in (['--input', 'target=anything'], ['--apply'], ['--', 'arbitrary target']):
+            with self.assertRaisesRegex(ValueError, 'no native arguments or target'):
+                consumer.schedule(self.root, ['fire', *flags])
+        self.execute.assert_not_called()
+
+    def test_git_redirects_cannot_hide_enrollment_before_any_git_call(self):
+        for key in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_GLOBAL'):
+            with self.subTest(key=key), patch.dict(os.environ, {key: ''}):
+                for operation in (consumer.project_root,
+                                  lambda: consumer.invoke(self.root, 'run', ['archon-lifecycle']),
+                                  lambda: consumer.schedule(self.root, ['fire'])):
+                    with self.assertRaisesRegex(ValueError, 'Git environment redirects'):
+                        operation()
+        self.execute.assert_not_called()
+
+    def test_harmless_git_environment_does_not_block_shared_route(self):
+        with patch.dict(os.environ, {'GIT_PAGER': 'cat', 'GIT_TERMINAL_PROMPT': '0', 'GIT_OPTIONAL_LOCKS': '0'}):
+            self.assertEqual(consumer.schedule(self.root, ['fire']), 0)
+        self.assertEqual(self.execute.call_args.args[0][-2:], ['schedule-tick', 'voice-bridge'])
+
+    def test_enrolled_manual_inspection_refuses_native_dotenv_redirects(self):
+        (self.root / '.archon').mkdir()
+        (self.root / '.archon/.env').write_text('ARCHON_HOME=/private-do-not-echo\n')
+        with self.assertRaisesRegex(ValueError, 'Registry redirect keys') as error:
+            consumer.invoke(self.root, 'get', ['exact-run'])
+        self.assertNotIn('/private-do-not-echo', str(error.exception))
+        self.execute.assert_not_called()
+
+    def test_known_config_worktree_cannot_hide_missing_root_mapping(self):
+        worktree = self.base / 'registered-worktree'
+        worktree.mkdir()
+        self.marker.unlink()
+        self.registry['projects'].clear()
+        for key in ('registered_root', 'consumer_root'):
+            self.config['projects']['voice-bridge'][key] = str(worktree)
+        self.save_config()
+        with patch.object(consumer, 'shared_root', return_value=self.root), \
+                self.assertRaisesRegex(ValueError, 'mapping is missing'):
+            consumer.schedule(self.root, ['fire'])
+        self.execute.assert_not_called()
+
+    def test_enrolled_install_keeps_pause_and_native_binding_and_has_no_wake(self):
+        pause = self.root / consumer.PAUSE
+        pause.write_text('keep paused')
+        trigger = self.root / consumer.TRIGGER
+        trigger.write_text('original native binding, preserve only')
+        with patch.multiple(consumer, read_settings=lambda _: {}, verify_source=lambda _: self.base,
+                            cli=lambda *_: ['native']), patch.object(consumer.sys, 'platform', 'darwin'), \
+                patch.object(consumer, 'configure_launchd') as configure, redirect_stdout(io.StringIO()):
+            self.assertEqual(consumer.schedule(self.root, ['install', '--apply']), 0)
+        plan = configure.call_args.args[1]
+        self.assertEqual(len(plan['launchd']), 1)
+        job = plistlib.loads(next(iter(plan['launchd'].values())).encode())
+        self.assertEqual(job['ProgramArguments'][-2:], ['schedule', 'fire'])
+        self.assertFalse(job['RunAtLoad'])
+        self.assertEqual(job['StartInterval'], 600)
+        self.assertTrue(plan['retire'][0].name.endswith('.wake.plist'))
+        self.assertEqual(pause.read_text(), 'keep paused')
+        self.assertEqual(trigger.read_text(), 'original native binding, preserve only')
+        self.execute.assert_not_called()
+
+    def test_enrolled_install_rejects_parallel_schedule(self):
+        (self.root / consumer.SCHEDULE).write_text(json.dumps({'parallel': 2}))
+        with patch.multiple(consumer, read_settings=lambda _: {}, verify_source=lambda _: self.base,
+                            cli=lambda *_: ['native']), self.assertRaisesRegex(ValueError, 'exactly one project slot'):
+            consumer.schedule(self.root, ['install', '--apply'])
+        self.execute.assert_not_called()
+
+    def test_enrolled_mac_timer_uses_verified_worktree_consumer_not_common_checkout(self):
+        common = self.base / 'main-checkout'
+        (common / '.factory').mkdir(parents=True)
+        (common / 'factory').mkdir()
+        (common / 'factory/consumer.py').write_text('unchecked legacy consumer')
+        self.registry['projects'][str(common)] = self.registry['projects'].pop(str(self.root))
+        self.save_config()
+        with patch.object(consumer, 'shared_root', return_value=common), \
+                patch.multiple(consumer, read_settings=lambda _: {}, verify_source=lambda _: self.base, cli=lambda *_: ['native']), \
+                patch.object(consumer.sys, 'platform', 'darwin'), patch.object(consumer, 'configure_launchd') as configure, redirect_stdout(io.StringIO()):
+            self.assertEqual(consumer.schedule(self.root, ['install']), 0)
+        job = plistlib.loads(next(iter(configure.call_args.args[1]['launchd'].values())).encode())
+        self.assertEqual(job['ProgramArguments'][1], str(self.root / 'factory/consumer.py'))
+        self.assertEqual(job['WorkingDirectory'], str(self.root))
+        self.assertEqual(job['StandardOutPath'], str(common / '.factory/schedule.log'))
+        self.assertIn(hashlib.sha256(str(common).encode()).hexdigest(), job['Label'])
+
+    def test_enrolled_install_hashes_exact_timer_consumer_and_pack_on_every_platform(self):
+        for platform in ('darwin', 'linux', 'win32'):
+            for name in ('consumer.py', 'pack.json'):
+                path = self.root / 'factory' / name
+                original = path.read_bytes()
+                path.write_bytes(b'unchecked scheduled file')
+                with self.subTest(platform=platform, name=name), \
+                        patch.multiple(consumer, read_settings=lambda _: {}, verify_source=lambda _: self.base, cli=lambda *_: ['native']), \
+                        patch.object(consumer.sys, 'platform', platform), \
+                        self.assertRaisesRegex(ValueError, 'timer.*pin'):
+                    consumer.schedule(self.root, ['install'])
+                path.write_bytes(original)
+        self.execute.assert_not_called()
+
+    def test_enrolled_fire_cannot_dispatch_while_install_owns_shared_lock(self):
+        with consumer.single_flight(self.root / '.factory/fire.lock') as held:
+            self.assertTrue(held)
+            self.assertEqual(consumer.schedule(self.root, ['fire']), 0)
+        self.execute.assert_not_called()
+
+    def test_enrolled_fire_holds_shared_lock_through_dispatch_and_rechecks_pending(self):
+        def dispatch(*args, **kwargs):
+            with consumer.single_flight(self.root / '.factory/fire.lock') as held:
+                self.assertFalse(held, 'installation must not overlap shared dispatch')
+            return subprocess.CompletedProcess([], 0)
+        self.execute.side_effect = dispatch
+        self.assertEqual(consumer.schedule(self.root, ['fire']), 0)
+        self.execute.reset_mock()
+        with patch.object(consumer, 'verify_registry_environment',
+                          side_effect=lambda _: (self.root / consumer.SCHEDULE_INSTALL_PENDING).write_text('{}')):
+            with self.assertRaisesRegex(ValueError, 'installation is incomplete'):
+                consumer.schedule(self.root, ['fire'])
+        self.execute.assert_not_called()
 
 
 if __name__ == '__main__':
