@@ -33,6 +33,8 @@ describe("chat grammar", () => {
     assert.deepEqual(parseCommand("switch to B"), { kind: "open", name: "B" });
     assert.deepEqual(parseCommand("What's happening?"), { kind: "happening" });
     assert.deepEqual(parseCommand("whats happening"), { kind: "happening" });
+    assert.deepEqual(parseCommand("What\u2019s happening?"), { kind: "happening" });
+    assert.deepEqual(parseCommand("  WHAT\u2019S   HAPPENING "), { kind: "happening" });
     assert.deepEqual(parseCommand("start the build"), { kind: "unknown" });
     assert.deepEqual(parseCommand("open"), { kind: "unknown" });
   });

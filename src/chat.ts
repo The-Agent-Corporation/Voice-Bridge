@@ -24,7 +24,7 @@ export function parseCommand(line: string): Command {
   const text = line.trim().replace(/\s+/g, " ");
   const lower = text.toLowerCase();
   if (lower === "list projects") return { kind: "list" };
-  if (/^what'?s happening\??$/.test(lower)) return { kind: "happening" };
+  if (/^what['\u2019]?s happening\??$/.test(lower)) return { kind: "happening" };
   const open = /^(?:open|switch to) (.+)$/i.exec(text);
   if (open) return { kind: "open", name: open[1]! };
   return { kind: "unknown" };
