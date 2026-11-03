@@ -1,4 +1,7 @@
+import { randomUUID } from "node:crypto";
+import type { MessageReceipt } from "./messages.js";
 import type { OpenedProject, ProjectSummary } from "./registry.js";
+import type { MessageReason, MessageState } from "./store.js";
 
 /**
  * The bridge's HTTP tools, called with the client token like any other client. The chat reaches
@@ -16,9 +19,36 @@ type Command =
   | { kind: "list" }
   | { kind: "open"; name: string }
   | { kind: "happening" }
+  | { kind: "tell"; instruction: string }
   | { kind: "unknown" };
 
-const HELP = `I understand: list projects | open <name> | switch to <name> | what's happening?`;
+const HELP = `I understand: list projects | open <name> | switch to <name> | what's happening? | tell it <instruction>`;
+
+/** What each receipt state shows, and no more: only `started` and `completed` say the session acted on it. */
+const STATE_WORDING: Record<MessageState, string> = {
+  accepted: "accepted, not yet queued",
+  queued: "queued, not yet delivered",
+  delivering: "being handed to the session, not yet delivered",
+  delivered: "delivered; the session has not reported starting it",
+  acknowledged: "acknowledged by the session; it has not reported starting it",
+  started: "started; the session reported a turn for it",
+  completed: "completed; the session reported its turn finished",
+  failed: "failed",
+  expired: "expired before it was delivered",
+  cancelled: "cancelled before it was delivered",
+};
+
+/** The reasons `send_to_primary` refuses for before anything is sent. */
+const REFUSALS: ReadonlySet<MessageReason> = new Set(["ambiguous_owner", "not_controllable", "unsupported_capability"]);
+
+type SendReceipt = MessageReceipt & { duplicate: boolean };
+
+/** An instruction whose send threw, so the bridge may or may not hold it; resending it reuses its key. */
+interface UnconfirmedSend {
+  project_id: string;
+  instruction: string;
+  idempotency_key: string;
+}
 
 export function parseCommand(line: string): Command {
   const text = line.trim().replace(/\s+/g, " ");
@@ -27,6 +57,8 @@ export function parseCommand(line: string): Command {
   if (/^what['\u2019]?s happening\??$/.test(lower)) return { kind: "happening" };
   const open = /^(?:open|switch to) (.+)$/i.exec(text);
   if (open) return { kind: "open", name: open[1]! };
+  const tell = /^tell it (.+)$/i.exec(text);
+  if (tell) return { kind: "tell", instruction: tell[1]! };
   return { kind: "unknown" };
 }
 
@@ -42,12 +74,20 @@ export function matchProjects(projects: readonly ProjectSummary[], name: string)
   return projects.filter((p) => fields(p).some((field) => field.includes(wanted)));
 }
 
+export function describeReceipt(receipt: SendReceipt): string {
+  const wording = receipt.state === "failed" && REFUSALS.has(receipt.reason) ? "refused, not sent" : STATE_WORDING[receipt.state];
+  const target = receipt.session_id ?? "no session";
+  const already = receipt.duplicate ? "The bridge already had this instruction; " : "";
+  return `${already}Message ${receipt.message_id} for ${target}: ${wording} (${receipt.reason}: ${receipt.detail}).`;
+}
+
 function heading(project: Pick<OpenedProject, "display_name" | "freshness">): string {
   return `${project.display_name} (freshness: ${project.freshness})`;
 }
 
 export class Conversation {
   #context: ConversationContext = { active_project_id: null, briefing: null };
+  #unconfirmed: UnconfirmedSend | null = null;
 
   constructor(private readonly callTool: CallTool) {}
 
@@ -65,6 +105,8 @@ export class Conversation {
         return this.#open(command.name);
       case "happening":
         return this.#happening();
+      case "tell":
+        return this.#tell(command.instruction);
       case "unknown":
         return HELP;
     }
@@ -92,6 +134,30 @@ export class Conversation {
     if (this.#context.active_project_id === null) return `No project is open. ${HELP}`;
     const project = await this.#load(this.#context.active_project_id);
     return `${heading(project)}\n${project.briefing.trimEnd()}`;
+  }
+
+  /**
+   * Repeating the last instruction after its send threw reuses that send's key, so the bridge answers
+   * with the message it may already hold instead of storing a second one. Once a send returns, the
+   * same words again are a new instruction.
+   */
+  async #tell(instruction: string): Promise<string> {
+    const projectId = this.#context.active_project_id;
+    if (projectId === null) return `No project is open, so nothing was sent. ${HELP}`;
+    const pending = this.#unconfirmed;
+    const send =
+      pending?.project_id === projectId && pending.instruction === instruction
+        ? pending
+        : { project_id: projectId, instruction, idempotency_key: `chat-${randomUUID()}` };
+    this.#unconfirmed = send;
+    const receipt = await this.callTool<SendReceipt>("send_to_primary", {
+      project_id: projectId,
+      text: instruction,
+      mode: "next_turn",
+      idempotency_key: send.idempotency_key,
+    });
+    this.#unconfirmed = null;
+    return describeReceipt(receipt);
   }
 
   /** Replaces the whole context, so the previous project's briefing is dropped rather than kept beside the new one. */

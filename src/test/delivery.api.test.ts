@@ -5,6 +5,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { after, before, describe, test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
+import { Conversation, type CallTool } from "../chat.js";
 import { STORE_FILE } from "../store.js";
 import { tokenPath } from "../token.js";
 import { readFakeLog, startHost, writeFakeCodex, type Host } from "./fakeCodexAppServer.js";
@@ -138,6 +139,44 @@ describe("delivery to a bridge-controlled session", () => {
     release(h);
     await until(b.message_id, "completed");
     assert.equal(await stop(h), 0);
+  });
+
+  test("tell it in the chat reports each receipt, queues behind a busy turn and starts no new writer", async () => {
+    const id = await project();
+    const h = await host(id);
+    const before = starts();
+    const callTool: CallTool = async <T>(name: string, body: Record<string, unknown>) => (await tool(name, body)) as T;
+    const chat = new Conversation(callTool);
+    await chat.reply(`open ${id}`);
+
+    const first = await chat.reply("tell it chat A");
+    assert.match(first, new RegExp(`^Message (m-\\S+) for ${h.session_id}: queued, not yet delivered \\(awaiting_delivery: `));
+    const a = /^Message (m-\S+) /.exec(first)![1]!;
+    await until(a, "started");
+    const second = await chat.reply("tell it chat B");
+    assert.match(second, /: queued, not yet delivered \(awaiting_delivery: /);
+    const b = /^Message (m-\S+) /.exec(second)![1]!;
+    await delay(500);
+    assert.equal((await read(b)).state, "queued");
+    assert.deepEqual(turnStarts().filter((text) => text.startsWith("chat")), ["chat A"]);
+    assert.equal(starts(), before);
+
+    release(h);
+    await until(b, "started");
+    release(h);
+    await until(b, "completed");
+    assert.equal(await stop(h), 0);
+  });
+
+  test("tell it in the chat to a project with no controllable session is refused and starts nothing", async () => {
+    const id = await project();
+    const before = starts();
+    const callTool: CallTool = async <T>(name: string, body: Record<string, unknown>) => (await tool(name, body)) as T;
+    const chat = new Conversation(callTool);
+    await chat.reply(`open ${id}`);
+    assert.match(await chat.reply("tell it chat C"), /: refused, not sent \((?:not_controllable|ambiguous_owner): /);
+    await delay(500);
+    assert.equal(starts(), before);
   });
 
   test("a second session start on a held worktree is refused with workspace_owned and starts nothing", async () => {
