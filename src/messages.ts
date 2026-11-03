@@ -66,12 +66,15 @@ function sendRequest(body: Record<string, unknown>): SendRequest {
   return { project_id: projectId, text, mode: body.mode, idempotency_key: idempotencyKey, approve_queue: approveQueue };
 }
 
+/** The reasons a send is refused before anything is stored as sendable. */
+export type RefusalReason = "ambiguous_owner" | "not_controllable" | "unsupported_capability";
+
 /**
  * What a send does, the first matching rule winning. A steer is refused even with `approve_queue`:
  * no session can verify a steer, and a queued one would later go out as a next turn.
  */
 export function planSend(route: PrimaryRoute, mode: MessageMode, approveQueue: boolean, canSendNextTurn: boolean): NewMessage["decision"] {
-  const refuse = (reason: "ambiguous_owner" | "not_controllable" | "unsupported_capability", detail: string): NewMessage["decision"] =>
+  const refuse = (reason: RefusalReason, detail: string): NewMessage["decision"] =>
     approveQueue
       ? { deliverable: false, state: "queued", reason: "awaiting_controllable_session", detail }
       : { deliverable: false, state: "failed", reason, detail };

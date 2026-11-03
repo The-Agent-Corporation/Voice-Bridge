@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { MessageReceipt } from "./messages.js";
+import type { MessageReceipt, RefusalReason } from "./messages.js";
 import type { OpenedProject, ProjectSummary } from "./registry.js";
 import type { MessageReason, MessageState } from "./store.js";
 
@@ -38,8 +38,12 @@ const STATE_WORDING: Record<MessageState, string> = {
   cancelled: "cancelled before it was delivered",
 };
 
-/** The reasons `send_to_primary` refuses for before anything is sent. */
-const REFUSALS: ReadonlySet<MessageReason> = new Set(["ambiguous_owner", "not_controllable", "unsupported_capability"]);
+/** Keyed by messages.ts's type so a reason added or removed there fails the type-check here; a value import would load the store. */
+const REFUSALS: Record<RefusalReason, true> = { ambiguous_owner: true, not_controllable: true, unsupported_capability: true };
+
+function isRefusal(reason: MessageReason): reason is RefusalReason {
+  return reason in REFUSALS;
+}
 
 type SendReceipt = MessageReceipt & { duplicate: boolean };
 
@@ -75,7 +79,7 @@ export function matchProjects(projects: readonly ProjectSummary[], name: string)
 }
 
 export function describeReceipt(receipt: SendReceipt): string {
-  const wording = receipt.state === "failed" && REFUSALS.has(receipt.reason) ? "refused, not sent" : STATE_WORDING[receipt.state];
+  const wording = receipt.state === "failed" && isRefusal(receipt.reason) ? "refused, not sent" : STATE_WORDING[receipt.state];
   const target = receipt.session_id ?? "no session";
   const already = receipt.duplicate ? "The bridge already had this instruction; " : "";
   return `${already}Message ${receipt.message_id} for ${target}: ${wording} (${receipt.reason}: ${receipt.detail}).`;
