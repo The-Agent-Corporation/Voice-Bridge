@@ -80,14 +80,17 @@ function sendReceipt(overrides: Partial<MessageReceipt & { duplicate: boolean }>
 }
 
 describe("tell it", () => {
-  const opened = { project_id: "golf-app", display_name: "Golf App", freshness: "current", briefing: "B" };
+  const projects = [
+    { project_id: "golf-app", display_name: "Golf App", freshness: "current", briefing: "B" },
+    { project_id: "tennis-app", display_name: "Tennis App", freshness: "current", briefing: "T" },
+  ];
 
   /** A bridge stand-in that records every call and answers each send from `answer`. */
   function fakeBridge(answer: (body: Record<string, unknown>) => unknown) {
     const sends: Record<string, unknown>[] = [];
     const callTool: CallTool = async <T>(tool: string, body: Record<string, unknown>) => {
-      if (tool === "list_projects") return { projects: [{ ...opened, canonical_path: "/a" }] } as T;
-      if (tool === "open_project") return opened as T;
+      if (tool === "list_projects") return { projects: projects.map((p) => ({ ...p, canonical_path: `/${p.project_id}` })) } as T;
+      if (tool === "open_project") return projects.find((p) => p.project_id === body.project_id) as T;
       assert.equal(tool, "send_to_primary");
       sends.push(body);
       return answer(body) as T;
@@ -165,6 +168,21 @@ describe("tell it", () => {
     await assert.rejects(chat.reply("tell it run the tests"), /bridge unreachable/);
     fail = false;
     await chat.reply("tell it stop");
+    assert.notEqual(sends[1]!.idempotency_key, sends[0]!.idempotency_key);
+  });
+
+  test("the same instruction to another project after a failed send gets its own key", async () => {
+    let fail = true;
+    const { sends, chat } = fakeBridge(() => {
+      if (fail) throw new Error("bridge unreachable");
+      return sendReceipt();
+    });
+    await chat.reply("open golf");
+    await assert.rejects(chat.reply("tell it run the tests"), /bridge unreachable/);
+    fail = false;
+    await chat.reply("open tennis");
+    await chat.reply("tell it run the tests");
+    assert.equal(sends[1]!.project_id, "tennis-app");
     assert.notEqual(sends[1]!.idempotency_key, sends[0]!.idempotency_key);
   });
 });
