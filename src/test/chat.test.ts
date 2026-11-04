@@ -171,6 +171,25 @@ describe("tell it", () => {
     assert.notEqual(sends[1]!.idempotency_key, sends[0]!.idempotency_key);
   });
 
+  test("a failed instruction keeps its key while another instruction is sent and returns", async () => {
+    let failing = new Set(["run the tests"]);
+    const { sends, chat } = fakeBridge((body) => {
+      if (failing.has(String(body.text))) throw new Error("bridge unreachable");
+      return sendReceipt();
+    });
+    await chat.reply("open golf");
+    await assert.rejects(chat.reply("tell it run the tests"), /bridge unreachable/);
+    await chat.reply("tell it stop");
+    failing = new Set();
+    await chat.reply("tell it run the tests");
+    await chat.reply("tell it run the tests");
+    const keys = sends.map((body) => body.idempotency_key);
+    assert.equal(keys.length, 4);
+    assert.notEqual(keys[1], keys[0]);
+    assert.equal(keys[2], keys[0]);
+    assert.notEqual(keys[3], keys[0]);
+  });
+
   test("the same instruction to another project after a failed send gets its own key", async () => {
     let fail = true;
     const { sends, chat } = fakeBridge(() => {

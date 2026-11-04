@@ -47,13 +47,6 @@ function isRefusal(reason: MessageReason): reason is RefusalReason {
 
 type SendReceipt = MessageReceipt & { duplicate: boolean };
 
-/** An instruction whose send threw, so the bridge may or may not hold it; resending it reuses its key. */
-interface UnconfirmedSend {
-  project_id: string;
-  instruction: string;
-  idempotency_key: string;
-}
-
 export function parseCommand(line: string): Command {
   const text = line.trim().replace(/\s+/g, " ");
   const lower = text.toLowerCase();
@@ -91,7 +84,8 @@ function heading(project: Pick<OpenedProject, "display_name" | "freshness">): st
 
 export class Conversation {
   #context: ConversationContext = { active_project_id: null, briefing: null };
-  #unconfirmed: UnconfirmedSend | null = null;
+  /** Keys of instructions whose send threw, so the bridge may or may not hold them, by project and instruction. */
+  #unconfirmed = new Map<string, string>();
 
   constructor(private readonly callTool: CallTool) {}
 
@@ -141,26 +135,23 @@ export class Conversation {
   }
 
   /**
-   * Repeating the last instruction after its send threw reuses that send's key, so the bridge answers
-   * with the message it may already hold instead of storing a second one. Once a send returns, the
-   * same words again are a new instruction.
+   * Repeating an instruction whose send threw reuses that send's key, so the bridge answers with the
+   * message it may already hold instead of storing a second one; other sends in between do not
+   * change that. Once a send returns, the same words again are a new instruction.
    */
   async #tell(instruction: string): Promise<string> {
     const projectId = this.#context.active_project_id;
     if (projectId === null) return `No project is open, so nothing was sent. ${HELP}`;
-    const pending = this.#unconfirmed;
-    const send =
-      pending?.project_id === projectId && pending.instruction === instruction
-        ? pending
-        : { project_id: projectId, instruction, idempotency_key: `chat-${randomUUID()}` };
-    this.#unconfirmed = send;
+    const sendId = JSON.stringify([projectId, instruction]);
+    const idempotencyKey = this.#unconfirmed.get(sendId) ?? `chat-${randomUUID()}`;
+    this.#unconfirmed.set(sendId, idempotencyKey);
     const receipt = await this.callTool<SendReceipt>("send_to_primary", {
       project_id: projectId,
       text: instruction,
       mode: "next_turn",
-      idempotency_key: send.idempotency_key,
+      idempotency_key: idempotencyKey,
     });
-    this.#unconfirmed = null;
+    this.#unconfirmed.delete(sendId);
     return describeReceipt(receipt);
   }
 
