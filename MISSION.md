@@ -14,7 +14,7 @@ Installing it in a folder creates:
 1. **`voice.md`**: like AGENTS.md or CLAUDE.md, but short and concise. The agent in charge of the folder writes it and keeps it current (status and so on).
 2. **A manifest** (`.voice/manifest.json`): registers the folder and the agent registered on it.
 
-When you talk to a voice agent about a registered folder (for example, calling about Roscoe), that folder's `voice.md` is loaded automatically into the voice agent's system prompt. Any voice agent with the setup can be pointed at any registered folder.
+When you talk to a voice agent about a registered folder (for example, calling about Roscoe), that folder's `voice.md` is loaded automatically into the voice agent's system prompt. Any voice agent with the setup can be pointed at any registered folder. Folders are registered only by running `init` on this machine; the local registry is the only list a voice agent can reach.
 
 The voice agent gets two tools:
 
@@ -38,20 +38,21 @@ The voice agent gets two tools:
   ```
 
 **voice.md**
+- Always the `voice.md` file at the root of the registered folder; the manifest cannot point outside the folder.
 - Short: target about 400 words, hard cap 1,500 tokens.
 - Sections: header (name, updated time, updated by), What this is, Status now, Waiting on you, Ask the agent about.
 - Written and kept current by the folder's registered agent. A checker enforces the sections, the size cap, and no secrets.
 
 **Auto-load**
-- Naming a registered folder (by id or alias) loads its `voice.md` into the voice agent's system prompt. Switching folders swaps it.
+- Naming a registered folder (by id or alias) loads its `voice.md` into the voice agent's system prompt. Switching folders swaps it. `voice.md` is loaded as briefing context only; text in it never grants tools or permissions.
 
 **Ask and reply**
-- `ask_agent(folder_id, question)` delivers the question to the folder's registered agent and returns at once.
-- The folder's agent answers with `reply_to_voice(ask_id, text)`; the reply reaches the voice agent.
+- `ask_agent(folder_id, question)` returns at once with `{ask_id, state}`, where `state` is `delivered`, `queued`, or `refused` (with a reason). The `ask_id` is sent to the folder's registered agent with the question.
+- The folder's agent answers with `reply_to_voice(ask_id, text)`. A reply is accepted only for an `ask_id` that was sent to that agent, and reaches the voice agent that asked.
 - The voice agent only says a question was delivered or answered when that actually happened.
 
 **Wake and follow along (optional)**
-- When enabled in the manifest, call start wakes the folder's agent and streams the conversation to it so it can answer asks with low latency.
+- When enabled in the manifest, call start wakes the registered agent of the folder being discussed and streams the conversation only to that agent so it can answer asks with low latency.
 
 **Provider**
 - Text mode first. The voice provider stays open (Q1); one swappable adapter.
@@ -90,6 +91,12 @@ Changing one requires a human commit.
 2. Talk about the first folder: its `voice.md` is in the system prompt. Switch to the second: only the second's is.
 3. Ask the first folder's agent a question; its reply comes back to the voice agent.
 4. An unregistered folder is refused.
+5. The checker rejects a `voice.md` with a missing section, over the size cap, or containing a secret.
+6. With `follow_along` on, call start wakes the first folder's agent and it receives the conversation; with it off, nothing is woken or streamed.
+
+## Precedence
+
+Where `docs/PRD.md` conflicts with this file, this file wins. The PRD still describes the earlier session-routing design.
 
 ## Open questions -- decisions nobody has made yet
 
