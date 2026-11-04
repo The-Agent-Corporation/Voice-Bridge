@@ -5,7 +5,9 @@ import path from "node:path";
 import { after, before, describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { startBridge, type RunningBridge } from "../app.js";
-import { Conversation, matchProjects, parseCommand, type CallTool } from "../chat.js";
+import { Conversation, describeReceipt, matchProjects, parseCommand, type CallTool } from "../chat.js";
+import type { MessageReceipt } from "../messages.js";
+import { MESSAGE_STATES } from "../store.js";
 import { readClientToken } from "../token.js";
 import { call, CLI_ENTRY, fixtureHomes, makeRepo, PRD_SAMPLE, removeTempDirs, tempDir } from "./helpers.js";
 
@@ -27,7 +29,7 @@ async function chatCli(dataDir: string, input: string): Promise<{ status: number
 }
 
 describe("chat grammar", () => {
-  test("parses the four commands and nothing else", () => {
+  test("parses the five commands and nothing else", () => {
     assert.deepEqual(parseCommand("list projects"), { kind: "list" });
     assert.deepEqual(parseCommand("  Open   Golf App "), { kind: "open", name: "Golf App" });
     assert.deepEqual(parseCommand("switch to B"), { kind: "open", name: "B" });
@@ -37,6 +39,10 @@ describe("chat grammar", () => {
     assert.deepEqual(parseCommand("  WHAT\u2019S   HAPPENING "), { kind: "happening" });
     assert.deepEqual(parseCommand("start the build"), { kind: "unknown" });
     assert.deepEqual(parseCommand("open"), { kind: "unknown" });
+    assert.deepEqual(parseCommand("  Tell IT   run the tests "), { kind: "tell", instruction: "run the tests" });
+    assert.deepEqual(parseCommand("tell it what\u2019s left"), { kind: "tell", instruction: "what\u2019s left" });
+    assert.deepEqual(parseCommand("tell it"), { kind: "unknown" });
+    assert.deepEqual(parseCommand("tell them to stop"), { kind: "unknown" });
   });
 
   test("an exact id or display name wins over partial matches", () => {
@@ -48,6 +54,155 @@ describe("chat grammar", () => {
     assert.deepEqual(matchProjects(projects, "golf app").map((p) => p.project_id), ["golf-app"]);
     assert.deepEqual(matchProjects(projects, "gol").map((p) => p.project_id), ["golf-app", "golf"]);
     assert.deepEqual(matchProjects(projects, "tennis"), []);
+  });
+});
+
+function sendReceipt(overrides: Partial<MessageReceipt & { duplicate: boolean }> = {}): MessageReceipt & { duplicate: boolean } {
+  return {
+    message_id: "m-1",
+    project_id: "golf-app",
+    session_id: "codex:s1",
+    sequence: 1,
+    mode: "next_turn",
+    question_id: null,
+    idempotency_key: "k",
+    state: "queued",
+    reason: "awaiting_delivery",
+    detail: "waiting for the session host",
+    provider_ref: null,
+    created_at: "2026-11-03T12:00:00.000Z",
+    updated_at: "2026-11-03T12:00:00.000Z",
+    expires_at: "2026-11-04T12:00:00.000Z",
+    transitions: [],
+    duplicate: false,
+    ...overrides,
+  };
+}
+
+describe("tell it", () => {
+  const projects = [
+    { project_id: "golf-app", display_name: "Golf App", freshness: "current", briefing: "B" },
+    { project_id: "tennis-app", display_name: "Tennis App", freshness: "current", briefing: "T" },
+  ];
+
+  /** A bridge stand-in that records every call and answers each send from `answer`. */
+  function fakeBridge(answer: (body: Record<string, unknown>) => unknown) {
+    const sends: Record<string, unknown>[] = [];
+    const callTool: CallTool = async <T>(tool: string, body: Record<string, unknown>) => {
+      if (tool === "list_projects") return { projects: projects.map((p) => ({ ...p, canonical_path: `/${p.project_id}` })) } as T;
+      if (tool === "open_project") return projects.find((p) => p.project_id === body.project_id) as T;
+      assert.equal(tool, "send_to_primary");
+      sends.push(body);
+      return answer(body) as T;
+    };
+    return { sends, chat: new Conversation(callTool) };
+  }
+
+  test("with no project open it says so and sends nothing", async () => {
+    const { sends, chat } = fakeBridge(() => sendReceipt());
+    assert.match(await chat.reply("tell it run the tests"), /^No project is open, so nothing was sent\./);
+    assert.equal(sends.length, 0);
+  });
+
+  test("sends the instruction as the open project's next turn and reports the receipt", async () => {
+    const { sends, chat } = fakeBridge(() => sendReceipt());
+    await chat.reply("open golf");
+    const reply = await chat.reply("tell it run the tests");
+    assert.equal(reply, "Message m-1 for codex:s1: queued, not yet delivered (awaiting_delivery: waiting for the session host).");
+    assert.equal(sends.length, 1);
+    assert.deepEqual({ ...sends[0], idempotency_key: undefined }, {
+      project_id: "golf-app",
+      text: "run the tests",
+      mode: "next_turn",
+      idempotency_key: undefined,
+    });
+    assert.match(String(sends[0]!.idempotency_key), /^chat-/);
+  });
+
+  test("each receipt state is worded without claiming more than it shows", () => {
+    const worded = Object.fromEntries(MESSAGE_STATES.map((state) => [state, describeReceipt(sendReceipt({ state, reason: "turn_failed" }))]));
+    for (const state of MESSAGE_STATES) {
+      const claimsWork = /started;|completed;/.test(worded[state]!);
+      assert.equal(claimsWork, state === "started" || state === "completed", worded[state]);
+    }
+    assert.match(worded.delivered!, /delivered; the session has not reported starting it/);
+    assert.match(worded.failed!, /: failed \(turn_failed: /);
+    assert.match(describeReceipt(sendReceipt({ session_id: null })), /for no session:/);
+  });
+
+  test("a refusal says it was not sent and why", () => {
+    for (const reason of ["ambiguous_owner", "not_controllable", "unsupported_capability"] as const) {
+      const reply = describeReceipt(sendReceipt({ state: "failed", reason, detail: "the primary is saved, not connected" }));
+      assert.match(reply, new RegExp(`refused, not sent \\(${reason}: the primary is saved, not connected\\)\\.$`));
+    }
+  });
+
+  test("a duplicate receipt says the bridge already had the instruction", () => {
+    assert.match(describeReceipt(sendReceipt({ duplicate: true, state: "delivered" })), /^The bridge already had this instruction; Message m-1 .*delivered/);
+  });
+
+  test("retrying an instruction whose send threw reuses its key; a later repeat is a new instruction", async () => {
+    let fail = true;
+    const { sends, chat } = fakeBridge(() => {
+      if (fail) throw new Error("bridge unreachable");
+      return sendReceipt();
+    });
+    await chat.reply("open golf");
+    await assert.rejects(chat.reply("tell it run the tests"), /bridge unreachable/);
+    fail = false;
+    await chat.reply("tell it   run the tests");
+    await chat.reply("tell it run the tests");
+    const keys = sends.map((body) => body.idempotency_key);
+    assert.equal(keys.length, 3);
+    assert.equal(keys[1], keys[0]);
+    assert.notEqual(keys[2], keys[1]);
+  });
+
+  test("a different instruction after a failed send gets its own key", async () => {
+    let fail = true;
+    const { sends, chat } = fakeBridge(() => {
+      if (fail) throw new Error("bridge unreachable");
+      return sendReceipt();
+    });
+    await chat.reply("open golf");
+    await assert.rejects(chat.reply("tell it run the tests"), /bridge unreachable/);
+    fail = false;
+    await chat.reply("tell it stop");
+    assert.notEqual(sends[1]!.idempotency_key, sends[0]!.idempotency_key);
+  });
+
+  test("a failed instruction keeps its key while another instruction is sent and returns", async () => {
+    let failing = new Set(["run the tests"]);
+    const { sends, chat } = fakeBridge((body) => {
+      if (failing.has(String(body.text))) throw new Error("bridge unreachable");
+      return sendReceipt();
+    });
+    await chat.reply("open golf");
+    await assert.rejects(chat.reply("tell it run the tests"), /bridge unreachable/);
+    await chat.reply("tell it stop");
+    failing = new Set();
+    await chat.reply("tell it run the tests");
+    await chat.reply("tell it run the tests");
+    const keys = sends.map((body) => body.idempotency_key);
+    assert.equal(keys.length, 4);
+    assert.notEqual(keys[1], keys[0]);
+    assert.equal(keys[2], keys[0]);
+    assert.notEqual(keys[3], keys[0]);
+  });
+
+  test("the same instruction to another project after a failed send gets its own key", async () => {
+    let fail = true;
+    const { sends, chat } = fakeBridge(() => {
+      if (fail) throw new Error("bridge unreachable");
+      return sendReceipt();
+    });
+    await chat.reply("open golf");
+    await assert.rejects(chat.reply("tell it run the tests"), /bridge unreachable/);
+    fail = false;
+    await chat.reply("open tennis");
+    await chat.reply("tell it run the tests");
+    assert.equal(sends[1]!.project_id, "tennis-app");
+    assert.notEqual(sends[1]!.idempotency_key, sends[0]!.idempotency_key);
   });
 });
 
