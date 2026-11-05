@@ -157,8 +157,11 @@ function runCheck(target: string): number {
   let text: string;
   try {
     if (statSync(resolved).isDirectory()) file = path.join(resolved, VOICE_MD_FILE);
+    // Reading a FIFO or device would block or never end, so only a regular file is read.
+    if (!statSync(file).isFile()) throw new CliError("voice_md_unsupported", `${file} is not a regular file`);
     text = readFileSync(file, "utf8");
   } catch (error) {
+    if (error instanceof CliError) throw error;
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT") throw new CliError("voice_md_not_found", `${file} does not exist`);
     throw new CliError("voice_md_unreadable", `${file} could not be read (${code ?? String(error)})`);

@@ -190,11 +190,11 @@ node dist/cli.js check /path/to/folder      # or a path to the file itself, such
 `check` reads only that file; it needs no daemon and no bridge state. It fails when:
 
 - the first line is not `# <name>`, or the lines before the first section lack `Updated: <time>` (ISO 8601 with a zone) or `Updated by: <who>`;
-- any of the four `##` sections `What this is`, `Status now`, `Waiting on you` and `Ask the agent about` is missing, repeated or empty (write "Nothing right now." instead). Case and spacing do not matter, other sections are allowed, the order is free, and a heading inside a fenced code block does not count;
+- any of the four `##` sections `What this is`, `Status now`, `Waiting on you` and `Ask the agent about` is missing, repeated or empty (write "Nothing right now." instead). Case and spacing do not matter, other sections are allowed and not checked, the order is free, and a heading inside a fenced code block does not count;
 - the file is over 1,500 tokens, estimated at four characters per token (aim for about 400 words);
-- any line, fenced or not, holds a secret: an API key, a GitHub, Slack, AWS, bearer or JSON web token, a private key, a credential in a URL or assigned to a name such as `password` or `api_key`, a `session_id: ...`, or any UUID, since it may be a session id.
+- any line, fenced or not, holds a secret: an API key, a GitHub, Slack, AWS, bearer or JSON web token, a private key, a credential in a URL or assigned to a name such as `password`, `token` or `api_key` (a quoted value may hold spaces), a long random-looking token such as the bridge's own client token, a `session_id: ...`, or any UUID, since it may be a session id.
 
-A file that passes prints `ok: <file> (<tokens> of 1500 tokens, <words> words)` and exits 0. Otherwise every problem is printed as `<file>:<line>: <code>: <message>` (no line when it concerns the whole file) and it exits 1; a secret is named by kind and line, never printed. A missing file is `voice_md_not_found` and exits 1; a wrong number of arguments prints the usage and exits 2.
+A file that passes prints `ok: <file> (<tokens> of 1500 tokens, <words> words)` and exits 0. Otherwise every problem is printed as `<file>:<line>: <code>: <message>` (no line when it concerns the whole file) and it exits 1; a secret is named by kind and line, never printed. A missing file is `voice_md_not_found` and a path that is not a regular file (a FIFO or a device, say) is `voice_md_unsupported`, both exiting 1; a wrong number of arguments prints the usage and exits 2.
 
 ## Checks
 

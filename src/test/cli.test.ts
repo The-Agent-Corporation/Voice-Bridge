@@ -293,4 +293,12 @@ describe("voice-bridge check", () => {
     }
     assert.equal(existsSync(dataDir), false);
   });
+
+  test("a path that is not a regular file is voice_md_unsupported instead of a hang", { skip: process.platform === "win32" && "no mkfifo" }, async () => {
+    const fifo = path.join(tempDir(), "voice.md");
+    assert.equal(spawnSync("mkfifo", [fifo]).status, 0);
+    const result = await runCli(absentDataDir(), "check", fifo);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /voice_md_unsupported/);
+  });
 });

@@ -56,8 +56,11 @@ const SECRET_RULES: readonly SecretRule[] = [
   {
     label: "credential assignment",
     pattern:
-      /\b(password|passwd|pwd|secret|client[_-]?secret|api[_-]?key|access[_-]?token|auth[_-]?token|refresh[_-]?token)\s*[:=]\s*["']?[^\s"']{8,}/i,
+      /\b(password|passwd|pwd|secret|client[_-]?secret|api[_-]?key|token|client[_-]?token|access[_-]?token|auth[_-]?token|refresh[_-]?token)\s*[:=]\s*("[^"]+"|'[^']+'|[^\s"']{4,})/i,
   },
+  // A generated token with no telling prefix, such as the bridge's own client token: a long base64url run
+  // mixing upper case, lower case and digits, which prose, paths and hex digests do not.
+  { label: "high-entropy token", pattern: /(?<![\w-])(?=[\w-]*[A-Z])(?=[\w-]*[a-z])(?=[\w-]*\d)[\w-]{32,}/ },
   { label: "session id", pattern: /\bsession[_ -]?id\s*[:=]\s*\S+/i },
   { label: "session id (UUID)", pattern: /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i },
 ];
@@ -90,6 +93,8 @@ export function checkVoiceMd(raw: string): VoiceMdCheck {
   let updatedBySeen = false;
   const sectionLines = new Map<string, number>();
   let openSection: { name: string; line: number; filled: boolean } | undefined;
+
+  const requiredSections = new Set(VOICE_MD_SECTIONS.map(normaliseHeading));
 
   const closeSection = () => {
     if (openSection && !openSection.filled) {
@@ -143,6 +148,7 @@ export function checkVoiceMd(raw: string): VoiceMdCheck {
     closeSection();
     if (heading[1] !== "##") return;
     const key = normaliseHeading(heading[2]!);
+    if (!requiredSections.has(key)) return;
     if (sectionLines.has(key)) {
       problems.push({ code: "duplicate_section", line: lineNo, message: `section "${heading[2]!.trim()}" appears more than once` });
     } else {

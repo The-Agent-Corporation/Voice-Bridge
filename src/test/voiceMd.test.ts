@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
 import { test } from "node:test";
 import { checkVoiceMd, VOICE_MD_SECTIONS, type VoiceMdProblemCode } from "../voiceMd.js";
 
@@ -62,6 +63,12 @@ test("empty and duplicated sections are rejected; case and spacing are not", () 
   assert.deepEqual(codes(VALID_VOICE_MD.replace("## Status now", "##  status NOW ")), []);
 });
 
+test("other sections are not checked, even empty or repeated", () => {
+  assert.deepEqual(codes(`${VALID_VOICE_MD}\n## Notes\n\n## Notes\nMore.\n`), []);
+  const emptyAfterExtra = VALID_VOICE_MD.replace("## Waiting on you\nNothing right now.\n", "## Notes\nSome.\n\n## Waiting on you\n");
+  assert.deepEqual(codes(emptyAfterExtra), ["empty_section"]);
+});
+
 test("each header line is required and the time must be a real zoned timestamp", () => {
   assert.deepEqual(codes(VALID_VOICE_MD.replace("# Roscoe\n", "Roscoe\n")), ["missing_name"]);
   assert.deepEqual(codes(VALID_VOICE_MD.replace("# Roscoe\n", "")), ["missing_name"]);
@@ -99,6 +106,11 @@ test("every kind of secret is reported by line without echoing it", () => {
     ["credential in URL", "clone https://fred:" + "hunter22@example.com/repo"],
     ["credential assignment", "password = " + "correcthorse"],
     ["credential assignment", "API_KEY: " + "'abcd1234efgh'"],
+    ["credential assignment", "password: " + '"correct horse battery staple"'],
+    ["credential assignment", "password=" + "hunter2"],
+    ["credential assignment", "token: " + randomBytes(32).toString("base64url")],
+    ["credential assignment", "client-token = " + "s3cr3tvalue"],
+    ["high-entropy token", "rotate " + "Zq7vK2mXw9" + "Lp4Rt8Yb1Nc6Hd3Fg5Js0Ae"],
     ["session id", "session_id: " + "abc123"],
     ["session id (UUID)", "resume 019a3c1e-7b2f-" + "7c40-9e1d-2f3a4b5c6d7e"],
   ];
@@ -121,6 +133,9 @@ test("ordinary words about credentials and sessions are not secrets", () => {
     "api key rotation is due",
     "the session went quiet at 2026-11-05T14:30:00Z",
     "Bearer of bad news",
+    "token: see the vault",
+    "see https://github.com/The-Agent-Corporation/Voice-Bridge/pull/123",
+    "commit 0abb74c4f543406481bea49c6e3b82cff7e3e2d6",
   ]) {
     assert.deepEqual(codes(withStatus(line)), [], line);
   }
