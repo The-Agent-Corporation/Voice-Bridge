@@ -64,7 +64,7 @@ const SECRET_RULES: readonly SecretRule[] = [
 
 const TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
 
-/** Characters / 4, the same rough estimate the rest of the project uses; no provider's tokenizer is chosen yet. */
+/** Characters / 4, the project's one token estimate; no provider's tokenizer is chosen yet. */
 export function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }

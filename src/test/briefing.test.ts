@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { estimateTokens, renderBriefing, SECTION_HEADINGS, type BriefingState } from "../briefing.js";
+import { renderBriefing, SECTION_HEADINGS, type BriefingState } from "../briefing.js";
+import { estimateTokens } from "../voiceMd.js";
 import { MIN_BRIEFING_TOKENS } from "../config.js";
 import type { BriefingEventRow } from "../store.js";
 

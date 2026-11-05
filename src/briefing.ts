@@ -1,6 +1,7 @@
 import { PROVIDERS } from "./adapters/types.js";
 import { getProjectStatus, latestRecordedCommit, type ProjectStatus } from "./status.js";
 import { BRIEFING_EVENTS_PER_TYPE, type BriefingEventRow, type Store } from "./store.js";
+import { estimateTokens } from "./voiceMd.js";
 
 /** The briefing's `## ` headings, in file order (docs/PRD.md §6.1). */
 export const SECTION_HEADINGS = [
@@ -83,10 +84,6 @@ export function loadBriefingState(store: Store, project: { project_id: string; d
     highest_event_id: store.highestProcessedEventId(project.project_id),
     session_identifiers: [...identifiers].sort(),
   };
-}
-
-export function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4);
 }
 
 /** Collapses whitespace and control characters so the text stays on one line. */
