@@ -15,6 +15,7 @@ The daemon listens on `127.0.0.1` only. In another terminal:
 ```sh
 node dist/cli.js --help                   # or -h or help: the command reference, without the daemon
 node dist/cli.js register /path/to/repo   # reads /path/to/repo/.voice/config.json
+node dist/cli.js check /path/to/folder    # checks <folder>/voice.md; no daemon needed
 node dist/cli.js projects
 node dist/cli.js open <project_id>
 node dist/cli.js sessions <project_id>
@@ -159,6 +160,41 @@ node dist/cli.js probe
 ```
 
 This runs on its own; the daemon need not be up. It prints JSON recording what the installed Codex and Claude Code can prove. For each provider it gives the realpath it ran, the version, and, for every surface, each capability as `supported`, `unsupported` or `unverified`, with the command and exit code as evidence. Only Codex's app-server is checked live: it runs in a throwaway home with no credentials and an environment built from nothing but your `PATH`. `probe` exits 1 if any process it started could not be killed. The observed matrix and what it means are in [docs/compatibility.md](docs/compatibility.md).
+
+## voice.md
+
+A folder's own agent keeps a `voice.md` at the folder's root; the voice agent will load it into its prompt. It looks like this:
+
+```markdown
+# Roscoe
+Updated: 2026-11-05T14:30:00Z
+Updated by: roscoe-main
+
+## What this is
+One or two sentences.
+
+## Status now
+...
+
+## Waiting on you
+Nothing right now.
+
+## Ask the agent about
+- ...
+```
+
+```sh
+node dist/cli.js check /path/to/folder      # or a path to the file itself, such as a draft
+```
+
+`check` reads only that file; it needs no daemon and no bridge state. It fails when:
+
+- the first line is not `# <name>`, or the lines before the first section lack `Updated: <time>` (ISO 8601 with a zone) or `Updated by: <who>`;
+- any of the four `##` sections `What this is`, `Status now`, `Waiting on you` and `Ask the agent about` is missing, repeated or empty (write "Nothing right now." instead). Case and spacing do not matter, other sections are allowed and not checked, the order is free, and a heading inside a fenced code block does not count;
+- the file is over 1,500 tokens, estimated at four characters per token (aim for about 400 words);
+- any line, fenced or not, holds a secret: an API key, a GitHub, Slack, AWS, bearer or JSON web token, a private key, a credential in a URL or assigned to a name such as `password`, `token` or `api_key` (a quoted value may hold spaces), a long random-looking token such as the bridge's own client token, a `session_id: ...`, or any UUID, since it may be a session id.
+
+A file that passes prints `ok: <file> (<tokens> of 1500 tokens, <words> words)` and exits 0. Otherwise every problem is printed as `<file>:<line>: <code>: <message>` (no line when it concerns the whole file) and it exits 1; a secret is named by kind and line, never printed. A missing file is `voice_md_not_found` and a path that is not a regular file (a FIFO or a device, say) is `voice_md_unsupported`, both exiting 1; a wrong number of arguments prints the usage and exits 2.
 
 ## Checks
 
