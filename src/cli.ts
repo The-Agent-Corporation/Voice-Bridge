@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import { daemonInfoPath, LISTEN_ADDRESS, type DaemonInfo } from "./app.js";
@@ -13,10 +13,12 @@ import type { SessionList } from "./sessions.js";
 import type { ProjectStatus } from "./status.js";
 import type { InboxItem } from "./store.js";
 import { readClientToken } from "./token.js";
+import { checkVoiceMd, VOICE_MD_FILE, VOICE_MD_MAX_TOKENS } from "./voiceMd.js";
 
 const USAGE = `usage:
   voice-bridge --help | -h | help
   voice-bridge register <path>
+  voice-bridge check <path>
   voice-bridge projects
   voice-bridge open <project_id>
   voice-bridge sessions <project_id>
@@ -148,6 +150,28 @@ async function runChat(): Promise<number> {
   return failed ? 1 : 0;
 }
 
+/** A folder means its root `voice.md`; a file is checked as is, so an agent can check a draft. */
+function runCheck(target: string): number {
+  const resolved = path.resolve(target);
+  let file = resolved;
+  let text: string;
+  try {
+    if (statSync(resolved).isDirectory()) file = path.join(resolved, VOICE_MD_FILE);
+    text = readFileSync(file, "utf8");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") throw new CliError("voice_md_not_found", `${file} does not exist`);
+    throw new CliError("voice_md_unreadable", `${file} could not be read (${code ?? String(error)})`);
+  }
+  const result = checkVoiceMd(text);
+  if (result.ok) {
+    console.log(`ok: ${file} (${result.tokens} of ${VOICE_MD_MAX_TOKENS} tokens, ${result.words} words)`);
+    return 0;
+  }
+  for (const p of result.problems) console.log(`${file}${p.line === null ? "" : `:${p.line}`}: ${p.code}: ${p.message}`);
+  return 1;
+}
+
 const HELP_ALIASES = new Set(["--help", "-h", "help"]);
 
 async function run(args: string[]): Promise<number> {
@@ -164,6 +188,7 @@ async function run(args: string[]): Promise<number> {
     console.log(`found ${result.sessions} saved session(s)${skipped}`);
     return 0;
   }
+  if (command === "check" && arg && rest.length === 0) return runCheck(arg);
   if (command === "projects" && arg === undefined) {
     const { projects } = await callTool<{ projects: ProjectSummary[] }>("list_projects", {});
     if (projects.length === 0) console.log("no projects registered");

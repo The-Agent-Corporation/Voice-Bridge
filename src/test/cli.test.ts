@@ -231,3 +231,66 @@ describe("voice-bridge CLI without a healthy daemon", () => {
     assert.match(result.stderr, /daemon_not_running: nothing is listening/);
   });
 });
+
+describe("voice-bridge check", () => {
+  const VOICE_MD = [
+    "# Roscoe",
+    "Updated: 2026-11-05T14:30:00Z",
+    "Updated by: roscoe-main",
+    "",
+    "## What this is",
+    "The billing service.",
+    "",
+    "## Status now",
+    "Invoices went out.",
+    "",
+    "## Waiting on you",
+    "Nothing right now.",
+    "",
+    "## Ask the agent about",
+    "- the retry job",
+    "",
+  ].join("\n");
+
+  const absentDataDir = () => path.join(tempDir(), "absent");
+
+  test("a folder's voice.md that follows the format passes, without bridge state", async () => {
+    const folder = tempDir();
+    writeFileSync(path.join(folder, "voice.md"), VOICE_MD);
+    const dataDir = absentDataDir();
+    const result = await runCli(dataDir, "check", folder);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, new RegExp(`^ok: ${path.join(folder, "voice.md")} \\(\\d+ of 1500 tokens, \\d+ words\\)\\n$`));
+    assert.equal(existsSync(dataDir), false);
+  });
+
+  test("a file missing a section or holding a secret fails, and the secret is not printed", async () => {
+    const folder = tempDir();
+    const draft = path.join(folder, "draft.md");
+    writeFileSync(draft, VOICE_MD.replace("## Waiting on you\n", ""));
+    const missing = await runCli(absentDataDir(), "check", draft);
+    assert.equal(missing.status, 1);
+    assert.match(missing.stdout, new RegExp(`^${draft}: missing_section: missing section "## Waiting on you"\\n$`));
+
+    const secret = "password=" + "correcthorse";
+    writeFileSync(draft, VOICE_MD.replace("Invoices went out.", secret));
+    const leaked = await runCli(absentDataDir(), "check", draft);
+    assert.equal(leaked.status, 1);
+    assert.match(leaked.stdout, new RegExp(`^${draft}:9: secret: `));
+    assert.ok(!leaked.stdout.includes(secret) && !leaked.stderr.includes(secret));
+  });
+
+  test("a folder without voice.md is voice_md_not_found and bad arity is a usage error", async () => {
+    const dataDir = absentDataDir();
+    const notFound = await runCli(dataDir, "check", tempDir());
+    assert.equal(notFound.status, 1);
+    assert.match(notFound.stderr, /voice_md_not_found/);
+
+    for (const args of [["check"], ["check", "a", "b"]]) {
+      const result = await runCli(dataDir, ...args);
+      assert.equal(result.status, 2, args.join(" "));
+      assert.match(result.stderr, /^usage:/);
+    }
+    assert.equal(existsSync(dataDir), false);
+  });
+});
