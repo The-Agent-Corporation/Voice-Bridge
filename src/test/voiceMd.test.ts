@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { test } from "node:test";
-import { checkVoiceMd, VOICE_MD_SECTIONS, type VoiceMdProblemCode } from "../voiceMd.js";
+import { checkVoiceMd, findSecrets, renderStarterVoiceMd, VOICE_MD_SECTIONS, type VoiceMdProblemCode } from "../voiceMd.js";
 
 const VALID_VOICE_MD = `# Roscoe
 Updated: 2026-11-05T14:30:00Z
@@ -157,5 +157,19 @@ test("every problem is reported at once, ordered by line with whole-file problem
       ["secret", 9],
       ["missing_section", null],
     ],
+  );
+});
+
+test("the starter init writes passes the checker", () => {
+  const starter = renderStarterVoiceMd({ name: "Roscoe", agentId: "roscoe-main", updatedAt: "2026-11-16T09:00:00.000Z" });
+  assert.deepEqual(checkVoiceMd(starter).problems, []);
+});
+
+test("findSecrets names a secret by kind and line without echoing it", () => {
+  const secret = "password=" + "correcthorse";
+  const problems = findSecrets(`${secret}\nnothing here`);
+  assert.deepEqual(
+    problems.map((p) => [p.code, p.line, p.message]),
+    [["secret", 1, "line contains a credential assignment; remove it"]],
   );
 });

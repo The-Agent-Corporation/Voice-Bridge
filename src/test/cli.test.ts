@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawnSync } from "node:child_process";
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
@@ -300,5 +300,67 @@ describe("voice-bridge check", () => {
     const result = await runCli(absentDataDir(), "check", fifo);
     assert.equal(result.status, 1);
     assert.match(result.stderr, /voice_md_unsupported/);
+  });
+});
+
+describe("voice-bridge init", () => {
+  const initIn = (cwd: string, dataDir: string, ...args: string[]) =>
+    new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve) => {
+      const child = execFile(
+        process.execPath,
+        [CLI_ENTRY, "init", ...args],
+        { cwd, env: { ...process.env, VOICE_BRIDGE_DATA_DIR: dataDir }, timeout: 10_000 },
+        (_error, stdout, stderr) => resolve({ status: child.exitCode, stdout, stderr }),
+      );
+    });
+
+  const folderNamed = (name: string) => {
+    const folder = path.join(tempDir(), name);
+    mkdirSync(folder);
+    return folder;
+  };
+
+  test("init in two folders, without a daemon, gives each a manifest and a voice.md that passes check", async () => {
+    const dataDir = path.join(tempDir(), "data");
+    for (const name of ["roscoe", "billing"]) {
+      const folder = folderNamed(name);
+      const result = await runCli(dataDir, "init", folder);
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(
+        result.stdout,
+        [
+          `initialized ${name} (${name}) at ${folder}`,
+          `manifest: created ${path.join(folder, ".voice", "manifest.json")}`,
+          `voice.md: created ${path.join(folder, "voice.md")}`,
+          `registry: registered ${name}`,
+          "",
+        ].join("\n"),
+      );
+      const checked = await runCli(dataDir, "check", folder);
+      assert.equal(checked.status, 0, checked.stdout);
+    }
+    assert.deepEqual(readdirSync(path.join(dataDir, "folders")).sort(), ["billing.json", "roscoe.json"]);
+  });
+
+  test("init with no path installs the current folder", async () => {
+    const folder = folderNamed("roscoe");
+    const result = await initIn(folder, path.join(tempDir(), "data"));
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, new RegExp(`^initialized roscoe \\(roscoe\\) at ${folder}\\n`));
+    assert.ok(existsSync(path.join(folder, "voice.md")));
+  });
+
+  test("bad arguments are a usage error and a conflict exits 1", async () => {
+    const dataDir = path.join(tempDir(), "data");
+    for (const args of [["init", "a", "b"], ["init", "--id"], ["init", "x", "--bogus", "y"]]) {
+      const result = await runCli(dataDir, ...args);
+      assert.equal(result.status, 2, args.join(" "));
+      assert.match(result.stderr, /^usage:/);
+    }
+
+    assert.equal((await runCli(dataDir, "init", folderNamed("app"))).status, 0);
+    const conflict = await runCli(dataDir, "init", folderNamed("app"));
+    assert.equal(conflict.status, 1);
+    assert.match(conflict.stderr, /folder_id_conflict/);
   });
 });
