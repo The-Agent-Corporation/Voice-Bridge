@@ -148,3 +148,20 @@ test("a missing path is path_not_found and a file is invalid_path", () => {
   writeFileSync(file, "");
   assert.throws(() => initFolder({ folder: file, dataDir: dir }), { code: "invalid_path" });
 });
+
+test("a hand-edited manifest whose name would break the starter voice.md is refused before writing", () => {
+  const folder = folderNamed("roscoe");
+  const dataDir = tempDir();
+  mkdirSync(path.join(folder, ".voice"));
+  const manifest = {
+    schema: "voice-manifest/0.1",
+    folder_id: "roscoe",
+    name: "Roscoe\n## Status now",
+    aliases: ["roscoe"],
+    briefing: "voice.md",
+    agent: { id: "roscoe-main", kind: "codex", follow_along: false },
+  };
+  writeFileSync(manifestPath(folder), JSON.stringify(manifest));
+  assert.throws(() => initFolder({ folder, dataDir }), { code: "starter_voice_md_invalid", message: /duplicate_section/ });
+  assertNothingWritten(folder, dataDir);
+});
