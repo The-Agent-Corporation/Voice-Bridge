@@ -81,6 +81,39 @@ function headerLabel(line: string, label: string): string | undefined {
   return match ? match[1]!.trim() : undefined;
 }
 
+/** Every line of `text` that holds a secret, by kind and 1-based line; the secret itself is never in the message. */
+export function findSecrets(text: string): VoiceMdProblem[] {
+  const problems: VoiceMdProblem[] = [];
+  text.split("\n").forEach((line, index) => {
+    for (const rule of SECRET_RULES) {
+      if (rule.pattern.test(line)) {
+        problems.push({ code: "secret", line: index + 1, message: `line contains a ${rule.label}; remove it` });
+      }
+    }
+  });
+  return problems;
+}
+
+/** The voice.md `voice-bridge init` writes: it passes the checker until the folder's agent replaces it. */
+export function renderStarterVoiceMd({ name, agentId, updatedAt }: { name: string; agentId: string; updatedAt: string }): string {
+  return `# ${name}
+Updated: ${updatedAt}
+Updated by: voice-bridge init
+
+## What this is
+${name} has not been described yet. Its agent, ${agentId}, replaces this text.
+
+## Status now
+Nothing reported yet.
+
+## Waiting on you
+Nothing right now.
+
+## Ask the agent about
+- what ${name} is and what is happening in it
+`;
+}
+
 export function checkVoiceMd(raw: string): VoiceMdCheck {
   const text = raw.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n");
   const lines = text.split("\n");
@@ -103,14 +136,10 @@ export function checkVoiceMd(raw: string): VoiceMdCheck {
     openSection = undefined;
   };
 
+  problems.push(...findSecrets(text));
+
   lines.forEach((line, index) => {
     const lineNo = index + 1;
-    for (const rule of SECRET_RULES) {
-      if (rule.pattern.test(line)) {
-        problems.push({ code: "secret", line: lineNo, message: `line contains a ${rule.label}; remove it` });
-      }
-    }
-
     const trimmedStart = line.trimStart();
     if (trimmedStart.startsWith("```") || trimmedStart.startsWith("~~~")) {
       inFence = !inFence;

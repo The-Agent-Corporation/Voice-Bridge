@@ -15,6 +15,7 @@ The daemon listens on `127.0.0.1` only. In another terminal:
 ```sh
 node dist/cli.js --help                   # or -h or help: the command reference, without the daemon
 node dist/cli.js register /path/to/repo   # reads /path/to/repo/.voice/config.json
+node dist/cli.js init [/path/to/folder] [--id <folder_id>]   # installs the plug-in; no daemon needed
 node dist/cli.js check /path/to/folder    # checks <folder>/voice.md; no daemon needed
 node dist/cli.js projects
 node dist/cli.js open <project_id>
@@ -25,7 +26,7 @@ node dist/cli.js inbox [--project <project_id>] [--status <status>]
 node dist/cli.js session start <project_id> --provider codex
 ```
 
-State lives in `VOICE_BRIDGE_DATA_DIR` when that is set, otherwise in the OS application-data folder (`~/Library/Application Support/voice-bridge` on macOS). The folder holds `bridge.sqlite`, the `client-token` (mode 0600) that every `/tools/*` call presents as `Authorization: Bearer <token>`, and `daemon.json`, which tells the CLI which port the running daemon chose and its pid; the CLI ignores the file once that process is gone.
+State lives in `VOICE_BRIDGE_DATA_DIR` when that is set, otherwise in the OS application-data folder (`~/Library/Application Support/voice-bridge` on macOS). The folder holds `bridge.sqlite`, `folders/` (the folders `init` installed, one file each), the `client-token` (mode 0600) that every `/tools/*` call presents as `Authorization: Bearer <token>`, and `daemon.json`, which tells the CLI which port the running daemon chose and its pid; the CLI ignores the file once that process is gone.
 
 ## Text chat
 
@@ -160,6 +161,29 @@ node dist/cli.js probe
 ```
 
 This runs on its own; the daemon need not be up. It prints JSON recording what the installed Codex and Claude Code can prove. For each provider it gives the realpath it ran, the version, and, for every surface, each capability as `supported`, `unsupported` or `unverified`, with the command and exit code as evidence. Only Codex's app-server is checked live: it runs in a throwaway home with no credentials and an environment built from nothing but your `PATH`. `probe` exits 1 if any process it started could not be killed. The observed matrix and what it means are in [docs/compatibility.md](docs/compatibility.md).
+
+## Install in a folder
+
+```sh
+node dist/cli.js init /path/to/folder    # or no path for the current folder
+```
+
+`init` needs no daemon and no Git. It writes `.voice/manifest.json`:
+
+```json
+{
+  "schema": "voice-manifest/0.1",
+  "folder_id": "roscoe",
+  "name": "Roscoe",
+  "aliases": ["roscoe"],
+  "briefing": "voice.md",
+  "agent": { "id": "roscoe-main", "kind": "codex", "follow_along": false }
+}
+```
+
+The name is the folder's name, the id a lowercase slug of it (`My App!` becomes `my-app`), and the alias the name in lower case; pass `--id <folder_id>` when the name has no slug or another folder holds the id. `briefing` is always `voice.md`, so a manifest cannot point outside its folder. It also writes a starter `voice.md` that passes `check`, for the folder's agent to replace, and registers the folder in `<data dir>/folders/<folder_id>.json`. Edit the manifest by hand to change anything else.
+
+Running `init` again never overwrites: an existing manifest and `voice.md` are kept as they are, and a kept `voice.md` that does not pass `check` only prints a warning. Everything is checked before the first write, so a refusal leaves the folder as it was. It exits 1 with `path_not_found` or `invalid_path` for a bad path, `invalid_folder_id` for an id that is not 1-64 lowercase letters, digits or hyphens, `manifest_invalid` for an existing manifest that breaks the shape above, `manifest_id_mismatch` when `--id` differs from it, `manifest_has_secret` when any key or value in the manifest would be a secret to `check` (a folder named after a UUID, or a `"token"` key, say), `starter_voice_md_invalid` when a hand-edited manifest's name or agent id would give a starter `voice.md` that fails `check` (a name with a line break, say), and `folder_id_conflict` when another folder that still has its manifest holds the id (or has one that cannot be read or parsed); an entry whose folder lost its manifest is replaced, and the `registry:` line names the folder it was taken from.
 
 ## voice.md
 

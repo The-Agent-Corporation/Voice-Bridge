@@ -5,6 +5,8 @@ import { createInterface } from "node:readline";
 import { daemonInfoPath, LISTEN_ADDRESS, type DaemonInfo } from "./app.js";
 import { Conversation } from "./chat.js";
 import { resolveDataDir } from "./dataDir.js";
+import { initFolder, type InitResult } from "./init.js";
+import { manifestPath } from "./manifest.js";
 import type { PrimaryResult } from "./primary.js";
 import { runProbe } from "./probe.js";
 import type { OpenedProject, ProjectSummary, RegisterResult } from "./registry.js";
@@ -18,6 +20,7 @@ import { checkVoiceMd, VOICE_MD_FILE, VOICE_MD_MAX_TOKENS } from "./voiceMd.js";
 const USAGE = `usage:
   voice-bridge --help | -h | help
   voice-bridge register <path>
+  voice-bridge init [<path>] [--id <folder_id>]
   voice-bridge check <path>
   voice-bridge projects
   voice-bridge open <project_id>
@@ -175,6 +178,37 @@ function runCheck(target: string): number {
   return 1;
 }
 
+/** `[]`, `[path]`, `["--id", id]` or `[path, "--id", id]`; anything else is a usage error. */
+function initRequest(args: string[]): { folder: string; id?: string } | undefined {
+  const isPath = (arg: string | undefined) => arg !== undefined && arg !== "" && !arg.startsWith("--");
+  const [first, ...rest] = args;
+  const folder = isPath(first) ? first! : process.cwd();
+  const flags = isPath(first) ? rest : args;
+  if (flags.length === 0) return { folder };
+  if (flags.length === 2 && flags[0] === "--id" && flags[1]) return { folder, id: flags[1] };
+  return undefined;
+}
+
+const REGISTRY_WORDS: Record<InitResult["registered"], string> = {
+  created: "registered",
+  replaced: "re-registered",
+  unchanged: "already registered",
+};
+
+function runInit(request: { folder: string; id?: string }): number {
+  const result = initFolder({ folder: path.resolve(request.folder), dataDir: resolveDataDir(process.env), id: request.id });
+  const voiceMdFile = path.join(result.folder, VOICE_MD_FILE);
+  console.log(`initialized ${result.folder_id} (${result.name}) at ${result.folder}`);
+  console.log(`manifest: ${result.manifest} ${manifestPath(result.folder)}`);
+  console.log(`voice.md: ${result.voice_md} ${voiceMdFile}`);
+  const displaced = result.displaced === undefined ? "" : ` (was ${result.displaced})`;
+  console.log(`registry: ${REGISTRY_WORDS[result.registered]} ${result.folder_id}${displaced}`);
+  if (!result.voice_md_ok) {
+    console.error(`voice-bridge: warning: ${voiceMdFile} does not pass check; run voice-bridge check ${result.folder}`);
+  }
+  return 0;
+}
+
 const HELP_ALIASES = new Set(["--help", "-h", "help"]);
 
 async function run(args: string[]): Promise<number> {
@@ -192,6 +226,8 @@ async function run(args: string[]): Promise<number> {
     return 0;
   }
   if (command === "check" && arg && rest.length === 0) return runCheck(arg);
+  const init = command === "init" ? initRequest(args.slice(1)) : undefined;
+  if (init) return runInit(init);
   if (command === "projects" && arg === undefined) {
     const { projects } = await callTool<{ projects: ProjectSummary[] }>("list_projects", {});
     if (projects.length === 0) console.log("no projects registered");
