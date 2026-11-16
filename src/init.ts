@@ -18,6 +18,8 @@ export interface InitResult {
   voice_md: "created" | "kept";
   voice_md_ok: boolean;
   registered: "created" | "replaced" | "unchanged";
+  /** The folder that held the id before a `replaced` registration. */
+  displaced?: string;
 }
 
 const errnoCode = (error: unknown) => (error as NodeJS.ErrnoException).code;
@@ -92,13 +94,42 @@ function passesCheck(file: string): boolean {
   }
 }
 
-/** Another folder still holding a manifest for `folderId` owns the id; a moved or uninstalled one does not. */
+/**
+ * Another folder still holding a manifest for `folderId` owns the id; a moved or uninstalled one, or one whose
+ * manifest now names another id, does not. A manifest that cannot be read or parsed proves neither, so it owns.
+ */
 function stillOwns(otherFolder: string, folderId: string): boolean {
+  let text: string;
   try {
-    return parseManifest(readFileSync(manifestPath(otherFolder), "utf8")).folder_id === folderId;
-  } catch {
-    return false;
+    text = readFileSync(manifestPath(otherFolder), "utf8");
+  } catch (error) {
+    const code = errnoCode(error);
+    return code !== "ENOENT" && code !== "ENOTDIR";
   }
+  try {
+    return parseManifest(text).folder_id === folderId;
+  } catch {
+    return true;
+  }
+}
+
+/** Each leaf of the manifest's JSON as a `key: value` line, so prose secret rules see JSON keys and values. */
+function manifestEntries(value: unknown, at = ""): { at: string; line: string }[] {
+  if (Array.isArray(value)) return value.flatMap((item, index) => manifestEntries(item, `${at}[${index}]`));
+  if (typeof value === "object" && value !== null) {
+    return Object.entries(value).flatMap(([key, item]) =>
+      typeof item === "object" && item !== null
+        ? manifestEntries(item, at ? `${at}.${key}` : key)
+        : [{ at: at ? `${at}.${key}` : key, line: `${key}: ${String(item)}` }],
+    );
+  }
+  return [{ at, line: String(value) }];
+}
+
+function manifestSecrets(text: string): string[] {
+  return manifestEntries(JSON.parse(text)).flatMap(({ at, line }) =>
+    findSecrets(line).map((problem) => `${at}: ${problem.message}`),
+  );
 }
 
 /** Creates `file` only if nothing is there; returns false when something got there first. */
@@ -136,10 +167,9 @@ export function initFolder({
     throw new FolderError("manifest_id_mismatch", `${manifestFile} already names folder_id ${folderId}, not ${id}`);
   }
 
-  const leaks = findSecrets(manifest.text);
+  const leaks = manifestSecrets(manifest.text);
   if (leaks.length > 0) {
-    const where = leaks.map((p) => `line ${p.line}: ${p.message}`).join("; ");
-    throw new FolderError("manifest_has_secret", `the manifest for ${folder} would hold a secret (${where})`);
+    throw new FolderError("manifest_has_secret", `the manifest for ${folder} would hold a secret (${leaks.join("; ")})`);
   }
 
   const voiceMdFile = path.join(folder, VOICE_MD_FILE);
@@ -189,5 +219,6 @@ export function initFolder({
     voice_md: voiceMdCreated ? "created" : "kept",
     voice_md_ok: voiceMdCreated || passesCheck(voiceMdFile),
     registered,
+    ...(registered === "replaced" && existing ? { displaced: existing.path } : {}),
   };
 }

@@ -201,7 +201,8 @@ function runInit(request: { folder: string; id?: string }): number {
   console.log(`initialized ${result.folder_id} (${result.name}) at ${result.folder}`);
   console.log(`manifest: ${result.manifest} ${manifestPath(result.folder)}`);
   console.log(`voice.md: ${result.voice_md} ${voiceMdFile}`);
-  console.log(`registry: ${REGISTRY_WORDS[result.registered]} ${result.folder_id}`);
+  const displaced = result.displaced === undefined ? "" : ` (was ${result.displaced})`;
+  console.log(`registry: ${REGISTRY_WORDS[result.registered]} ${result.folder_id}${displaced}`);
   if (!result.voice_md_ok) {
     console.error(`voice-bridge: warning: ${voiceMdFile} does not pass check; run voice-bridge check ${result.folder}`);
   }

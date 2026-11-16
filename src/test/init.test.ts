@@ -4,7 +4,7 @@ import path from "node:path";
 import { after, test } from "node:test";
 import { foldersDir, readRegisteredFolder } from "../folders.js";
 import { initFolder } from "../init.js";
-import { manifestPath } from "../manifest.js";
+import { buildManifest, manifestPath } from "../manifest.js";
 import { checkVoiceMd } from "../voiceMd.js";
 import { removeTempDirs, tempDir } from "./helpers.js";
 
@@ -118,8 +118,26 @@ test("a folder id held by another live folder conflicts; a stale holder is repla
 
   rmSync(manifestPath(first));
   const third = folderNamed("app");
-  assert.equal(initFolder({ folder: third, dataDir }).registered, "replaced");
+  const replaced = initFolder({ folder: third, dataDir });
+  assert.equal(replaced.registered, "replaced");
+  assert.equal(replaced.displaced, first);
   assert.equal(readRegisteredFolder(dataDir, "app")?.path, third);
+});
+
+test("a holder whose manifest cannot be read or parsed still owns its id", () => {
+  const dataDir = tempDir();
+  const first = folderNamed("app");
+  initFolder({ folder: first, dataDir });
+  const second = folderNamed("app");
+
+  writeFileSync(manifestPath(first), "{ mid-edit");
+  assert.throws(() => initFolder({ folder: second, dataDir }), { code: "folder_id_conflict" });
+
+  rmSync(manifestPath(first));
+  mkdirSync(manifestPath(first));
+  assert.throws(() => initFolder({ folder: second, dataDir }), { code: "folder_id_conflict" });
+  assert.equal(readRegisteredFolder(dataDir, "app")?.path, first);
+  assert.equal(existsSync(path.join(second, ".voice")), false);
 });
 
 test("a folder keeps one entry when its manifest's folder_id changes, and --id must match the manifest", () => {
@@ -139,6 +157,22 @@ test("a manifest that would hold a secret is refused and nothing is written", ()
   assert.throws(() => initFolder({ folder, dataDir }), { code: "manifest_has_secret" });
   assert.equal(existsSync(path.join(folder, ".voice")), false);
   assertNothingWritten(folder, dataDir);
+});
+
+test("a kept manifest with a credential under a JSON key is refused, naming the key but not the value", () => {
+  for (const [key, value] of [["token", "hunter2hunter2"], ["api_key", "abcd1234efgh"]] as const) {
+    const folder = folderNamed("roscoe");
+    const dataDir = tempDir();
+    mkdirSync(path.dirname(manifestPath(folder)));
+    const manifest = { ...buildManifest({ folderId: "roscoe", name: "roscoe" }), [key]: value };
+    writeFileSync(manifestPath(folder), JSON.stringify(manifest, null, 2));
+    assert.throws(
+      () => initFolder({ folder, dataDir }),
+      (error: Error & { code?: string }) =>
+        error.code === "manifest_has_secret" && error.message.includes(`${key}:`) && !error.message.includes(value),
+    );
+    assertNothingWritten(folder, dataDir);
+  }
 });
 
 test("a missing path is path_not_found and a file is invalid_path", () => {
