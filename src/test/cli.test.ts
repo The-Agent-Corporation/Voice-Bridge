@@ -364,3 +364,51 @@ describe("voice-bridge init", () => {
     assert.match(conflict.stderr, /folder_id_conflict/);
   });
 });
+
+describe("voice-bridge talk", () => {
+  const talk = (dataDir: string, input: string) =>
+    new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve) => {
+      const child = execFile(
+        process.execPath,
+        [CLI_ENTRY, "talk"],
+        { env: { ...process.env, VOICE_BRIDGE_DATA_DIR: dataDir }, timeout: 10_000 },
+        (_error, stdout, stderr) => resolve({ status: child.exitCode, stdout, stderr }),
+      );
+      child.stdin!.end(input);
+    });
+
+  test("init two folders, load one, switch to the other, and a never-registered name is refused", async () => {
+    const dataDir = path.join(tempDir(), "data");
+    for (const name of ["roscoe", "billing"]) {
+      const folder = path.join(tempDir(), name);
+      mkdirSync(folder);
+      assert.equal((await runCli(dataDir, "init", folder)).status, 0);
+    }
+
+    const result = await talk(dataDir, "talk about roscoe\nshow prompt\n\nswitch to billing\nshow prompt\ntalk about nowhere\n");
+
+    assert.equal(result.status, 0, result.stderr);
+    const [loadedRoscoe, roscoePrompt, loadedBilling, billingPrompt, refused] = result.stdout.split(/\n(?=Loaded |You are |Refused: )/);
+    assert.equal(loadedRoscoe, "Loaded roscoe (roscoe). Its voice.md is now the briefing in the system prompt.");
+    assert.match(roscoePrompt!, /<voice_md folder_id="roscoe">\n# roscoe\n/);
+    assert.ok(!roscoePrompt!.includes("billing"));
+    assert.equal(loadedBilling, "Loaded billing (billing). Its voice.md is now the briefing in the system prompt.");
+    assert.match(billingPrompt!, /<voice_md folder_id="billing">\n# billing\n/);
+    assert.ok(!billingPrompt!.includes("roscoe"));
+    assert.equal(
+      refused,
+      'Refused: no registered folder is called "nowhere"; only folders set up with voice-bridge init can be loaded. Still loaded: billing (billing).\n',
+    );
+  });
+
+  test("with no data dir, every name is refused and nothing is created", async () => {
+    const dataDir = path.join(tempDir(), "absent");
+    const result = await talk(dataDir, "talk about roscoe\n");
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(
+      result.stdout,
+      'Refused: no registered folder is called "roscoe"; only folders set up with voice-bridge init can be loaded. No folder is loaded.\n',
+    );
+    assert.equal(existsSync(dataDir), false);
+  });
+});
