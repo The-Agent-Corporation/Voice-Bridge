@@ -2,7 +2,7 @@ import { readFileSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import { listRegisteredFolders, readRegisteredFolder, type RegisteredFolder } from "./folders.js";
 import { FolderError, manifestPath, parseManifest, type VoiceManifest } from "./manifest.js";
-import { checkVoiceMd, VOICE_MD_FILE } from "./voiceMd.js";
+import { checkVoiceMd, normaliseVoiceMdText, VOICE_MD_FILE } from "./voiceMd.js";
 
 /**
  * The text-mode voice agent (MISSION.md Auto-load): naming a registered folder puts that folder's voice.md,
@@ -60,31 +60,44 @@ function readManifestOf(entry: RegisteredFolder): VoiceManifest {
   return parseManifest(text);
 }
 
+interface ResolvedFolder {
+  entry: RegisteredFolder;
+  manifest: VoiceManifest;
+}
+
 /** Aliases come from each registered folder's manifest; one that cannot be read or names another folder is not trusted. */
-function foldersWithAlias(dataDir: string, name: string): RegisteredFolder[] {
-  return listRegisteredFolders(dataDir).filter((entry) => {
+function foldersWithAlias(dataDir: string, name: string): ResolvedFolder[] {
+  return listRegisteredFolders(dataDir).flatMap((entry) => {
     let manifest: VoiceManifest;
     try {
       manifest = readManifestOf(entry);
     } catch (error) {
-      if (error instanceof FolderError) return false;
+      if (error instanceof FolderError) return [];
       throw error;
     }
-    return manifest.folder_id === entry.folder_id && manifest.aliases.some((alias) => normaliseName(alias) === name);
+    const trusted = manifest.folder_id === entry.folder_id;
+    return trusted && manifest.aliases.some((alias) => normaliseName(alias) === name) ? [{ entry, manifest }] : [];
   });
 }
 
-function resolveFolder(dataDir: string, said: string): RegisteredFolder | LoadResult {
+function resolveFolder(dataDir: string, said: string): ResolvedFolder | LoadResult {
   const name = normaliseName(said);
   const byId = readRegisteredFolder(dataDir, name);
-  if (byId) return byId;
+  if (byId) {
+    try {
+      return { entry: byId, manifest: readManifestOf(byId) };
+    } catch (error) {
+      if (error instanceof FolderError) return refused("manifest_invalid", `the manifest of ${byId.folder_id} could not be read: ${error.message}.`);
+      throw error;
+    }
+  }
   const matches = foldersWithAlias(dataDir, name);
   const quoted = JSON.stringify(said.trimEnd());
   if (matches.length === 0) {
     return refused("unregistered", `no registered folder is called ${quoted}; only folders set up with voice-bridge init can be loaded.`);
   }
   if (matches.length > 1) {
-    const ids = matches.map((entry) => entry.folder_id).sort().join(", ");
+    const ids = matches.map(({ entry }) => entry.folder_id).sort().join(", ");
     return refused("ambiguous", `${quoted} names several registered folders (${ids}); say one of those ids.`);
   }
   return matches[0]!;
@@ -110,21 +123,15 @@ function readVoiceMd(entry: RegisteredFolder): { text: string } | LoadResult {
     const codes = [...new Set(check.problems.map((problem) => problem.code))].join(", ");
     return refused("voice_md_invalid", `${id}'s voice.md does not pass voice-bridge check (${codes}); run voice-bridge check ${entry.path}.`);
   }
-  return { text: text.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n") };
+  return { text: normaliseVoiceMdText(text) };
 }
 
 /** Resolves `said` against the local registry and reads that folder's voice.md from disk, every time. */
 export function loadFolder(dataDir: string, said: string): LoadResult {
-  const entry = resolveFolder(dataDir, said);
-  if ("state" in entry) return entry;
+  const resolved = resolveFolder(dataDir, said);
+  if ("state" in resolved) return resolved;
+  const { entry, manifest } = resolved;
   const id = entry.folder_id;
-  let manifest: VoiceManifest;
-  try {
-    manifest = readManifestOf(entry);
-  } catch (error) {
-    if (error instanceof FolderError) return refused("manifest_invalid", `the manifest of ${id} could not be read: ${error.message}.`);
-    throw error;
-  }
   if (manifest.folder_id !== id) {
     return refused(
       "registration_stale",
@@ -138,12 +145,12 @@ export function loadFolder(dataDir: string, said: string): LoadResult {
 
 /** Holds at most one folder, so a switch replaces the briefing; a refused load keeps the folder already loaded. */
 export class VoiceAgent {
-  #loaded: LoadedFolder | null = null;
+  #loaded: Readonly<LoadedFolder> | null = null;
 
   constructor(private readonly dataDir: string) {}
 
-  get loaded(): LoadedFolder | null {
-    return structuredClone(this.#loaded);
+  get loaded(): Readonly<LoadedFolder> | null {
+    return this.#loaded;
   }
 
   get systemPrompt(): string {
@@ -152,7 +159,7 @@ export class VoiceAgent {
 
   load(said: string): LoadResult {
     const result = loadFolder(this.dataDir, said);
-    if (result.state === "loaded") this.#loaded = { ...result.folder };
+    if (result.state === "loaded") this.#loaded = result.folder;
     return result;
   }
 }

@@ -114,8 +114,13 @@ Nothing right now.
 `;
 }
 
+/** The text of a voice.md as the checker judges it and the voice agent loads it: no BOM, LF line endings. */
+export function normaliseVoiceMdText(raw: string): string {
+  return raw.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n");
+}
+
 export function checkVoiceMd(raw: string): VoiceMdCheck {
-  const text = raw.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n");
+  const text = normaliseVoiceMdText(raw);
   const lines = text.split("\n");
   const problems: VoiceMdProblem[] = [];
 
