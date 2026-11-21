@@ -190,6 +190,24 @@ test("a registration whose manifest now names another folder is stale; a broken 
   assert.match(broken.state === "refused" ? broken.message : "", /^the manifest of roscoe could not be read: not valid JSON/);
 });
 
+test("another folder's broken or mismatched manifest does not break alias lookup", () => {
+  const dataDir = tempDir();
+  const roscoe = registered(dataDir, "roscoe");
+  editManifest(roscoe, { aliases: ["roscoe", "the dog"] });
+  const billing = registered(dataDir, "billing");
+
+  writeFileSync(manifestPath(billing), "{ mid-edit");
+  const byAlias = loadFolder(dataDir, "the dog");
+  assert.equal(byAlias.state === "loaded" && byAlias.folder.folder_id, "roscoe");
+  const unknown = loadFolder(dataDir, "nowhere");
+  assert.equal(unknown.state === "refused" && unknown.reason, "unregistered");
+
+  writeFileSync(manifestPath(billing), readFileSync(manifestPath(roscoe)));
+  editManifest(billing, { folder_id: "other" });
+  const notAmbiguous = loadFolder(dataDir, "the dog");
+  assert.equal(notAmbiguous.state === "loaded" && notAmbiguous.folder.folder_id, "roscoe");
+});
+
 test("a closing tag inside voice.md cannot end the frame early", () => {
   const prompt = buildSystemPrompt({
     folder_id: "roscoe",
