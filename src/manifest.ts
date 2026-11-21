@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { PROVIDERS, type Provider } from "./adapters/types.js";
 import { PROJECT_ID_PATTERN } from "./config.js";
@@ -89,4 +90,15 @@ export function parseManifest(text: string): VoiceManifest {
     briefing: VOICE_MD_FILE,
     agent: { id: agent.id, kind, follow_along: agent.follow_along },
   };
+}
+
+/** Reads and validates the manifest at `file`; a file that cannot be read is `manifest_invalid` too. */
+export function readManifest(file: string): VoiceManifest & { text: string } {
+  let text: string;
+  try {
+    text = readFileSync(file, "utf8");
+  } catch (error) {
+    throw new FolderError("manifest_invalid", `${file} could not be read (${(error as NodeJS.ErrnoException).code ?? String(error)})`);
+  }
+  return { ...parseManifest(text), text };
 }

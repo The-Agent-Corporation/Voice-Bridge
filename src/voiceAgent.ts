@@ -1,7 +1,7 @@
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import { listRegisteredFolders, readRegisteredFolder, type RegisteredFolder } from "./folders.js";
-import { FolderError, manifestPath, parseManifest, type VoiceManifest } from "./manifest.js";
+import { FolderError, manifestPath, readManifest, type VoiceManifest } from "./manifest.js";
 import { checkVoiceMd, normaliseVoiceMdText, VOICE_MD_FILE } from "./voiceMd.js";
 
 /**
@@ -50,16 +50,6 @@ export function buildSystemPrompt(loaded: LoadedFolder | null): string {
 
 const refused = (reason: LoadRefusal, message: string): LoadResult => ({ state: "refused", reason, message });
 
-function readManifestOf(entry: RegisteredFolder): VoiceManifest {
-  let text: string;
-  try {
-    text = readFileSync(manifestPath(entry.path), "utf8");
-  } catch (error) {
-    throw new FolderError("manifest_invalid", `${manifestPath(entry.path)} could not be read (${(error as NodeJS.ErrnoException).code ?? String(error)})`);
-  }
-  return parseManifest(text);
-}
-
 interface ResolvedFolder {
   entry: RegisteredFolder;
   manifest: VoiceManifest;
@@ -70,7 +60,7 @@ function foldersWithAlias(dataDir: string, name: string): ResolvedFolder[] {
   return listRegisteredFolders(dataDir).flatMap((entry) => {
     let manifest: VoiceManifest;
     try {
-      manifest = readManifestOf(entry);
+      manifest = readManifest(manifestPath(entry.path));
     } catch (error) {
       if (error instanceof FolderError) return [];
       throw error;
@@ -85,7 +75,7 @@ function resolveFolder(dataDir: string, said: string): ResolvedFolder | LoadResu
   const byId = readRegisteredFolder(dataDir, name);
   if (byId) {
     try {
-      return { entry: byId, manifest: readManifestOf(byId) };
+      return { entry: byId, manifest: readManifest(manifestPath(byId.path)) };
     } catch (error) {
       if (error instanceof FolderError) return refused("manifest_invalid", `the manifest of ${byId.folder_id} could not be read: ${error.message}.`);
       throw error;

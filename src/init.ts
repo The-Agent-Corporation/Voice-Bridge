@@ -7,7 +7,7 @@ import {
   removeRegisteredFolder,
   writeRegisteredFolder,
 } from "./folders.js";
-import { buildManifest, FolderError, manifestPath, parseManifest, type VoiceManifest } from "./manifest.js";
+import { buildManifest, FolderError, manifestPath, parseManifest, readManifest, type VoiceManifest } from "./manifest.js";
 import { checkVoiceMd, findSecrets, renderStarterVoiceMd, VOICE_MD_FILE } from "./voiceMd.js";
 
 export interface InitResult {
@@ -61,16 +61,6 @@ function slugOf(name: string): string {
     .replace(/^-+|-+$/g, "")
     .slice(0, 64)
     .replace(/-+$/, "");
-}
-
-function readManifest(file: string): VoiceManifest & { text: string } {
-  let text: string;
-  try {
-    text = readFileSync(file, "utf8");
-  } catch (error) {
-    throw new FolderError("manifest_invalid", `${file} could not be read (${errnoCode(error) ?? String(error)})`);
-  }
-  return { ...parseManifest(text), text };
 }
 
 function newManifest(folder: string, id: string | undefined): VoiceManifest & { text: string } {
