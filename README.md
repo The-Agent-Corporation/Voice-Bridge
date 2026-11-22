@@ -17,6 +17,7 @@ node dist/cli.js --help                   # or -h or help: the command reference
 node dist/cli.js register /path/to/repo   # reads /path/to/repo/.voice/config.json
 node dist/cli.js init [/path/to/folder] [--id <folder_id>]   # installs the plug-in; no daemon needed
 node dist/cli.js check /path/to/folder    # checks <folder>/voice.md; no daemon needed
+node dist/cli.js talk                     # loads a registered folder's voice.md by name; no daemon needed
 node dist/cli.js projects
 node dist/cli.js open <project_id>
 node dist/cli.js sessions <project_id>
@@ -219,6 +220,16 @@ node dist/cli.js check /path/to/folder      # or a path to the file itself, such
 - any line, fenced or not, holds a secret: an API key, a GitHub, Slack, AWS, bearer or JSON web token, a private key, a credential in a URL or assigned to a name such as `password`, `token` or `api_key` (a quoted value may hold spaces), a long random-looking token such as the bridge's own client token, a `session_id: ...`, or any UUID, since it may be a session id.
 
 A file that passes prints `ok: <file> (<tokens> of 1500 tokens, <words> words)` and exits 0. Otherwise every problem is printed as `<file>:<line>: <code>: <message>` (no line when it concerns the whole file) and it exits 1; a secret is named by kind and line, never printed. A missing file is `voice_md_not_found` and a path that is not a regular file (a FIFO or a device, say) is `voice_md_unsupported`, both exiting 1; a wrong number of arguments prints the usage and exits 2.
+
+## Talk about a folder (text mode)
+
+`talk` is the voice agent in text mode: one command per line on stdin, one reply per line. It makes no model call and needs no daemon; it only builds the system prompt a voice provider will be given, and `show prompt` prints it.
+
+```sh
+printf 'talk about roscoe\nshow prompt\nswitch to billing\nshow prompt\ntalk about nowhere\n' | node dist/cli.js talk
+```
+
+`talk about <folder>` and `switch to <folder>` take a folder id or one of its manifest `aliases`, compared exactly but ignoring case, spacing and trailing `.`, `?` or `!`; an id always wins over another folder's alias, and an alias two folders share is refused as ambiguous. Only folders `init` registered in `<data dir>/folders/` can be loaded; any other name is refused. Each load reads `voice.md` from disk again and refuses it unless it is a regular file inside the folder that passes `check`; a refusal names the failing check codes, never the file's text. The prompt holds one folder's `voice.md` at a time, inside `<voice_md folder_id="...">` tags and marked as information only, so a switch replaces it, and a refused name keeps the folder already loaded. A refusal is a normal reply: `talk` exits 0 unless reading the registry or a file fails unexpectedly.
 
 ## Checks
 

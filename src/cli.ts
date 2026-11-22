@@ -15,6 +15,7 @@ import type { SessionList } from "./sessions.js";
 import type { ProjectStatus } from "./status.js";
 import type { InboxItem } from "./store.js";
 import { readClientToken } from "./token.js";
+import { talkReply, VoiceAgent } from "./voiceAgent.js";
 import { checkVoiceMd, VOICE_MD_FILE, VOICE_MD_MAX_TOKENS } from "./voiceMd.js";
 
 const USAGE = `usage:
@@ -32,7 +33,8 @@ const USAGE = `usage:
   voice-bridge inbox [--project <project_id>] [--status <status>]
   voice-bridge probe
   voice-bridge session start <project_id> --provider <provider>
-  voice-bridge chat`;
+  voice-bridge chat
+  voice-bridge talk`;
 
 class CliError extends Error {
   constructor(readonly code: string, message: string) {
@@ -145,6 +147,22 @@ async function runChat(): Promise<number> {
     if (!line.trim()) continue;
     try {
       console.log(await conversation.reply(line));
+    } catch (error) {
+      failed = true;
+      console.error(describeError(error));
+    }
+  }
+  return failed ? 1 : 0;
+}
+
+/** Like `chat`, but daemon-free over the folder registry; a refused folder is a reply, not a failure. */
+async function runTalk(): Promise<number> {
+  const agent = new VoiceAgent(resolveDataDir(process.env));
+  let failed = false;
+  for await (const line of createInterface({ input: process.stdin, crlfDelay: Infinity })) {
+    if (!line.trim()) continue;
+    try {
+      console.log(talkReply(agent, line));
     } catch (error) {
       failed = true;
       console.error(describeError(error));
@@ -294,6 +312,7 @@ async function run(args: string[]): Promise<number> {
     return runSessionHost({ projectId: rest[0], provider: rest[2], env: process.env, dataDir: resolveDataDir(process.env) });
   }
   if (command === "chat" && arg === undefined) return runChat();
+  if (command === "talk" && arg === undefined) return runTalk();
   console.error(USAGE);
   return 2;
 }
